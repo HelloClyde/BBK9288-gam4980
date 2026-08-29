@@ -135,8 +135,8 @@ def main() -> None:
             if args.enable_hle:
                 qmp.key("down")     # firmware HLE row
                 time.sleep(0.5)
-                qmp.key("ret")      # enable HLE; leave performance debug off
-                time.sleep(0.5)
+                # HLE is enabled by default; leave it enabled and keep
+                # performance debug off for the gameplay smoke test.
                 return_steps = 3
             else:
                 return_steps = 4

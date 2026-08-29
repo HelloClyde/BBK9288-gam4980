@@ -96,6 +96,16 @@ typedef int (*gam4980_rom_read_fn)(
     void *context, u8 region, u32 offset, u8 *out, u32 size
 );
 
+enum gam4980_load_stage {
+    GAM4980_LOAD_STAGE_GAME_HLE = 1,
+    GAM4980_LOAD_STAGE_CFG,
+    GAM4980_LOAD_STAGE_AOT_INDEX,
+};
+
+typedef void (*gam4980_load_progress_fn)(
+    void *context, u32 stage, u32 current, u32 total
+);
+
 #ifdef GAM4980_ENABLE_PROFILING
 typedef void (*gam4980_instruction_profile_fn)(
     void *context, u16 virtual_pc, u32 physical_pc, u8 opcode
@@ -115,6 +125,9 @@ typedef struct gam4980_buffers {
 
 int gam4980_init(const gam4980_buffers_t *buffers);
 void gam4980_deinit(void);
+void gam4980_set_load_progress_callback(
+    gam4980_load_progress_fn callback, void *context
+);
 u8 *gam4980_game_storage(void);
 int gam4980_load_game_header(const u8 *header, u32 size);
 void gam4980_key_down(u8 key);
@@ -123,6 +136,7 @@ int gam4980_render_frame(void);
 void gam4980_run_frame(void);
 int gam4980_cpu_halted(void);
 const u8 *gam4980_packed_frame(void);
+u32 gam4980_changed_row_mask(u32 word);
 const u16 *gam4980_expand_frame(const u8 *packed_frame);
 const u16 *gam4980_framebuffer(void);
 void gam4980_set_lcd_theme(u32 theme);
@@ -138,13 +152,42 @@ void gam4980_set_firmware_hle_enabled(int enabled);
 int gam4980_firmware_hle_enabled(void);
 u32 gam4980_firmware_hle_hits(void);
 u64 gam4980_firmware_hle_guest_cycles(void);
+u32 gam4980_resource_span_cache_hits(void);
+u32 gam4980_resource_span_cache_misses(void);
+u32 gam4980_firmware_hle_path_count(void);
+u16 gam4980_firmware_hle_path_pc(u32 path_id);
+u32 gam4980_firmware_hle_path_attempts(u32 path_id);
+u32 gam4980_firmware_hle_path_hits(u32 path_id);
+u32 gam4980_firmware_hle_path_condition_rejects(u32 path_id);
+u32 gam4980_firmware_hle_path_budget_rejects(u32 path_id);
+u32 gam4980_firmware_hle_path_batch_groups(u32 path_id);
+u32 gam4980_firmware_hle_path_batch_iterations(u32 path_id);
+u32 gam4980_firmware_hle_path_batch_max(u32 path_id);
+u32 gam4980_firmware_hle_path_direct_groups(u32 path_id);
+u32 gam4980_firmware_hle_path_direct_iterations(u32 path_id);
+u64 gam4980_firmware_hle_path_guest_cycles(u32 path_id);
 #endif
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
+#define GAM4980_GAME_AOT_SEMANTIC_KIND_COUNT 13u
 void gam4980_set_game_load_aot_enabled(int enabled);
+void gam4980_set_game_aot_metrics_enabled(int enabled);
+void gam4980_set_game_aot_semantic_mask(u32 mask);
+void gam4980_set_game_aot_entry_limit(u32 limit);
+void gam4980_set_game_aot_direct_links(int enabled);
+int gam4980_game_aot_direct_link_available(void);
 u32 gam4980_game_aot_entry_count(void);
 int gam4980_game_aot_enabled(void);
+u32 gam4980_game_hle_match_count(void);
 u32 gam4980_game_aot_entry_physical_pc(u32 entry_id);
 u32 gam4980_game_aot_entry_pattern(u32 entry_id);
+u32 gam4980_game_aot_semantic_count(void);
+u32 gam4980_game_aot_linked_call_count(void);
+u32 gam4980_game_aot_direct_link_hits(void);
+u32 gam4980_game_aot_direct_link_stage_hits(u32 stage);
+u32 gam4980_game_aot_reachable_count(void);
+u32 gam4980_game_aot_code_size(void);
+u32 gam4980_game_aot_semantic_hits(u32 semantic_kind);
+u32 gam4980_game_aot_semantic_hit_total(void);
 #endif
 #if (defined(GAM4980_ENABLE_AOT) && defined(GAM4980_AOT_DIAGNOSTICS)) || \
     defined(GAM4980_RUNTIME_PERFORMANCE_LOG) || \
@@ -156,6 +199,9 @@ int gam4980_performance_debug_enabled(void);
 u64 gam4980_aot_instruction_count(void);
 u32 gam4980_aot_block_count(void);
 u64 gam4980_aot_block_hit_count(u32 block_id);
+u32 gam4980_aot_block_physical_pc(u32 block_id);
+u16 gam4980_aot_block_virtual_pc(u32 block_id);
+u32 gam4980_aot_block_instruction_count(u32 block_id);
 u16 gam4980_aot_block_bank2(u32 block_id);
 int gam4980_aot_block_bank2_varies(u32 block_id);
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
@@ -166,6 +212,16 @@ u64 gam4980_game_aot_entry_hit_count(u32 entry_id);
 #ifdef GAM4980_RUNTIME_PERFORMANCE_LOG
 u32 gam4980_performance_exec_calls(void);
 u64 gam4980_performance_guest_cycles(void);
+u64 gam4980_performance_scheduled_cycles(void);
+u64 gam4980_performance_halted_cycles(void);
+u64 gam4980_performance_timer_ticks(void);
+u32 gam4980_performance_step_frames(void);
+u32 gam4980_performance_lcd_write_calls(void);
+u32 gam4980_performance_lcd_changed_writes(void);
+u32 gam4980_performance_render_calls(void);
+u32 gam4980_performance_dirty_render_calls(void);
+u32 gam4980_performance_changed_render_calls(void);
+u32 gam4980_performance_pc_sample_stride(void);
 u32 gam4980_performance_sample_count(void);
 u32 gam4980_performance_sample_capacity(void);
 u16 gam4980_performance_sample_virtual_pc(u32 sample_id);
@@ -175,6 +231,9 @@ u32 gam4980_performance_sample_dropped(void);
 #endif
 #ifdef GAM4980_STATE_DIAGNOSTICS
 u64 gam4980_state_hash(void);
+u64 gam4980_state_cpu_hash(void);
+u64 gam4980_state_ram_hash(void);
+u64 gam4980_state_timing_hash(void);
 #endif
 #ifdef GAM4980_ENABLE_PROFILING
 void gam4980_set_instruction_profile(

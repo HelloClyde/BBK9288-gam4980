@@ -99,6 +99,9 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
     uint32_t game_aot_physical_pc = 0;
     const s6502_game_aot_entry_t *game_aot_entry = 0;
     const uint8_t *game_aot_code = 0;
+#ifdef S6502_GAME_HLE_LOCALS
+    S6502_GAME_HLE_LOCALS
+#endif
 #endif
 #ifdef S6502_INSTRUCTION_HOOK
     uint16_t instruction_pc;
@@ -111,6 +114,21 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
 #define S6502_FETCH_OPCODE() READX8(pc++)
 #endif
   _exit:
+#if defined(S6502_TEST_STOP_PREDICATE)
+    if (S6502_TEST_STOP_PREDICATE(pc) && executed) {
+#elif defined(S6502_TEST_STOP_PC)
+    if (pc == (uint16_t)S6502_TEST_STOP_PC && executed) {
+#endif
+#if defined(S6502_TEST_STOP_PREDICATE) || defined(S6502_TEST_STOP_PC)
+      u->pc = pc;
+      u->ac = ac;
+      u->ix = ix;
+      u->iy = iy;
+      u->sp = sp;
+      u->status = status;
+      return executed;
+    }
+#endif
     if ((executed >= cycles) || sys_halt_p()) {
 #ifdef S6502_AOT_DISPATCH
   _aot_return:
@@ -132,6 +150,21 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
       NEXT;
     };
   _next:
+#if defined(S6502_TEST_STOP_PREDICATE)
+    if (S6502_TEST_STOP_PREDICATE(pc) && executed) {
+#elif defined(S6502_TEST_STOP_PC)
+    if (pc == (uint16_t)S6502_TEST_STOP_PC && executed) {
+#endif
+#if defined(S6502_TEST_STOP_PREDICATE) || defined(S6502_TEST_STOP_PC)
+      u->pc = pc;
+      u->ac = ac;
+      u->ix = ix;
+      u->iy = iy;
+      u->sp = sp;
+      u->status = status;
+      return executed;
+    }
+#endif
 #ifdef S6502_NO_COMPUTED_GOTO
     switch (S6502_FETCH_OPCODE()) {
     case 0x00: goto _00;
@@ -2354,6 +2387,9 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
 #endif
 #ifdef S6502_GAME_AOT_EMIT_BLOCKS
 #include "s6502_game_load_aot.h"
+#endif
+#ifdef S6502_GAME_HLE_EMIT_BLOCKS
+#include "s6502_game_hle.h"
 #endif
   };
 #undef CYCLES

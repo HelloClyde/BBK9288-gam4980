@@ -109,6 +109,22 @@ int main(int argc, char **argv)
     gam4980_set_game_load_aot_enabled(
         getenv("GAM4980_DISABLE_GAME_LOAD_AOT") == 0
     );
+    {
+        const char *semantic_mask = getenv("GAM4980_GAME_AOT_SEMANTIC_MASK");
+
+        if (semantic_mask && *semantic_mask)
+            gam4980_set_game_aot_semantic_mask(
+                (u32)strtoul(semantic_mask, 0, 0)
+            );
+        semantic_mask = getenv("GAM4980_GAME_AOT_ENTRY_LIMIT");
+        if (semantic_mask && *semantic_mask)
+            gam4980_set_game_aot_entry_limit(
+                (u32)strtoul(semantic_mask, 0, 0)
+            );
+        gam4980_set_game_aot_direct_links(
+            getenv("GAM4980_DISABLE_GAME_AOT_DIRECT_LINKS") == 0
+        );
+    }
 #endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
     gam4980_set_firmware_hle_enabled(
@@ -162,11 +178,65 @@ int main(int argc, char **argv)
     );
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
     printf(
-        "game aot entries=%u instructions=%llu enabled=%d\n",
+        "game aot entries=%u semantic=%u reachable=%u linked_calls=%u "
+        "direct_link_available=%d direct_link_hits=%u code_size=%u "
+        "instructions=%llu enabled=%d "
+        "hle_matches=%u\n",
         (unsigned)gam4980_game_aot_entry_count(),
+        (unsigned)gam4980_game_aot_semantic_count(),
+        (unsigned)gam4980_game_aot_reachable_count(),
+        (unsigned)gam4980_game_aot_linked_call_count(),
+        gam4980_game_aot_direct_link_available(),
+        (unsigned)gam4980_game_aot_direct_link_hits(),
+        (unsigned)gam4980_game_aot_code_size(),
         (unsigned long long)gam4980_game_aot_instruction_count(),
-        gam4980_game_aot_enabled()
+        gam4980_game_aot_enabled(),
+        (unsigned)gam4980_game_hle_match_count()
     );
+    printf(
+        "direct link stages eligible=%u signature=%u metadata=%u "
+        "mapping=%u budget=%u\n",
+        (unsigned)gam4980_game_aot_direct_link_stage_hits(0u),
+        (unsigned)gam4980_game_aot_direct_link_stage_hits(1u),
+        (unsigned)gam4980_game_aot_direct_link_stage_hits(2u),
+        (unsigned)gam4980_game_aot_direct_link_stage_hits(3u),
+        (unsigned)gam4980_game_aot_direct_link_stage_hits(4u)
+    );
+    {
+        u64 pattern_hits[16] = {0};
+        u32 entry_id;
+
+        for (entry_id = 0u;
+             entry_id < gam4980_game_aot_entry_count(); ++entry_id) {
+            u32 pattern = gam4980_game_aot_entry_pattern(entry_id);
+
+            if (pattern < 16u)
+                pattern_hits[pattern] +=
+                    gam4980_game_aot_entry_hit_count(entry_id);
+        }
+        for (entry_id = 0u; entry_id < 16u; ++entry_id) {
+            if (pattern_hits[entry_id])
+                printf(
+                    "game aot pattern=%u hits=%llu\n", (unsigned)entry_id,
+                    (unsigned long long)pattern_hits[entry_id]
+                );
+        }
+        if (getenv("GAM4980_SMOKE_AOT_ENTRIES")) {
+            for (entry_id = 0u;
+                 entry_id < gam4980_game_aot_entry_count(); ++entry_id) {
+                u64 hits = gam4980_game_aot_entry_hit_count(entry_id);
+
+                if (hits)
+                    printf(
+                        "game aot entry=%u pc=%06x pattern=%u hits=%llu\n",
+                        (unsigned)entry_id,
+                        (unsigned)gam4980_game_aot_entry_physical_pc(entry_id),
+                        (unsigned)gam4980_game_aot_entry_pattern(entry_id),
+                        (unsigned long long)hits
+                    );
+            }
+        }
+    }
 #endif
 #endif
 #ifdef GAM4980_RUNTIME_PERFORMANCE_LOG
@@ -179,17 +249,55 @@ int main(int argc, char **argv)
     );
 #endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    {
+        u32 path_id;
+
     printf(
         "firmware hle enabled=%d hits=%u cycles=%llu\n",
         gam4980_firmware_hle_enabled(),
         (unsigned)gam4980_firmware_hle_hits(),
         (unsigned long long)gam4980_firmware_hle_guest_cycles()
     );
+    printf(
+        "resource span cache hits=%u misses=%u\n",
+        (unsigned)gam4980_resource_span_cache_hits(),
+        (unsigned)gam4980_resource_span_cache_misses()
+    );
+        for (path_id = 0;
+             path_id < gam4980_firmware_hle_path_count(); ++path_id) {
+            printf(
+                "hle path=%u pc=%04x attempts=%u hits=%u cond=%u budget=%u "
+                "batch_groups=%u batch_iterations=%u batch_max=%u "
+                "direct_groups=%u direct_iterations=%u "
+                "cycles=%llu\n",
+                (unsigned)path_id,
+                (unsigned)gam4980_firmware_hle_path_pc(path_id),
+                (unsigned)gam4980_firmware_hle_path_attempts(path_id),
+                (unsigned)gam4980_firmware_hle_path_hits(path_id),
+                (unsigned)gam4980_firmware_hle_path_condition_rejects(path_id),
+                (unsigned)gam4980_firmware_hle_path_budget_rejects(path_id),
+                (unsigned)gam4980_firmware_hle_path_batch_groups(path_id),
+                (unsigned)gam4980_firmware_hle_path_batch_iterations(path_id),
+                (unsigned)gam4980_firmware_hle_path_batch_max(path_id),
+                (unsigned)gam4980_firmware_hle_path_direct_groups(path_id),
+                (unsigned)
+                    gam4980_firmware_hle_path_direct_iterations(path_id),
+                (unsigned long long)
+                    gam4980_firmware_hle_path_guest_cycles(path_id)
+            );
+        }
+    }
 #endif
 #ifdef GAM4980_STATE_DIAGNOSTICS
     printf(
         "state hash=%016llx\n",
         (unsigned long long)gam4980_state_hash()
+    );
+    printf(
+        "state cpu=%016llx ram=%016llx timing=%016llx\n",
+        (unsigned long long)gam4980_state_cpu_hash(),
+        (unsigned long long)gam4980_state_ram_hash(),
+        (unsigned long long)gam4980_state_timing_hash()
     );
 #endif
     gam4980_deinit();

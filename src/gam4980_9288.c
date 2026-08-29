@@ -15,13 +15,15 @@
 #define SCREEN_PITCH_BYTES 80
 #define SCREEN_FRAME_BYTES (SCREEN_PITCH_BYTES * GAM_SCREEN_HEIGHT)
 #define BBK9288_FIRMWARE_SYS_BLT_FRAME_OFFSET 0x5b0u
+#define BBK9288_FIRMWARE_GET_RTC6_OFFSET 0x590u
 #define VIEW_X 1
 #define VIEW_Y 24
 #define FRAME_RATE_HZ 60u
-#define GUI_TIMER_HZ 20u
+#define GUI_TIMER_HZ 40u
 #define FRAME_TIMER_ID 1
-#define FRAME_TIMER_SPEED 20
-#define EXIT_HOLD_TIMER_TICKS 20u
+#define FRAME_TIMER_SPEED 1
+#define EXIT_HOLD_TIMER_TICKS 40u
+#define SETTINGS_VERSION 2u
 
 /* Keep the public 9288 SDK ABI compile-checked.  Its SysBltFrame member is at
  * +0x59c; the runtime firmware compatibility shift is handled at the call. */
@@ -45,7 +47,6 @@ static const char k_game_dir[] = "a:\\gam4980\\";
 static const char k_game_pattern[] = "a:\\gam4980\\*.*";
 static const char k_config_path[] = "a:\\gam4980\\GAM4980.CFG";
 static const char k_performance_log_path[] = "a:\\gam4980\\PERF.LOG";
-static const char k_append_mode[] = "ab";
 static const u8 k_expand_2x_pair[4] = {0xffu, 0xf0u, 0x0fu, 0x00u};
 #ifdef GAM4980_LOAD_DIAGNOSTICS
 static const char k_diag_path[] = "a:\\gam4980\\DIAG.TXT";
@@ -73,13 +74,11 @@ static const T_BYTE k_setting_aot_off[] = {
     0xa3, 0xba, 0xb9, 0xd8, 0
 }; /* 加载时 AOT：关 (GBK) */
 static const T_BYTE k_setting_hle_on[] = {
-    0xb9, 0xcc, 0xbc, 0xfe, ' ', 'H', 'L', 'E',
-    0xa3, 0xba, 0xbf, 0xaa, 0
-}; /* 固件 HLE：开 (GBK) */
+    'H', 'L', 'E', 0xa3, 0xba, 0xbf, 0xaa, 0
+}; /* HLE：开 (GBK) */
 static const T_BYTE k_setting_hle_off[] = {
-    0xb9, 0xcc, 0xbc, 0xfe, ' ', 'H', 'L', 'E',
-    0xa3, 0xba, 0xb9, 0xd8, 0
-}; /* 固件 HLE：关 (GBK) */
+    'H', 'L', 'E', 0xa3, 0xba, 0xb9, 0xd8, 0
+}; /* HLE：关 (GBK) */
 static const T_BYTE k_setting_debug_on[] = {
     0xd0, 0xd4, 0xc4, 0xdc, 0xb5, 0xf7, 0xca, 0xd4,
     0xa3, 0xba, 0xbf, 0xaa, 0
@@ -100,6 +99,67 @@ static const T_BYTE k_setting_return[] = {
     0xb7, 0xb5, 0xbb, 0xd8, 0xd3, 0xce, 0xcf, 0xb7,
     0xc1, 0xd0, 0xb1, 0xed, 0
 }; /* 返回游戏列表 (GBK) */
+static const T_BYTE k_loading_prepare[] = "PREPARING RUNTIME";
+static const T_BYTE k_loading_read[] = "READING GAME FILE";
+static const T_BYTE k_loading_hle[] = "MATCHING GAME HLE";
+static const T_BYTE k_loading_cfg[] = "ANALYZING GAME CODE";
+static const T_BYTE k_loading_aot[] = "BUILDING AOT INDEX";
+static const T_BYTE k_loading_save[] = "LOADING SAVE DATA";
+static const T_BYTE k_loading_start[] = "STARTING GAME";
+
+/* Compact 5x7 glyph rows for a true framebuffer Loading page.  The 9288
+ * game window's GUI TextOut path does not reach the game HSDMA surface on all
+ * firmware revisions, so these ASCII states are rendered into the same 2-bpp
+ * 320x240 buffer used by normal gameplay.  Entries 0..9 are digits and
+ * 10..35 are A..Z. */
+static const u8 k_loading_font[36][7] = {
+    {0x0e,0x11,0x13,0x15,0x19,0x11,0x0e}, /* 0 */
+    {0x04,0x0c,0x04,0x04,0x04,0x04,0x0e}, /* 1 */
+    {0x0e,0x11,0x01,0x02,0x04,0x08,0x1f}, /* 2 */
+    {0x1e,0x01,0x01,0x0e,0x01,0x01,0x1e}, /* 3 */
+    {0x02,0x06,0x0a,0x12,0x1f,0x02,0x02}, /* 4 */
+    {0x1f,0x10,0x10,0x1e,0x01,0x01,0x1e}, /* 5 */
+    {0x06,0x08,0x10,0x1e,0x11,0x11,0x0e}, /* 6 */
+    {0x1f,0x01,0x02,0x04,0x08,0x08,0x08}, /* 7 */
+    {0x0e,0x11,0x11,0x0e,0x11,0x11,0x0e}, /* 8 */
+    {0x0e,0x11,0x11,0x0f,0x01,0x02,0x0c}, /* 9 */
+    {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}, /* A */
+    {0x1e,0x11,0x11,0x1e,0x11,0x11,0x1e}, /* B */
+    {0x0e,0x11,0x10,0x10,0x10,0x11,0x0e}, /* C */
+    {0x1e,0x11,0x11,0x11,0x11,0x11,0x1e}, /* D */
+    {0x1f,0x10,0x10,0x1e,0x10,0x10,0x1f}, /* E */
+    {0x1f,0x10,0x10,0x1e,0x10,0x10,0x10}, /* F */
+    {0x0e,0x11,0x10,0x17,0x11,0x11,0x0f}, /* G */
+    {0x11,0x11,0x11,0x1f,0x11,0x11,0x11}, /* H */
+    {0x0e,0x04,0x04,0x04,0x04,0x04,0x0e}, /* I */
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0c}, /* J */
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* K */
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1f}, /* L */
+    {0x11,0x1b,0x15,0x15,0x11,0x11,0x11}, /* M */
+    {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, /* N */
+    {0x0e,0x11,0x11,0x11,0x11,0x11,0x0e}, /* O */
+    {0x1e,0x11,0x11,0x1e,0x10,0x10,0x10}, /* P */
+    {0x0e,0x11,0x11,0x11,0x15,0x12,0x0d}, /* Q */
+    {0x1e,0x11,0x11,0x1e,0x14,0x12,0x11}, /* R */
+    {0x0f,0x10,0x10,0x0e,0x01,0x01,0x1e}, /* S */
+    {0x1f,0x04,0x04,0x04,0x04,0x04,0x04}, /* T */
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0e}, /* U */
+    {0x11,0x11,0x11,0x11,0x11,0x0a,0x04}, /* V */
+    {0x11,0x11,0x11,0x15,0x15,0x15,0x0a}, /* W */
+    {0x11,0x11,0x0a,0x04,0x0a,0x11,0x11}, /* X */
+    {0x11,0x11,0x0a,0x04,0x04,0x04,0x04}, /* Y */
+    {0x1f,0x01,0x02,0x04,0x08,0x10,0x1f}  /* Z */
+};
+
+enum T_GAM4980_LoadPhase {
+    LOAD_PHASE_NONE = 0,
+    LOAD_PHASE_PREPARE,
+    LOAD_PHASE_READ,
+    LOAD_PHASE_HLE,
+    LOAD_PHASE_CFG,
+    LOAD_PHASE_AOT,
+    LOAD_PHASE_SAVE,
+};
 
 static T_GUI_HWND g_main_window;
 static T_GUI_HDC g_game_hdc;
@@ -125,7 +185,11 @@ static int g_setting_load_aot = 1;
 #else
 static int g_setting_load_aot;
 #endif
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+static int g_setting_firmware_hle = 1;
+#else
 static int g_setting_firmware_hle;
+#endif
 static int g_setting_performance_debug;
 static int g_setting_double_speed;
 static u8 g_static_ram[GAM4980_RAM_SIZE]
@@ -141,24 +205,117 @@ static int g_first_frame_logged;
 static int g_frame_tick_pending;
 typedef struct T_GAM4980_PerformanceMetrics {
     u32 load_begin_tick;
-    u32 session_begin_tick;
+    u32 session_last_tick;
     u32 game_size;
     u32 flash_size;
     u32 core_init_ticks;
     u32 game_read_ticks;
     u32 game_header_ticks;
     u32 load_total_ticks;
+    u32 load_rtc_elapsed_ms;
+    u32 load_rtc_elapsed_valid;
+    u32 load_prepare_rtc_elapsed_ms;
+    u32 load_prepare_rtc_elapsed_valid;
+    u32 load_read_rtc_elapsed_ms;
+    u32 load_read_rtc_elapsed_valid;
+    u32 load_hle_rtc_elapsed_ms;
+    u32 load_hle_rtc_elapsed_valid;
+    u32 load_cfg_rtc_elapsed_ms;
+    u32 load_cfg_rtc_elapsed_valid;
+    u32 load_aot_rtc_elapsed_ms;
+    u32 load_aot_rtc_elapsed_valid;
+    u32 load_save_rtc_elapsed_ms;
+    u32 load_save_rtc_elapsed_valid;
     u32 first_frame_ticks;
     u32 session_ticks;
+    u32 rtc_start_day;
+    u32 rtc_start_time_ms;
+    u32 rtc_end_day;
+    u32 rtc_end_time_ms;
+    u32 rtc_elapsed_ms;
+    u32 rtc_start_valid;
+    u32 rtc_end_valid;
+    u32 rtc_elapsed_valid;
+    u32 timer_messages_received;
+    u32 timer_messages_while_pending;
     u32 timer_batches;
     u32 guest_frames;
+    u32 scheduler_batches_0_frames;
+    u32 scheduler_batches_1_frame;
+    u32 scheduler_batches_2_frames;
+    u32 scheduler_batches_3_frames;
+    u32 scheduler_batches_other;
+    u32 batch_work_ticks_total;
+    u32 batch_work_ticks_min;
+    u32 batch_work_ticks_max;
+    u32 batch_work_samples;
+    u32 batch_work_zero_ticks;
+    u32 batch_work_at_or_over_deadline;
+    u32 core_work_ticks_total;
+    u32 core_work_ticks_min;
+    u32 core_work_ticks_max;
+    u32 core_work_samples;
+    u32 render_work_ticks_total;
+    u32 render_work_ticks_min;
+    u32 render_work_ticks_max;
+    u32 render_work_samples;
+    u32 present_work_ticks_total;
+    u32 present_work_ticks_min;
+    u32 present_work_ticks_max;
+    u32 present_work_samples;
+    u32 batch_guest_cycles_min;
+    u32 batch_guest_cycles_max;
+    u32 batch_guest_cycle_samples;
     u32 render_updates;
     u32 screen_submissions;
+    u32 timer_delta_min_ticks;
+    u32 timer_delta_max_ticks;
+    u32 timer_delta_under_10;
+    u32 timer_delta_equal_10;
+    u32 timer_delta_over_10;
+    u32 paint_submit_requests;
+    u32 paint_messages;
+    u32 paint_completed;
+    u32 paint_with_submission;
+    u32 paint_without_submission;
+    u32 paint_submit_overwrites;
+    u32 paint_max_submissions_per_message;
+    u32 paint_first_latency_ticks_total;
+    u32 paint_first_latency_ticks_max;
+    u32 paint_last_latency_ticks_total;
+    u32 paint_last_latency_ticks_max;
+    u32 paint_interval_ticks_total;
+    u32 paint_interval_ticks_min;
+    u32 paint_interval_ticks_max;
+    u32 paint_interval_samples;
+    u32 paint_invalidate_failures;
     u32 rom_reads;
     u32 rom_bytes;
 } T_GAM4980_PerformanceMetrics;
 
+typedef struct T_GAM4980_RtcMarker {
+    u32 day;
+    u32 time_ms;
+    u32 valid;
+} T_GAM4980_RtcMarker;
+
 static T_GAM4980_PerformanceMetrics g_performance;
+static T_GAM4980_RtcMarker g_load_total_rtc_start;
+static T_GAM4980_RtcMarker g_load_phase_rtc_start;
+static u32 g_load_phase;
+static const T_BYTE *g_loading_status;
+static u32 g_loading_step;
+static u32 g_loading_current;
+static u32 g_loading_total;
+static u32 g_loading_paint_serial;
+static int g_loading_active;
+static int g_paint_tracking_active;
+static int g_paint_pending;
+static int g_last_paint_tick_valid;
+static u32 g_pending_paint_submissions;
+static u32 g_first_pending_submit_tick;
+static u32 g_last_pending_submit_tick;
+static u32 g_last_paint_tick;
 /* The 9288 GUI game interface submits a complete 0x4b00-byte virtual screen. */
 static u8 g_screen_frame[SCREEN_FRAME_BYTES]
     __attribute__((aligned(4), section(".scratch")));
@@ -171,6 +328,10 @@ static u32 g_expand_2x_shifted[2][256]
 
 typedef void (*T_9288_SysBltFrame)(
     T_GUI_HDC hdc, unsigned char *virtual_screen
+);
+typedef void (*T_9288_GetRtc6)(
+    u8 *second, u8 *minute, u8 *hour,
+    u16 *day, u16 *month, u16 *year
 );
 
 #ifdef GAM4980_MEMORY_DIAGNOSTICS
@@ -229,7 +390,171 @@ void *memset(void *destination, int value, unsigned int size)
 
 static u32 tick_elapsed(u32 start, u32 end)
 {
-    return end - start;
+    /* The public 9288 GUI ABI returns a 16-bit tick counter.  Subtract in
+     * that width so short measurements remain correct across one wrap. */
+    return (u16)((u16)end - (u16)start);
+}
+
+static u32 date_day_number(u16 year, u16 month, u16 day)
+{
+    static const u16 days_before_month[12] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+    };
+    u32 y;
+    u32 result;
+
+    if (year < 1900u || month == 0u || month > 12u ||
+        day == 0u || day > 31u)
+        return 0u;
+    y = (u32)year - 1u;
+    result = y * 365u + y / 4u - y / 100u + y / 400u;
+    result += days_before_month[month - 1u] + day;
+    if (month > 2u && (year % 4u) == 0u &&
+        ((year % 100u) != 0u || (year % 400u) == 0u))
+        ++result;
+    return result;
+}
+
+static int read_wall_rtc(u32 *day, u32 *time_ms)
+{
+    T_9288_GetRtc6 get_rtc = *(T_9288_GetRtc6 *)(void *)(
+        (u8 *)(void *)tpDL_GUITable + BBK9288_FIRMWARE_GET_RTC6_OFFSET
+    );
+    u8 second = 0;
+    u8 minute = 0;
+    u8 hour = 0;
+    u16 date_day = 0;
+    u16 month = 0;
+    u16 year = 0;
+
+    if (!get_rtc || !day || !time_ms)
+        return 0;
+    get_rtc(&second, &minute, &hour, &date_day, &month, &year);
+    if (hour > 23u || minute > 59u || second > 59u)
+        return 0;
+    *day = date_day_number(year, month, date_day);
+    if (!*day)
+        return 0;
+    *time_ms = ((u32)hour * 3600u + (u32)minute * 60u + second) * 1000u;
+    return 1;
+}
+
+static int wall_rtc_elapsed_ms(
+    u32 start_day, u32 start_time_ms, u32 end_day, u32 end_time_ms,
+    u32 *elapsed
+)
+{
+    u32 day_delta;
+
+    if (!elapsed || end_day < start_day)
+        return 0;
+    day_delta = end_day - start_day;
+    if (day_delta == 0u) {
+        if (end_time_ms < start_time_ms)
+            return 0;
+        *elapsed = end_time_ms - start_time_ms;
+        return 1;
+    }
+    if (day_delta == 1u) {
+        *elapsed = 86400000u - start_time_ms + end_time_ms;
+        return 1;
+    }
+    return 0;
+}
+
+static void load_rtc_begin_total(void)
+{
+    memset(&g_load_total_rtc_start, 0, sizeof(g_load_total_rtc_start));
+    if (!g_setting_performance_debug)
+        return;
+    g_load_total_rtc_start.valid = (u32)read_wall_rtc(
+        &g_load_total_rtc_start.day,
+        &g_load_total_rtc_start.time_ms
+    );
+}
+
+static void load_rtc_end_total(void)
+{
+    u32 end_day;
+    u32 end_time_ms;
+
+    if (!g_setting_performance_debug || !g_load_total_rtc_start.valid ||
+        !read_wall_rtc(&end_day, &end_time_ms))
+        return;
+    g_performance.load_rtc_elapsed_valid = (u32)wall_rtc_elapsed_ms(
+        g_load_total_rtc_start.day, g_load_total_rtc_start.time_ms,
+        end_day, end_time_ms, &g_performance.load_rtc_elapsed_ms
+    );
+}
+
+static void load_rtc_phase_targets(
+    u32 phase, u32 **elapsed_ms, u32 **valid
+)
+{
+    *elapsed_ms = 0;
+    *valid = 0;
+    switch (phase) {
+    case LOAD_PHASE_PREPARE:
+        *elapsed_ms = &g_performance.load_prepare_rtc_elapsed_ms;
+        *valid = &g_performance.load_prepare_rtc_elapsed_valid;
+        break;
+    case LOAD_PHASE_READ:
+        *elapsed_ms = &g_performance.load_read_rtc_elapsed_ms;
+        *valid = &g_performance.load_read_rtc_elapsed_valid;
+        break;
+    case LOAD_PHASE_HLE:
+        *elapsed_ms = &g_performance.load_hle_rtc_elapsed_ms;
+        *valid = &g_performance.load_hle_rtc_elapsed_valid;
+        break;
+    case LOAD_PHASE_CFG:
+        *elapsed_ms = &g_performance.load_cfg_rtc_elapsed_ms;
+        *valid = &g_performance.load_cfg_rtc_elapsed_valid;
+        break;
+    case LOAD_PHASE_AOT:
+        *elapsed_ms = &g_performance.load_aot_rtc_elapsed_ms;
+        *valid = &g_performance.load_aot_rtc_elapsed_valid;
+        break;
+    case LOAD_PHASE_SAVE:
+        *elapsed_ms = &g_performance.load_save_rtc_elapsed_ms;
+        *valid = &g_performance.load_save_rtc_elapsed_valid;
+        break;
+    default:
+        break;
+    }
+}
+
+static void load_rtc_begin_phase(u32 phase)
+{
+    g_load_phase = phase;
+    memset(&g_load_phase_rtc_start, 0, sizeof(g_load_phase_rtc_start));
+    if (!g_setting_performance_debug)
+        return;
+    g_load_phase_rtc_start.valid = (u32)read_wall_rtc(
+        &g_load_phase_rtc_start.day,
+        &g_load_phase_rtc_start.time_ms
+    );
+}
+
+static void load_rtc_end_phase(u32 phase)
+{
+    u32 end_day;
+    u32 end_time_ms;
+    u32 *elapsed_ms;
+    u32 *valid;
+
+    if (g_load_phase != phase)
+        return;
+    g_load_phase = LOAD_PHASE_NONE;
+    if (!g_setting_performance_debug || !g_load_phase_rtc_start.valid ||
+        !read_wall_rtc(&end_day, &end_time_ms))
+        return;
+    load_rtc_phase_targets(phase, &elapsed_ms, &valid);
+    if (!elapsed_ms || !valid)
+        return;
+    *valid = (u32)wall_rtc_elapsed_ms(
+        g_load_phase_rtc_start.day, g_load_phase_rtc_start.time_ms,
+        end_day, end_time_ms, elapsed_ms
+    );
 }
 
 static int is_exit_scancode(T_UHWORD scancode)
@@ -370,7 +695,11 @@ static void load_settings(void)
     FS_FILE *file = fs_fopen(k_config_path, FS_O_RDONLY);
 
     g_setting_performance_debug = 0;
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    g_setting_firmware_hle = 1;
+#else
     g_setting_firmware_hle = 0;
+#endif
     g_setting_double_speed = 0;
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
     g_setting_load_aot = 1;
@@ -388,7 +717,7 @@ static void load_settings(void)
     }
     fs_fclose(file);
     if (data[0] != 'G' || data[1] != '4' || data[2] != '9' ||
-        data[3] != '8' || data[4] != 1u ||
+        data[3] != '8' || (data[4] != 1u && data[4] != SETTINGS_VERSION) ||
         data[6] != settings_checksum(data, 6u) || data[7] != (u8)~data[6])
         return;
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
@@ -396,14 +725,25 @@ static void load_settings(void)
 #endif
     g_setting_performance_debug = (data[5] & 0x02u) != 0u;
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
-    g_setting_firmware_hle = (data[5] & 0x04u) != 0u;
+    if (data[4] == 1u) {
+        /* HLE was experimental and default-off in version 1.  It has since
+         * passed target-screen and long-run state checks, so migrate existing
+         * installs to the faster default once.  Version 2 continues to
+         * preserve an explicit user choice. */
+        g_setting_firmware_hle = 1;
+        g_settings_dirty = 1;
+    } else {
+        g_setting_firmware_hle = (data[5] & 0x04u) != 0u;
+    }
 #endif
     g_setting_double_speed = (data[5] & 0x08u) != 0u;
 }
 
 static void save_settings(void)
 {
-    u8 data[8] = {'G', '4', '9', '8', 1u, 0u, 0u, 0u};
+    u8 data[8] = {
+        'G', '4', '9', '8', SETTINGS_VERSION, 0u, 0u, 0u
+    };
     FS_FILE *file;
 
     if (!g_settings_dirty)
@@ -431,6 +771,176 @@ static void save_settings(void)
 static void reset_performance_metrics(void)
 {
     memset(&g_performance, 0, sizeof(g_performance));
+    memset(&g_load_total_rtc_start, 0, sizeof(g_load_total_rtc_start));
+    memset(&g_load_phase_rtc_start, 0, sizeof(g_load_phase_rtc_start));
+    g_load_phase = LOAD_PHASE_NONE;
+    g_paint_tracking_active = 0;
+    g_paint_pending = 0;
+    g_last_paint_tick_valid = 0;
+    g_pending_paint_submissions = 0u;
+    g_first_pending_submit_tick = 0u;
+    g_last_pending_submit_tick = 0u;
+    g_last_paint_tick = 0u;
+}
+
+static void performance_begin_paint_tracking(void)
+{
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    /* Paint timing needs several GUI clock reads per submission.  The light
+     * benchmark measures only wall throughput and deliberately omits it. */
+    g_paint_tracking_active = 0;
+    return;
+#else
+    if (!g_setting_performance_debug)
+        return;
+    g_paint_tracking_active = 1;
+    g_paint_pending = 0;
+    g_last_paint_tick_valid = 0;
+    g_pending_paint_submissions = 0u;
+#endif
+}
+
+static void performance_begin_session(void)
+{
+    if (!g_setting_performance_debug)
+        return;
+    g_performance.session_ticks = 0u;
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    g_performance.session_last_tick = (u16)fnGUI_GetTickCount();
+#endif
+    g_performance.rtc_start_valid = (u32)read_wall_rtc(
+        &g_performance.rtc_start_day,
+        &g_performance.rtc_start_time_ms
+    );
+}
+
+static u32 performance_accumulate_session_ticks(void)
+{
+    u32 now;
+    u32 elapsed;
+
+    if (!g_setting_performance_debug)
+        return 0u;
+    now = (u16)fnGUI_GetTickCount();
+    elapsed = tick_elapsed(g_performance.session_last_tick, now);
+    g_performance.session_ticks += elapsed;
+    g_performance.session_last_tick = now;
+    return elapsed;
+}
+
+static void performance_end_session(void)
+{
+    if (!g_setting_performance_debug)
+        return;
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    (void)performance_accumulate_session_ticks();
+#endif
+    g_performance.rtc_end_valid = (u32)read_wall_rtc(
+        &g_performance.rtc_end_day,
+        &g_performance.rtc_end_time_ms
+    );
+    if (g_performance.rtc_start_valid && g_performance.rtc_end_valid) {
+        g_performance.rtc_elapsed_valid = (u32)wall_rtc_elapsed_ms(
+            g_performance.rtc_start_day,
+            g_performance.rtc_start_time_ms,
+            g_performance.rtc_end_day,
+            g_performance.rtc_end_time_ms,
+            &g_performance.rtc_elapsed_ms
+        );
+    }
+}
+
+static void performance_record_duration(
+    u32 elapsed, u32 *total, u32 *minimum, u32 *maximum, u32 *samples
+)
+{
+    *total += elapsed;
+    if (!*samples || elapsed < *minimum)
+        *minimum = elapsed;
+    if (elapsed > *maximum)
+        *maximum = elapsed;
+    ++*samples;
+}
+
+static void performance_record_screen_submission(T_BOOL invalidated)
+{
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    (void)invalidated;
+    return;
+#else
+    u32 now;
+
+    if (!g_paint_tracking_active)
+        return;
+    now = (u16)fnGUI_GetTickCount();
+    ++g_performance.paint_submit_requests;
+    if (!invalidated)
+        ++g_performance.paint_invalidate_failures;
+    if (g_paint_pending) {
+        ++g_performance.paint_submit_overwrites;
+        ++g_pending_paint_submissions;
+        g_last_pending_submit_tick = now;
+    } else if (invalidated) {
+        g_paint_pending = 1;
+        g_pending_paint_submissions = 1u;
+        g_first_pending_submit_tick = now;
+        g_last_pending_submit_tick = now;
+    }
+#endif
+}
+
+static void performance_record_paint_message(void)
+{
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    return;
+#else
+    u32 now;
+    u32 elapsed;
+
+    if (!g_paint_tracking_active)
+        return;
+    now = (u16)fnGUI_GetTickCount();
+    ++g_performance.paint_messages;
+    if (g_last_paint_tick_valid) {
+        elapsed = tick_elapsed(g_last_paint_tick, now);
+        g_performance.paint_interval_ticks_total += elapsed;
+        if (!g_performance.paint_interval_samples ||
+            elapsed < g_performance.paint_interval_ticks_min)
+            g_performance.paint_interval_ticks_min = elapsed;
+        if (elapsed > g_performance.paint_interval_ticks_max)
+            g_performance.paint_interval_ticks_max = elapsed;
+        ++g_performance.paint_interval_samples;
+    }
+    g_last_paint_tick = now;
+    g_last_paint_tick_valid = 1;
+    if (!g_paint_pending) {
+        ++g_performance.paint_without_submission;
+        return;
+    }
+    ++g_performance.paint_with_submission;
+    if (g_pending_paint_submissions >
+        g_performance.paint_max_submissions_per_message)
+        g_performance.paint_max_submissions_per_message =
+            g_pending_paint_submissions;
+    elapsed = tick_elapsed(g_first_pending_submit_tick, now);
+    g_performance.paint_first_latency_ticks_total += elapsed;
+    if (elapsed > g_performance.paint_first_latency_ticks_max)
+        g_performance.paint_first_latency_ticks_max = elapsed;
+    elapsed = tick_elapsed(g_last_pending_submit_tick, now);
+    g_performance.paint_last_latency_ticks_total += elapsed;
+    if (elapsed > g_performance.paint_last_latency_ticks_max)
+        g_performance.paint_last_latency_ticks_max = elapsed;
+    g_paint_pending = 0;
+    g_pending_paint_submissions = 0u;
+#endif
+}
+
+static void performance_record_paint_completed(void)
+{
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    if (g_paint_tracking_active)
+        ++g_performance.paint_completed;
+#endif
 }
 
 static int open_rom_file(u8 region, const char *path)
@@ -464,10 +974,12 @@ static int read_rom_bank(
     FS_FILE *file;
 
     (void)context;
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
     if (g_setting_performance_debug) {
         ++g_performance.rom_reads;
         g_performance.rom_bytes += size;
     }
+#endif
 #ifdef GAM4980_MEMORY_DIAGNOSTICS
     ++g_gam4980_memory_diagnostic.rom_reads;
     g_gam4980_memory_diagnostic.last_rom_region = region;
@@ -724,6 +1236,155 @@ static void performance_log_u32(
     (void)fs_fwrite(line, 1, (size_t)(out - line), file);
 }
 
+/* The 9288 build is freestanding and intentionally does not link a 64-bit
+ * division runtime.  Performance logging only needs a saturated 32-bit
+ * quotient, so use a small restoring divider at shutdown instead of pulling
+ * compiler support into the gameplay image. */
+static u32 performance_divide_u64_u32(u64 numerator, u32 denominator)
+{
+    u64 remainder = 0u;
+    u32 quotient = 0u;
+    int bit;
+
+    if (!denominator)
+        return 0u;
+    for (bit = 63; bit >= 0; --bit) {
+        remainder = (remainder << 1u) |
+            ((numerator >> (u32)bit) & (u64)1u);
+        if (remainder >= (u64)denominator) {
+            remainder -= (u64)denominator;
+            if (bit >= 32)
+                return 0xffffffffu;
+            quotient |= (u32)1u << (u32)bit;
+        }
+    }
+    return quotient;
+}
+
+static u32 performance_wall_rate_u32(
+    u32 count, u32 elapsed_ms, u32 units_per_count
+)
+{
+    if (!elapsed_ms)
+        return 0u;
+    return performance_divide_u64_u32(
+        (u64)count * (u64)units_per_count, elapsed_ms
+    );
+}
+
+static u32 performance_wall_rate_u64(
+    u64 count, u32 elapsed_ms, u32 units_per_count
+)
+{
+    if (!elapsed_ms)
+        return 0u;
+    return performance_divide_u64_u32(
+        count * (u64)units_per_count, elapsed_ms
+    );
+}
+
+static u32 performance_expected_count(u32 elapsed_ms, u32 frequency_hz)
+{
+    u32 seconds = elapsed_ms / 1000u;
+    u32 remainder_ms = elapsed_ms % 1000u;
+
+    return seconds * frequency_hz +
+        (remainder_ms * frequency_hz + 500u) / 1000u;
+}
+
+static void performance_log_wall_throughput(FS_FILE *file)
+{
+    u32 elapsed_ms = g_performance.rtc_elapsed_ms;
+    u32 expected_guest_hz = g_setting_double_speed ? 120u : 60u;
+    u32 timer_millihz = 0u;
+    u32 guest_millifps = 0u;
+    u32 render_millifps = 0u;
+    u32 submit_millifps = 0u;
+    u32 expected_timers = 0u;
+    u32 expected_frames = 0u;
+    u32 timer_deficit = 0u;
+    u32 timer_excess = 0u;
+    u32 frame_deficit = 0u;
+    u32 frame_excess = 0u;
+
+    if (g_performance.rtc_elapsed_valid && elapsed_ms) {
+        timer_millihz = performance_wall_rate_u32(
+            g_performance.timer_messages_received, elapsed_ms, 1000000u
+        );
+        guest_millifps = performance_wall_rate_u32(
+            g_performance.guest_frames, elapsed_ms, 1000000u
+        );
+        render_millifps = performance_wall_rate_u32(
+            g_performance.render_updates, elapsed_ms, 1000000u
+        );
+        submit_millifps = performance_wall_rate_u32(
+            g_performance.screen_submissions, elapsed_ms, 1000000u
+        );
+        expected_timers = performance_expected_count(elapsed_ms, GUI_TIMER_HZ);
+        expected_frames = performance_expected_count(
+            elapsed_ms, expected_guest_hz
+        );
+        if (expected_timers > g_performance.timer_messages_received)
+            timer_deficit = expected_timers -
+                g_performance.timer_messages_received;
+        else
+            timer_excess = g_performance.timer_messages_received -
+                expected_timers;
+        if (expected_frames > g_performance.guest_frames)
+            frame_deficit = expected_frames - g_performance.guest_frames;
+        else
+            frame_excess = g_performance.guest_frames - expected_frames;
+    }
+
+    /* GetRtc6 exposes whole seconds.  Rates are therefore approximate over
+     * short captures; use sessions of at least 30 seconds on real hardware. */
+    performance_log_u32(file, "wall_rate_valid", elapsed_ms != 0u &&
+        g_performance.rtc_elapsed_valid != 0u);
+    performance_log_u32(file, "wall_rate_rtc_resolution_ms", 1000u);
+    performance_log_u32(file, "wall_timer_millihz", timer_millihz);
+    performance_log_u32(file, "wall_guest_millifps", guest_millifps);
+    performance_log_u32(file, "wall_render_millifps", render_millifps);
+    performance_log_u32(file, "wall_submit_millifps", submit_millifps);
+    performance_log_u32(
+        file, "wall_effective_speed_percent_x100", guest_millifps / 6u
+    );
+    performance_log_u32(
+        file, "wall_requested_speed_achieved_percent_x100",
+        expected_guest_hz ? guest_millifps * 10u / expected_guest_hz : 0u
+    );
+    performance_log_u32(
+        file, "wall_expected_timer_messages_approx", expected_timers
+    );
+    performance_log_u32(file, "wall_timer_message_deficit", timer_deficit);
+    performance_log_u32(file, "wall_timer_message_excess", timer_excess);
+    performance_log_u32(
+        file, "wall_expected_guest_frames_approx", expected_frames
+    );
+    performance_log_u32(file, "wall_guest_frame_deficit", frame_deficit);
+    performance_log_u32(file, "wall_guest_frame_excess", frame_excess);
+#if defined(GAM4980_RUNTIME_PERFORMANCE_LOG) && \
+    !defined(GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG)
+    performance_log_u32(
+        file, "wall_core_exec_calls_per_second",
+        performance_wall_rate_u32(
+            gam4980_performance_exec_calls(), elapsed_ms, 1000u
+        )
+    );
+    performance_log_u32(
+        file, "wall_guest_cycles_per_second",
+        performance_wall_rate_u64(
+            gam4980_performance_guest_cycles(), elapsed_ms, 1000u
+        )
+    );
+    performance_log_u32(
+        file, "wall_scheduled_guest_cycles_per_second",
+        performance_wall_rate_u64(
+            gam4980_performance_scheduled_cycles(), elapsed_ms, 1000u
+        )
+    );
+#endif
+}
+
 #if (defined(GAM4980_ENABLE_AOT) && defined(GAM4980_AOT_DIAGNOSTICS)) || \
     defined(GAM4980_RUNTIME_PERFORMANCE_LOG) || \
     defined(GAM4980_ENABLE_FIRMWARE_HLE)
@@ -754,6 +1415,69 @@ static void performance_log_u64_hex(
 }
 #endif
 
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+static void performance_log_hle_paths(FS_FILE *file)
+{
+    u32 path_id;
+
+    for (path_id = 0;
+         path_id < gam4980_firmware_hle_path_count();
+         ++path_id) {
+        char line[320];
+        char *out = append_text(line, "hle_path=");
+
+        out = append_u32_decimal(out, path_id);
+        out = append_text(out, " pc=");
+        out = append_u32_hex(
+            out, gam4980_firmware_hle_path_pc(path_id), 4
+        );
+        out = append_text(out, " attempts=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_attempts(path_id)
+        );
+        out = append_text(out, " hits=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_hits(path_id)
+        );
+        out = append_text(out, " condition_rejects=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_condition_rejects(path_id)
+        );
+        out = append_text(out, " budget_rejects=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_budget_rejects(path_id)
+        );
+        out = append_text(out, " batch_groups=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_batch_groups(path_id)
+        );
+        out = append_text(out, " batch_iterations=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_batch_iterations(path_id)
+        );
+        out = append_text(out, " batch_max=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_batch_max(path_id)
+        );
+        out = append_text(out, " direct_groups=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_direct_groups(path_id)
+        );
+        out = append_text(out, " direct_iterations=");
+        out = append_u32_decimal(
+            out, gam4980_firmware_hle_path_direct_iterations(path_id)
+        );
+        out = append_text(out, " guest_cycles=");
+        out = append_u64_hex(
+            out, gam4980_firmware_hle_path_guest_cycles(path_id)
+        );
+        *out++ = '\r';
+        *out++ = '\n';
+        (void)fs_fwrite(line, 1, (size_t)(out - line), file);
+    }
+}
+#endif
+
 #if defined(GAM4980_ENABLE_AOT) && defined(GAM4980_AOT_DIAGNOSTICS)
 static void performance_log_aot_blocks(FS_FILE *file)
 {
@@ -764,13 +1488,25 @@ static void performance_log_aot_blocks(FS_FILE *file)
     );
     for (block_id = 0; block_id < gam4980_aot_block_count(); ++block_id) {
         u64 hits = gam4980_aot_block_hit_count(block_id);
-        char line[96];
+        char line[144];
         char *out;
 
         if (!hits)
             continue;
         out = append_text(line, "static_block=");
         out = append_u32_decimal(out, block_id);
+        out = append_text(out, " ppc=");
+        out = append_u32_hex(
+            out, gam4980_aot_block_physical_pc(block_id), 6
+        );
+        out = append_text(out, " vpc=");
+        out = append_u32_hex(
+            out, gam4980_aot_block_virtual_pc(block_id), 4
+        );
+        out = append_text(out, " insns=");
+        out = append_u32_decimal(
+            out, gam4980_aot_block_instruction_count(block_id)
+        );
         out = append_text(out, " hits=");
         out = append_u64_hex(out, hits);
         out = append_text(out, " bank2=");
@@ -784,6 +1520,25 @@ static void performance_log_aot_blocks(FS_FILE *file)
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
     performance_log_u32(
         file, "game_aot_entries", gam4980_game_aot_entry_count()
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_entries", gam4980_game_aot_semantic_count()
+    );
+    performance_log_u32(
+        file, "game_aot_reachable_entries", gam4980_game_aot_reachable_count()
+    );
+    performance_log_u32(
+        file, "game_aot_linked_calls", gam4980_game_aot_linked_call_count()
+    );
+    performance_log_u32(
+        file, "game_aot_direct_link_hits",
+        gam4980_game_aot_direct_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_code_size", gam4980_game_aot_code_size()
+    );
+    performance_log_u32(
+        file, "game_hle_matches", gam4980_game_hle_match_count()
     );
     performance_log_u32(
         file, "game_aot_enabled_end", gam4980_game_aot_enabled() != 0
@@ -830,6 +1585,43 @@ static void performance_log_runtime_samples(FS_FILE *file)
     performance_log_u64_hex(
         file, "guest_cycles", gam4980_performance_guest_cycles()
     );
+    performance_log_u64_hex(
+        file, "scheduled_guest_cycles",
+        gam4980_performance_scheduled_cycles()
+    );
+    performance_log_u64_hex(
+        file, "halt_fast_forward_cycles",
+        gam4980_performance_halted_cycles()
+    );
+    performance_log_u64_hex(
+        file, "emulated_timer_ticks",
+        gam4980_performance_timer_ticks()
+    );
+    performance_log_u32(
+        file, "core_step_frames", gam4980_performance_step_frames()
+    );
+    performance_log_u32(
+        file, "lcd_write_calls", gam4980_performance_lcd_write_calls()
+    );
+    performance_log_u32(
+        file, "lcd_changed_writes",
+        gam4980_performance_lcd_changed_writes()
+    );
+    performance_log_u32(
+        file, "core_render_calls", gam4980_performance_render_calls()
+    );
+    performance_log_u32(
+        file, "core_dirty_render_calls",
+        gam4980_performance_dirty_render_calls()
+    );
+    performance_log_u32(
+        file, "core_changed_render_calls",
+        gam4980_performance_changed_render_calls()
+    );
+    performance_log_u32(
+        file, "pc_sample_stride",
+        gam4980_performance_pc_sample_stride()
+    );
     performance_log_u32(
         file, "pc_sample_count", gam4980_performance_sample_count()
     );
@@ -868,12 +1660,19 @@ static void write_performance_log(void)
 
     if (!g_setting_performance_debug)
         return;
-    file = fs_fopen(k_performance_log_path, k_append_mode);
-    if (!file)
-        file = fs_fopen(k_performance_log_path, FS_O_WRONLY);
+    /* Recreate the log instead of relying on the 9288 FAT implementation's
+     * "wb" truncate path.  Reusing an existing cluster chain can leave a
+     * valid directory length backed by erased NAND data after an interrupted
+     * or emulator-written capture. */
+    (void)fs_remove(k_performance_log_path);
+    file = fs_fopen(k_performance_log_path, FS_O_WRONLY);
     if (!file)
         return;
-    performance_log_text(file, "\r\n[GAM4980 PERF 1]\r\n");
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    performance_log_text(file, "[GAM4980 PERF LIGHT 1]\r\n");
+#else
+    performance_log_text(file, "[GAM4980 PERF 4]\r\n");
+#endif
     performance_log_text(file, "game=");
     name = base_name(g_game_path);
     performance_log_text(file, name);
@@ -883,7 +1682,17 @@ static void write_performance_log(void)
         file, "firmware_hle", g_setting_firmware_hle != 0
     );
     performance_log_u32(file, "speed_2x", g_setting_double_speed != 0);
+    performance_log_u32(
+        file, "requested_speed_percent",
+        g_setting_double_speed ? 200u : 100u
+    );
+    performance_log_u32(
+        file, "expected_guest_hz", g_setting_double_speed ? 120u : 60u
+    );
     performance_log_u32(file, "debug", 1u);
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    performance_log_u32(file, "lightweight_benchmark", 1u);
+#endif
     performance_log_u32(file, "game_size", g_performance.game_size);
     performance_log_u32(file, "flash_size", g_performance.flash_size);
     performance_log_u32(
@@ -899,18 +1708,394 @@ static void write_performance_log(void)
         file, "load_total_ticks", g_performance.load_total_ticks
     );
     performance_log_u32(
+        file, "load_rtc_elapsed_ms", g_performance.load_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_rtc_elapsed_valid",
+        g_performance.load_rtc_elapsed_valid
+    );
+    performance_log_u32(
+        file, "load_prepare_rtc_elapsed_ms",
+        g_performance.load_prepare_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_prepare_rtc_elapsed_valid",
+        g_performance.load_prepare_rtc_elapsed_valid
+    );
+    performance_log_u32(
+        file, "load_read_rtc_elapsed_ms",
+        g_performance.load_read_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_read_rtc_elapsed_valid",
+        g_performance.load_read_rtc_elapsed_valid
+    );
+    performance_log_u32(
+        file, "load_hle_rtc_elapsed_ms",
+        g_performance.load_hle_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_hle_rtc_elapsed_valid",
+        g_performance.load_hle_rtc_elapsed_valid
+    );
+    performance_log_u32(
+        file, "load_cfg_rtc_elapsed_ms",
+        g_performance.load_cfg_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_cfg_rtc_elapsed_valid",
+        g_performance.load_cfg_rtc_elapsed_valid
+    );
+    performance_log_u32(
+        file, "load_aot_rtc_elapsed_ms",
+        g_performance.load_aot_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_aot_rtc_elapsed_valid",
+        g_performance.load_aot_rtc_elapsed_valid
+    );
+    performance_log_u32(
+        file, "load_save_rtc_elapsed_ms",
+        g_performance.load_save_rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "load_save_rtc_elapsed_valid",
+        g_performance.load_save_rtc_elapsed_valid
+    );
+    performance_log_u32(
         file, "first_frame_ticks", g_performance.first_frame_ticks
     );
     performance_log_u32(file, "session_ticks", g_performance.session_ticks);
+    performance_log_u32(
+        file, "session_tick_elapsed_ms",
+        g_performance.session_ticks * 5u / 2u
+    );
+    performance_log_u32(
+        file, "rtc_start_day", g_performance.rtc_start_day
+    );
+    performance_log_u32(
+        file, "rtc_start_time_ms", g_performance.rtc_start_time_ms
+    );
+    performance_log_u32(
+        file, "rtc_end_day", g_performance.rtc_end_day
+    );
+    performance_log_u32(
+        file, "rtc_end_time_ms", g_performance.rtc_end_time_ms
+    );
+    performance_log_u32(
+        file, "rtc_elapsed_ms", g_performance.rtc_elapsed_ms
+    );
+    performance_log_u32(
+        file, "rtc_start_valid", g_performance.rtc_start_valid
+    );
+    performance_log_u32(
+        file, "rtc_end_valid", g_performance.rtc_end_valid
+    );
+    performance_log_u32(
+        file, "rtc_elapsed_valid", g_performance.rtc_elapsed_valid
+    );
+    performance_log_wall_throughput(file);
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    performance_log_u32(
+        file, "timer_messages_received",
+        g_performance.timer_messages_received
+    );
+    performance_log_u32(file, "timer_batches", g_performance.timer_batches);
+    performance_log_u32(file, "guest_frames", g_performance.guest_frames);
+    performance_log_u32(file, "render_updates", g_performance.render_updates);
+    performance_log_u32(
+        file, "screen_submissions", g_performance.screen_submissions
+    );
+    performance_log_u32(file, "shutdown_pc", gam4980_shutdown_pc());
+#ifdef GAM4980_ENABLE_GAME_LOAD_AOT
+    performance_log_u32(
+        file, "game_aot_entries", gam4980_game_aot_entry_count()
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_entries", gam4980_game_aot_semantic_count()
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_hits_total",
+        gam4980_game_aot_semantic_hit_total()
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_far_call_hits",
+        gam4980_game_aot_semantic_hits(1u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_load_oper1_imm16_hits",
+        gam4980_game_aot_semantic_hits(2u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_load_oper2_imm16_hits",
+        gam4980_game_aot_semantic_hits(3u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_stack_add16_hits",
+        gam4980_game_aot_semantic_hits(4u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_stack_sub16_hits",
+        gam4980_game_aot_semantic_hits(5u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_store_char_arg_imm_hits",
+        gam4980_game_aot_semantic_hits(6u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_store_int_arg_oper1_hits",
+        gam4980_game_aot_semantic_hits(7u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_load_oper1_zp16_hits",
+        gam4980_game_aot_semantic_hits(8u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_load_oper2_zp16_hits",
+        gam4980_game_aot_semantic_hits(9u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_add16_oper1_oper2_hits",
+        gam4980_game_aot_semantic_hits(10u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_sub16_oper1_oper2_hits",
+        gam4980_game_aot_semantic_hits(11u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_load_oper1_indy16_hits",
+        gam4980_game_aot_semantic_hits(12u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_store_oper1_indy16_hits",
+        gam4980_game_aot_semantic_hits(13u)
+    );
+    performance_log_u32(
+        file, "game_aot_reachable_entries", gam4980_game_aot_reachable_count()
+    );
+    performance_log_u32(
+        file, "game_aot_linked_calls", gam4980_game_aot_linked_call_count()
+    );
+    performance_log_u32(
+        file, "game_aot_direct_link_hits",
+        gam4980_game_aot_direct_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_code_size", gam4980_game_aot_code_size()
+    );
+    performance_log_u32(
+        file, "game_hle_matches", gam4980_game_hle_match_count()
+    );
+    performance_log_u32(
+        file, "game_aot_enabled_end", gam4980_game_aot_enabled() != 0
+    );
+#endif
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    performance_log_u32(
+        file, "resource_span_cache_hits", gam4980_resource_span_cache_hits()
+    );
+    performance_log_u32(
+        file, "resource_span_cache_misses",
+        gam4980_resource_span_cache_misses()
+    );
+#endif
+    performance_log_text(file, "[END]\r\n");
+    (void)fs_update(file);
+    fs_fclose(file);
+    return;
+#endif
+    performance_log_u32(
+        file, "timer_messages_received",
+        g_performance.timer_messages_received
+    );
+    performance_log_u32(
+        file, "timer_messages_while_pending",
+        g_performance.timer_messages_while_pending
+    );
     performance_log_u32(
         file, "timer_batches", g_performance.timer_batches
     );
     performance_log_u32(file, "guest_frames", g_performance.guest_frames);
     performance_log_u32(
+        file, "scheduler_batches_0_frames",
+        g_performance.scheduler_batches_0_frames
+    );
+    performance_log_u32(
+        file, "scheduler_batches_1_frame",
+        g_performance.scheduler_batches_1_frame
+    );
+    performance_log_u32(
+        file, "scheduler_batches_2_frames",
+        g_performance.scheduler_batches_2_frames
+    );
+    performance_log_u32(
+        file, "scheduler_batches_3_frames",
+        g_performance.scheduler_batches_3_frames
+    );
+    performance_log_u32(
+        file, "scheduler_batches_other",
+        g_performance.scheduler_batches_other
+    );
+    performance_log_u32(
+        file, "batch_work_ticks_total",
+        g_performance.batch_work_ticks_total
+    );
+    performance_log_u32(
+        file, "batch_work_ticks_min", g_performance.batch_work_ticks_min
+    );
+    performance_log_u32(
+        file, "batch_work_ticks_max", g_performance.batch_work_ticks_max
+    );
+    performance_log_u32(
+        file, "batch_work_samples", g_performance.batch_work_samples
+    );
+    performance_log_u32(
+        file, "batch_work_zero_ticks", g_performance.batch_work_zero_ticks
+    );
+    performance_log_u32(
+        file, "batch_work_at_or_over_deadline",
+        g_performance.batch_work_at_or_over_deadline
+    );
+    performance_log_u32(
+        file, "core_work_ticks_total", g_performance.core_work_ticks_total
+    );
+    performance_log_u32(
+        file, "core_work_ticks_min", g_performance.core_work_ticks_min
+    );
+    performance_log_u32(
+        file, "core_work_ticks_max", g_performance.core_work_ticks_max
+    );
+    performance_log_u32(
+        file, "core_work_samples", g_performance.core_work_samples
+    );
+    performance_log_u32(
+        file, "render_work_ticks_total",
+        g_performance.render_work_ticks_total
+    );
+    performance_log_u32(
+        file, "render_work_ticks_min", g_performance.render_work_ticks_min
+    );
+    performance_log_u32(
+        file, "render_work_ticks_max", g_performance.render_work_ticks_max
+    );
+    performance_log_u32(
+        file, "render_work_samples", g_performance.render_work_samples
+    );
+    performance_log_u32(
+        file, "present_work_ticks_total",
+        g_performance.present_work_ticks_total
+    );
+    performance_log_u32(
+        file, "present_work_ticks_min", g_performance.present_work_ticks_min
+    );
+    performance_log_u32(
+        file, "present_work_ticks_max", g_performance.present_work_ticks_max
+    );
+    performance_log_u32(
+        file, "present_work_samples", g_performance.present_work_samples
+    );
+    performance_log_u32(
+        file, "batch_guest_cycles_min",
+        g_performance.batch_guest_cycles_min
+    );
+    performance_log_u32(
+        file, "batch_guest_cycles_max",
+        g_performance.batch_guest_cycles_max
+    );
+    performance_log_u32(
+        file, "batch_guest_cycle_samples",
+        g_performance.batch_guest_cycle_samples
+    );
+    performance_log_u32(
         file, "render_updates", g_performance.render_updates
     );
     performance_log_u32(
         file, "screen_submissions", g_performance.screen_submissions
+    );
+    /* The SDK's TIME_MS macro maps 25 ms to 10 counter units. */
+    performance_log_u32(file, "tick_unit_us", 2500u);
+    performance_log_u32(file, "hardware_tick_units", 10u);
+    performance_log_u32(
+        file, "timer_delta_min_ticks", g_performance.timer_delta_min_ticks
+    );
+    performance_log_u32(
+        file, "timer_delta_max_ticks", g_performance.timer_delta_max_ticks
+    );
+    performance_log_u32(
+        file, "timer_delta_under_10", g_performance.timer_delta_under_10
+    );
+    performance_log_u32(
+        file, "timer_delta_equal_10", g_performance.timer_delta_equal_10
+    );
+    performance_log_u32(
+        file, "timer_delta_over_10", g_performance.timer_delta_over_10
+    );
+    performance_log_u32(
+        file, "paint_submit_requests", g_performance.paint_submit_requests
+    );
+    performance_log_u32(
+        file, "paint_messages", g_performance.paint_messages
+    );
+    performance_log_u32(
+        file, "paint_completed", g_performance.paint_completed
+    );
+    performance_log_u32(
+        file, "paint_with_submission", g_performance.paint_with_submission
+    );
+    performance_log_u32(
+        file, "paint_without_submission",
+        g_performance.paint_without_submission
+    );
+    performance_log_u32(
+        file, "paint_submit_overwrites",
+        g_performance.paint_submit_overwrites
+    );
+    performance_log_u32(
+        file, "paint_max_submissions_per_message",
+        g_performance.paint_max_submissions_per_message
+    );
+    performance_log_u32(
+        file, "paint_first_latency_ticks_total",
+        g_performance.paint_first_latency_ticks_total
+    );
+    performance_log_u32(
+        file, "paint_first_latency_ticks_max",
+        g_performance.paint_first_latency_ticks_max
+    );
+    performance_log_u32(
+        file, "paint_last_latency_ticks_total",
+        g_performance.paint_last_latency_ticks_total
+    );
+    performance_log_u32(
+        file, "paint_last_latency_ticks_max",
+        g_performance.paint_last_latency_ticks_max
+    );
+    performance_log_u32(
+        file, "paint_interval_ticks_total",
+        g_performance.paint_interval_ticks_total
+    );
+    performance_log_u32(
+        file, "paint_interval_ticks_min",
+        g_performance.paint_interval_ticks_min
+    );
+    performance_log_u32(
+        file, "paint_interval_ticks_max",
+        g_performance.paint_interval_ticks_max
+    );
+    performance_log_u32(
+        file, "paint_interval_samples",
+        g_performance.paint_interval_samples
+    );
+    performance_log_u32(
+        file, "paint_invalidate_failures",
+        g_performance.paint_invalidate_failures
+    );
+    performance_log_u32(
+        file, "paint_pending_at_log", g_paint_pending != 0
+    );
+    performance_log_u32(
+        file, "paint_pending_submissions_at_log",
+        g_pending_paint_submissions
     );
     performance_log_u32(file, "rom_reads", g_performance.rom_reads);
     performance_log_u32(file, "rom_bytes", g_performance.rom_bytes);
@@ -920,10 +2105,36 @@ static void write_performance_log(void)
         file, "game_aot_entries", gam4980_game_aot_entry_count()
     );
     performance_log_u32(
+        file, "game_aot_semantic_entries", gam4980_game_aot_semantic_count()
+    );
+    performance_log_u32(
+        file, "game_aot_reachable_entries", gam4980_game_aot_reachable_count()
+    );
+    performance_log_u32(
+        file, "game_aot_linked_calls", gam4980_game_aot_linked_call_count()
+    );
+    performance_log_u32(
+        file, "game_aot_direct_link_hits",
+        gam4980_game_aot_direct_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_code_size", gam4980_game_aot_code_size()
+    );
+    performance_log_u32(
+        file, "game_hle_matches", gam4980_game_hle_match_count()
+    );
+    performance_log_u32(
         file, "game_aot_enabled_end", gam4980_game_aot_enabled() != 0
     );
 #endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    performance_log_u32(
+        file, "resource_span_cache_hits", gam4980_resource_span_cache_hits()
+    );
+    performance_log_u32(
+        file, "resource_span_cache_misses",
+        gam4980_resource_span_cache_misses()
+    );
     performance_log_u32(
         file, "firmware_hle_hits", gam4980_firmware_hle_hits()
     );
@@ -931,6 +2142,7 @@ static void write_performance_log(void)
         file, "firmware_hle_guest_cycles",
         gam4980_firmware_hle_guest_cycles()
     );
+    performance_log_hle_paths(file);
 #endif
 #if defined(GAM4980_ENABLE_AOT) && defined(GAM4980_AOT_DIAGNOSTICS)
     performance_log_aot_blocks(file);
@@ -1241,6 +2453,174 @@ static long get_game_size(const char *path)
     return size;
 }
 
+static void submit_screen_frame(void);
+
+static u8 loading_glyph_row(T_BYTE character, u32 row)
+{
+    static const u8 slash[7] = {
+        0x01u, 0x02u, 0x02u, 0x04u, 0x08u, 0x08u, 0x10u
+    };
+
+    if (row >= 7u)
+        return 0u;
+    if (character >= '0' && character <= '9')
+        return k_loading_font[character - '0'][row];
+    if (character >= 'A' && character <= 'Z')
+        return k_loading_font[10u + character - 'A'][row];
+    if (character == '/')
+        return slash[row];
+    return 0u;
+}
+
+static void loading_black_pixel(u32 x, u32 y)
+{
+    u8 *pixel_byte;
+    u32 shift;
+
+    if (x >= GAM_SCREEN_WIDTH || y >= GAM_SCREEN_HEIGHT)
+        return;
+    pixel_byte = &g_screen_frame[y * SCREEN_PITCH_BYTES + (x >> 2)];
+    shift = 6u - ((x & 3u) << 1);
+    *pixel_byte = (u8)(*pixel_byte & (u8)~(3u << shift));
+}
+
+static void loading_draw_text(u32 x, u32 y, const T_BYTE *text)
+{
+    while (text && *text) {
+        u32 row;
+
+        for (row = 0u; row < 7u; ++row) {
+            u8 bits = loading_glyph_row(*text, row);
+            u32 column;
+
+            for (column = 0u; column < 5u; ++column) {
+                u32 px;
+                u32 py;
+
+                if (!(bits & (u8)(1u << (4u - column))))
+                    continue;
+                px = x + column * 2u;
+                py = y + row * 2u;
+                loading_black_pixel(px, py);
+                loading_black_pixel(px + 1u, py);
+                loading_black_pixel(px, py + 1u);
+                loading_black_pixel(px + 1u, py + 1u);
+            }
+        }
+        x += 12u;
+        ++text;
+    }
+}
+
+static void render_loading_stage(void)
+{
+    T_BYTE progress_text[48];
+    char *out;
+
+    if (!g_loading_status)
+        return;
+    memset(g_screen_frame, 0xff, sizeof(g_screen_frame));
+    loading_draw_text(24u, 74u, g_loading_status);
+    out = append_text((char *)progress_text, "LOADING ");
+    out = append_u32_decimal(out, g_loading_step);
+    *out++ = '/';
+    out = append_u32_decimal(out, 7u);
+    if (g_loading_total > 1u) {
+        out = append_text(out, "  PASS ");
+        out = append_u32_decimal(out, g_loading_current);
+        *out++ = '/';
+        out = append_u32_decimal(out, g_loading_total);
+    }
+    *out = 0;
+    loading_draw_text(24u, 102u, progress_text);
+}
+
+static void commit_loading_frame_direct(void)
+{
+    volatile u32 *video = (volatile u32 *)(unsigned long)0x003c0000u;
+    const u32 *source = (const u32 *)(const void *)g_screen_frame;
+    u32 word;
+
+    /* app_env_9288/SRC/downsample.c documents 0x3c0000 as the physical
+     * 320x240x2-bpp video surface and clears it with 4800 word stores.  The
+     * game HSDMA path is not active yet during synchronous loading on every
+     * firmware, so make the already-rendered Loading frame visible through
+     * this official early-screen path. */
+    for (word = 0u; word < SCREEN_FRAME_BYTES / sizeof(u32); ++word)
+        video[word] = source[word];
+}
+
+static void draw_loading_stage(
+    const T_BYTE *status, u32 step, u32 current, u32 total
+)
+{
+    T_GUI_Msg message;
+    T_GUI_HWND window;
+    u32 paint_serial;
+
+    if (!g_main_window)
+        return;
+    g_loading_status = status;
+    g_loading_step = step;
+    g_loading_current = current;
+    g_loading_total = total;
+    g_loading_active = 1;
+    paint_serial = g_loading_paint_serial;
+    window = g_main_window;
+    render_loading_stage();
+    submit_screen_frame();
+    /* Loading runs synchronously before the normal emulator message loop.
+     * GUI TextOut/BeginPaint does not reach the game HSDMA surface on every
+     * 9288 firmware.  Render directly into the 2-bpp game framebuffer, submit
+     * it through the same SysBltFrame path as gameplay, then follow the
+     * official SDK WaitPainted sample before beginning the next load phase. */
+    while (fnGUI_GetMessage(&message, window)) {
+        fnGUI_TranslateMessage(&message);
+        fnGUI_DispatchMessage(&message);
+        if (g_loading_paint_serial != paint_serial ||
+            g_main_window != window)
+            break;
+    }
+    commit_loading_frame_direct();
+}
+
+static void load_progress_callback(
+    void *context, u32 stage, u32 current, u32 total
+)
+{
+    const T_BYTE *status = k_loading_aot;
+    u32 phase = LOAD_PHASE_AOT;
+    u32 step = 5u;
+
+    (void)context;
+    if (stage == GAM4980_LOAD_STAGE_GAME_HLE) {
+        status = k_loading_hle;
+        phase = LOAD_PHASE_HLE;
+        step = 3u;
+    } else if (stage == GAM4980_LOAD_STAGE_CFG) {
+        status = k_loading_cfg;
+        phase = LOAD_PHASE_CFG;
+        step = 4u;
+    }
+    if (current == 0u) {
+        draw_loading_stage(status, step, current, total);
+        load_rtc_begin_phase(phase);
+        return;
+    }
+    if (total && current >= total) {
+        load_rtc_end_phase(phase);
+        if (stage == GAM4980_LOAD_STAGE_AOT_INDEX)
+            draw_loading_stage(status, step, current, total);
+        return;
+    }
+    /* A full LCD paint is deliberately much more expensive than updating a
+     * host window.  One midpoint update proves that a long AOT scan is still
+     * advancing without adding eight unnecessary paint waits. */
+    if (stage == GAM4980_LOAD_STAGE_AOT_INDEX &&
+        current == total / 2u)
+        draw_loading_stage(status, step, current, total);
+}
+
 static int load_game(const char *path)
 {
     u8 header[GAM4980_GAME_HEADER_SIZE];
@@ -1251,7 +2631,10 @@ static int load_game(const char *path)
 
     if (!file)
         return 0;
+    draw_loading_stage(k_loading_read, 2u, 0u, 1u);
+    load_rtc_begin_phase(LOAD_PHASE_READ);
     if (fs_fseek(file, 0, SEEK_END) < 0) {
+        load_rtc_end_phase(LOAD_PHASE_READ);
         fs_fclose(file);
         return 0;
     }
@@ -1264,10 +2647,12 @@ static int load_game(const char *path)
         !read_exact(file, header, GAM4980_GAME_HEADER_SIZE) ||
         fs_fseek(file, 0, SEEK_SET) < 0 ||
         !read_exact(file, gam4980_game_storage(), (u32)size)) {
+        load_rtc_end_phase(LOAD_PHASE_READ);
         fs_fclose(file);
         return 0;
     }
     fs_fclose(file);
+    load_rtc_end_phase(LOAD_PHASE_READ);
     g_performance.game_read_ticks = tick_elapsed(
         operation_tick, (u32)fnGUI_GetTickCount()
     );
@@ -1279,7 +2664,10 @@ static int load_game(const char *path)
     );
     if (header_result <= 0 || !make_save_path(path))
         return 0;
+    draw_loading_stage(k_loading_save, 6u, 0u, 1u);
+    load_rtc_begin_phase(LOAD_PHASE_SAVE);
     load_save();
+    load_rtc_end_phase(LOAD_PHASE_SAVE);
     gam4980_save_mark_clean();
     write_load_diagnostic(0x0au, (u32)size, 0u);
     return 1;
@@ -1288,6 +2676,7 @@ static int load_game(const char *path)
 static void submit_screen_frame(void)
 {
     T_9288_SysBltFrame sys_blt_frame;
+    T_BOOL invalidated;
 
     if (!g_main_window || !g_game_hdc)
         return;
@@ -1301,13 +2690,15 @@ static void submit_screen_frame(void)
     );
     if (sys_blt_frame) {
         sys_blt_frame(g_game_hdc, g_screen_frame);
-        if (g_setting_performance_debug)
+        if (g_setting_performance_debug && !g_loading_active)
             ++g_performance.screen_submissions;
         /* Thunder Fighter follows the frame copy with this exact call so the
          * GUI paint path transfers the updated client DC to the LCD. */
-        (void)fnGUI_InvalidateRect(
+        invalidated = fnGUI_InvalidateRect(
             g_main_window, (const T_GUI_Rect *)0, (T_BOOL)0
         );
+        if (!g_loading_active)
+            performance_record_screen_submission(invalidated);
     }
 }
 
@@ -1352,6 +2743,9 @@ static void present_2x(const u8 *packed)
     if (!packed)
         return;
     for (source_y = 0; source_y < GAM4980_LCD_HEIGHT; ++source_y) {
+        if (!(gam4980_changed_row_mask((u32)source_y >> 5) &
+              (1u << ((u32)source_y & 31u))))
+            continue;
         const u8 *source =
             packed + source_y * GAM4980_LCD_PACKED_STRIDE;
         u32 *destination_0 = (u32 *)(void *)(
@@ -1458,24 +2852,61 @@ static void run_timer_frame(void)
 {
     u32 frames_this_tick;
     u32 frame_count;
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    u32 timer_delta;
+    u32 batch_start_tick = 0u;
+    u32 core_end_tick = 0u;
+    u32 render_end_tick = 0u;
+    u32 batch_end_tick;
+    u32 elapsed;
+    u64 guest_cycles_before = 0u;
+    u64 guest_cycles_after;
+#endif
+    int frame_changed;
 
-    /* On 9288, GUI timer speed 20 delivers about 20 MSG_TIMER events per
-     * second.  Normal mode advances three 60 Hz guest frames per event.  The
-     * optional 2x setting advances guest time twice as fast without changing
-     * the firmware-compatible timer or screen submission path. */
+    /* The 9288 GUI clock advances about once per 24.9 ms hardware tick.
+     * Timer speed 1 therefore yields about 40 MSG_TIMER events per second.
+     * The phase accumulator alternates one and two 60 Hz guest frames in
+     * normal mode; 2x advances three frames per event. */
     g_timer_frame_phase += FRAME_RATE_HZ *
         (g_setting_double_speed ? 2u : 1u);
     frames_this_tick = g_timer_frame_phase / GUI_TIMER_HZ;
     g_timer_frame_phase %= GUI_TIMER_HZ;
     frame_count = frames_this_tick;
     if (g_setting_performance_debug) {
+#ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
         ++g_performance.timer_batches;
         g_performance.guest_frames += frame_count;
+#else
+        timer_delta = performance_accumulate_session_ticks();
+        batch_start_tick = (u16)fnGUI_GetTickCount();
+        guest_cycles_before = gam4980_performance_guest_cycles();
+        if (!g_performance.timer_batches ||
+            timer_delta < g_performance.timer_delta_min_ticks)
+            g_performance.timer_delta_min_ticks = timer_delta;
+        if (timer_delta > g_performance.timer_delta_max_ticks)
+            g_performance.timer_delta_max_ticks = timer_delta;
+        if (timer_delta < 10u)
+            ++g_performance.timer_delta_under_10;
+        else if (timer_delta == 10u)
+            ++g_performance.timer_delta_equal_10;
+        else
+            ++g_performance.timer_delta_over_10;
+        ++g_performance.timer_batches;
+        g_performance.guest_frames += frame_count;
+        switch (frame_count) {
+        case 0u: ++g_performance.scheduler_batches_0_frames; break;
+        case 1u: ++g_performance.scheduler_batches_1_frame; break;
+        case 2u: ++g_performance.scheduler_batches_2_frames; break;
+        case 3u: ++g_performance.scheduler_batches_3_frames; break;
+        default: ++g_performance.scheduler_batches_other; break;
+        }
         if (!g_performance.first_frame_ticks)
             g_performance.first_frame_ticks = tick_elapsed(
                 g_performance.load_begin_tick,
                 (u32)fnGUI_GetTickCount()
             );
+#endif
     }
     while (frames_this_tick-- != 0u) {
         gam4980_step_frame();
@@ -1489,11 +2920,73 @@ static void run_timer_frame(void)
         }
 #endif
     }
-    if (gam4980_render_frame()) {
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    if (g_setting_performance_debug) {
+        core_end_tick = (u16)fnGUI_GetTickCount();
+        elapsed = tick_elapsed(batch_start_tick, core_end_tick);
+        performance_record_duration(
+            elapsed,
+            &g_performance.core_work_ticks_total,
+            &g_performance.core_work_ticks_min,
+            &g_performance.core_work_ticks_max,
+            &g_performance.core_work_samples
+        );
+        guest_cycles_after = gam4980_performance_guest_cycles();
+        elapsed = (u32)(guest_cycles_after - guest_cycles_before);
+        if (!g_performance.batch_guest_cycle_samples ||
+            elapsed < g_performance.batch_guest_cycles_min)
+            g_performance.batch_guest_cycles_min = elapsed;
+        if (elapsed > g_performance.batch_guest_cycles_max)
+            g_performance.batch_guest_cycles_max = elapsed;
+        ++g_performance.batch_guest_cycle_samples;
+    }
+#endif
+    frame_changed = gam4980_render_frame();
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    if (g_setting_performance_debug) {
+        render_end_tick = (u16)fnGUI_GetTickCount();
+        elapsed = tick_elapsed(core_end_tick, render_end_tick);
+        performance_record_duration(
+            elapsed,
+            &g_performance.render_work_ticks_total,
+            &g_performance.render_work_ticks_min,
+            &g_performance.render_work_ticks_max,
+            &g_performance.render_work_samples
+        );
+    }
+#endif
+    if (frame_changed) {
         if (g_setting_performance_debug)
             ++g_performance.render_updates;
         present_2x(gam4980_packed_frame());
     }
+#ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
+    if (g_setting_performance_debug) {
+        batch_end_tick = (u16)fnGUI_GetTickCount();
+        if (frame_changed) {
+            elapsed = tick_elapsed(render_end_tick, batch_end_tick);
+            performance_record_duration(
+                elapsed,
+                &g_performance.present_work_ticks_total,
+                &g_performance.present_work_ticks_min,
+                &g_performance.present_work_ticks_max,
+                &g_performance.present_work_samples
+            );
+        }
+        elapsed = tick_elapsed(batch_start_tick, batch_end_tick);
+        performance_record_duration(
+            elapsed,
+            &g_performance.batch_work_ticks_total,
+            &g_performance.batch_work_ticks_min,
+            &g_performance.batch_work_ticks_max,
+            &g_performance.batch_work_samples
+        );
+        if (!elapsed)
+            ++g_performance.batch_work_zero_ticks;
+        if (elapsed >= 10u)
+            ++g_performance.batch_work_at_or_over_deadline;
+    }
+#endif
     if (gam4980_shutdown_requested())
         g_close_requested = 1;
     if (g_escape_down && ++g_exit_hold_timer_ticks >= EXIT_HOLD_TIMER_TICKS)
@@ -1505,6 +2998,7 @@ static T_WORD gam_window_proc(
 )
 {
     T_UHWORD scancode = LOUHWORD(wparam);
+    T_WORD result;
 
     (void)lparam;
     switch (message) {
@@ -1532,6 +3026,11 @@ static T_WORD gam_window_proc(
         /* Keep the callback bounded and collapse duplicate timer messages.
          * The GUI timer remains periodic, so its wait overlaps the interpreted
          * work instead of adding another delay after every completed batch. */
+        if (g_setting_performance_debug) {
+            ++g_performance.timer_messages_received;
+            if (g_frame_tick_pending)
+                ++g_performance.timer_messages_while_pending;
+        }
         g_frame_tick_pending = 1;
         /* MSG_TIMER is fully consumed here.  Passing an already-handled timer
          * to DefaultMainWinProc can schedule an unnecessary window repaint;
@@ -1540,10 +3039,23 @@ static T_WORD gam_window_proc(
     case MSG_ERASEBKGND:
         return 0;
     case MSG_PAINT:
+        if (g_loading_active) {
+            /* SysBltFrame has already populated the client DC with the 2-bpp
+             * Loading frame.  DefaultMainWinProc performs the real LCD
+             * transfer, exactly as it does for gameplay. */
+            result = fnGUI_DefaultMainWinProc(
+                window, message, wparam, lparam
+            );
+            ++g_loading_paint_serial;
+            return result;
+        }
         /* SysBltFrame already populated the client DC.  DefaultMainWinProc
          * performs the pending GUI/LCD transfer; resubmitting here would
          * invalidate the window again and create a permanent paint loop. */
-        return fnGUI_DefaultMainWinProc(window, message, wparam, lparam);
+        performance_record_paint_message();
+        result = fnGUI_DefaultMainWinProc(window, message, wparam, lparam);
+        performance_record_paint_completed();
+        return result;
     case MSG_CLOSE:
         g_close_requested = 1;
         (void)fnGUI_KillTimer(window, FRAME_TIMER_ID);
@@ -1655,9 +3167,11 @@ static int run_emulator_window(void)
 
     if (!g_main_window)
         return 0;
+    g_loading_active = 0;
     window = g_main_window;
     write_load_diagnostic(0x0bu, 0u, 0u);
     init_screen_expansion();
+    performance_begin_paint_tracking();
     clear_screen();
     g_close_requested = 0;
     g_escape_down = 0;
@@ -1674,7 +3188,7 @@ static int run_emulator_window(void)
         destroy_emulator_window();
         return 0;
     }
-    g_performance.session_begin_tick = (u32)fnGUI_GetTickCount();
+    performance_begin_session();
 
     while (!g_close_requested && !gam4980_shutdown_requested()) {
         /* Thunder Fighter pumps the global GUI queue during gameplay.  Timer
@@ -1693,11 +3207,7 @@ static int run_emulator_window(void)
         }
     }
 
-    if (g_setting_performance_debug)
-        g_performance.session_ticks = tick_elapsed(
-            g_performance.session_begin_tick,
-            (u32)fnGUI_GetTickCount()
-        );
+    performance_end_session();
     finish_emulator_window(window);
     return 1;
 }
@@ -1718,12 +3228,16 @@ T_WORD App_Main(void)
         return 0;
     reset_performance_metrics();
     g_performance.load_begin_tick = (u32)fnGUI_GetTickCount();
+    load_rtc_begin_total();
     memory_diagnostic(0x01u, 0u, 0u);
     write_load_diagnostic(0x01u, 0u, 0u);
     if (!create_emulator_window()) {
         show_error("Could not create the GAM4980 window.");
         return -1;
     }
+    gam4980_set_load_progress_callback(load_progress_callback, 0);
+    draw_loading_stage(k_loading_prepare, 1u, 0u, 1u);
+    load_rtc_begin_phase(LOAD_PHASE_PREPARE);
     memory_diagnostic(0x02u, (u32)(unsigned long)g_main_window, 0u);
     write_load_diagnostic(0x02u, (u32)(unsigned long)g_main_window, 0u);
     game_size = get_game_size(g_game_path);
@@ -1768,6 +3282,7 @@ T_WORD App_Main(void)
     write_load_diagnostic(0x06u, g_buffers.flash_size, 0u);
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
     gam4980_set_game_load_aot_enabled(g_setting_load_aot);
+    gam4980_set_game_aot_metrics_enabled(g_setting_performance_debug);
 #endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
     gam4980_set_firmware_hle_enabled(g_setting_firmware_hle);
@@ -1795,12 +3310,15 @@ T_WORD App_Main(void)
     memory_diagnostic(0x05u, (u32)core_status, 0u);
     write_load_diagnostic(0x07u, (u32)core_status, 0u);
     initialized = 1;
+    load_rtc_end_phase(LOAD_PHASE_PREPARE);
     if (!load_game(g_game_path)) {
         show_error("The selected GAM file is invalid or unreadable.");
         release_buffers();
         destroy_emulator_window();
         return -4;
     }
+    draw_loading_stage(k_loading_start, 7u, 1u, 1u);
+    load_rtc_end_total();
     g_performance.load_total_ticks = tick_elapsed(
         g_performance.load_begin_tick, (u32)fnGUI_GetTickCount()
     );
@@ -1817,5 +3335,11 @@ T_WORD App_Main(void)
     return 0;
 }
 
-/* The upstream core includes the instruction interpreter as one unit. */
+/*
+ * Keep the legacy single-translation-unit form available for ad-hoc builds.
+ * The 9288 build compiles the large core/AOT unit separately so that changing
+ * this frontend does not rebuild every generated 6502 block.
+ */
+#ifndef GAM4980_SEPARATE_CORE_OBJECT
 #include "gam4980_core.c"
+#endif

@@ -55,9 +55,12 @@ def main() -> None:
         qmp.capture(args.output / "05-aot-on.ppm")
         qmp.key("down")
         time.sleep(0.8)
-        qmp.key("ret")    # firmware HLE on
+        qmp.key("ret")    # firmware HLE off
         time.sleep(0.8)
-        qmp.capture(args.output / "06-hle-on.ppm")
+        qmp.capture(args.output / "06-hle-off.ppm")
+        qmp.key("ret")    # restore the default-on setting
+        time.sleep(0.8)
+        qmp.capture(args.output / "06a-hle-on.ppm")
 
         qmp.key("down")
         time.sleep(0.8)

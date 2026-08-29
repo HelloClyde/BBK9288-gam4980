@@ -34,6 +34,79 @@ def run(command: list[str], step: str) -> None:
         raise SystemExit(f"{step} failed with exit code {exc.returncode}") from exc
 
 
+def compile_fingerprint(
+    compiler: str,
+    flags: list[str],
+    source: Path,
+    dependencies: list[Path],
+) -> str:
+    """Hash everything that can affect one cached object file."""
+    digest = hashlib.sha256()
+    compiler_path = Path(compiler)
+    digest.update(str(compiler_path).encode("utf-8"))
+    try:
+        compiler_stat = compiler_path.stat()
+        digest.update(
+            f"\0{compiler_stat.st_size}\0{compiler_stat.st_mtime_ns}".encode(
+                "ascii"
+            )
+        )
+    except OSError:
+        # A compiler found through PATH may not be represented by this spelling.
+        # Its name still participates in the key.
+        pass
+    for flag in flags:
+        digest.update(b"\0flag\0")
+        digest.update(flag.encode("utf-8"))
+    unique_paths = {source.resolve(), *(path.resolve() for path in dependencies)}
+    canonical_path = lambda item: str(item).replace("\\", "/").casefold()
+    for path in sorted(unique_paths, key=canonical_path):
+        digest.update(b"\0file\0")
+        # The SDK normalization directory lives on a Windows volume.  Its
+        # case-insensitive filesystem may retain either Dsys.h or dsys.h when
+        # both compatibility spellings target the same file.  Header identity
+        # must therefore be case-folded or an unchanged SDK misses the cache
+        # nondeterministically on each Python process.
+        identity = canonical_path(path)
+        digest.update(identity.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def compile_cached(
+    compiler: str,
+    flags: list[str],
+    source: Path,
+    output: Path,
+    dependencies: list[Path],
+    rebuild: bool,
+) -> None:
+    fingerprint = compile_fingerprint(
+        compiler, flags, source, dependencies
+    )
+    stamp = output.with_suffix(output.suffix + ".sha256")
+    if (
+        not rebuild
+        and output.is_file()
+        and stamp.is_file()
+        and stamp.read_text(encoding="ascii").strip() == fingerprint
+    ):
+        print(f"+ reuse {output.name} (inputs unchanged)")
+        return
+    if not rebuild and output.is_file() and stamp.is_file():
+        previous = stamp.read_text(encoding="ascii").strip()
+        print(
+            f"+ cache miss {output.name}: "
+            f"{previous[:12]} -> {fingerprint[:12]}"
+        )
+    run(
+        [compiler, *flags, "-c", str(source), "-o", str(output)],
+        f"compile {source.name}",
+    )
+    stamp.write_text(fingerprint + "\n", encoding="ascii")
+
+
 def write_sdk_header(path: Path, data: bytes) -> None:
     lines = []
     for line in data.splitlines(keepends=True):
@@ -97,10 +170,14 @@ def compile_app(
     switch_dispatch: bool,
     enable_aot: bool,
     game_load_aot: bool,
+    aot_diagnostics: bool,
+    lightweight_performance: bool,
     load_diagnostics: bool,
     memory_diagnostics: bool,
     optimization: str,
     firmware_hle_mask: int,
+    aggressive_region_hle: bool,
+    rebuild: bool,
 ) -> bytes:
     clang = find_tool(toolchain, "clang")
     objcopy = find_tool(toolchain, "llvm-objcopy")
@@ -127,6 +204,7 @@ def compile_app(
         "-Wno-int-to-pointer-cast",
         "-DDL_DOWN",
         "-D_RLS_",
+        "-DGAM4980_TARGET_9288",
         "-I",
         str(SOURCE_ROOT / "9288_compat"),
         "-I",
@@ -144,6 +222,10 @@ def compile_app(
                 f"-DGAM4980_FIRMWARE_HLE_MASK={firmware_hle_mask}",
             ]
         )
+    if aggressive_region_hle:
+        if not enable_aot:
+            raise SystemExit("--aggressive-region-hle requires AOT/HLE")
+        common_flags.append("-DGAM4980_ENABLE_AGGRESSIVE_REGION_HLE")
     if game_load_aot:
         if not enable_aot:
             raise SystemExit("--game-load-aot requires the normal AOT dispatcher")
@@ -153,21 +235,48 @@ def compile_app(
                 "-DGAM4980_RUNTIME_PERFORMANCE_LOG",
             ]
         )
+        if lightweight_performance:
+            common_flags.append("-DGAM4980_LIGHTWEIGHT_PERFORMANCE_LOG")
+    if aot_diagnostics:
+        if not enable_aot:
+            raise SystemExit("--aot-diagnostics requires the normal AOT dispatcher")
+        common_flags.append("-DGAM4980_AOT_DIAGNOSTICS")
+    if lightweight_performance and aot_diagnostics:
+        raise SystemExit(
+            "--lightweight-performance cannot be combined with "
+            "--aot-diagnostics"
+        )
     if load_diagnostics:
         common_flags.append("-DGAM4980_LOAD_DIAGNOSTICS")
     if memory_diagnostics:
         common_flags.append("-DGAM4980_MEMORY_DIAGNOSTICS")
-    for source in (
-        SOURCE_ROOT / "gam4980_9288_start.c",
-        SOURCE_ROOT / "gam4980_9288_runtime.c",
-        SOURCE_ROOT / "gam4980_9288.c",
-    ):
+    # Header contents, rather than mtimes, are part of the object cache key.
+    # This deliberately includes generated AOT headers: changing either BIN's
+    # offline translation invalidates the core object, while changing only the
+    # 9288 frontend source leaves that expensive object reusable.
+    dependencies = sorted(SOURCE_ROOT.rglob("*.h"))
+    dependencies.extend(sorted(generated_include.rglob("*.h")))
+    compile_units = (
+        (SOURCE_ROOT / "gam4980_9288_start.c", []),
+        (SOURCE_ROOT / "gam4980_9288_runtime.c", []),
+        (
+            SOURCE_ROOT / "gam4980_9288.c",
+            ["-DGAM4980_SEPARATE_CORE_OBJECT"],
+        ),
+        (SOURCE_ROOT / "gam4980_core.c", []),
+    )
+    for source, unit_flags in compile_units:
         if not source.is_file():
             raise SystemExit(f"missing source: {source}")
         output = BUILD_ROOT / f"{source.stem}.o"
-        run(
-            [clang, *common_flags, "-c", str(source), "-o", str(output)],
-            f"compile {source.name}",
+        flags = [*common_flags, *unit_flags]
+        compile_cached(
+            clang,
+            flags,
+            source,
+            output,
+            dependencies,
+            rebuild,
         )
         objects.append(output)
 
@@ -354,6 +463,19 @@ def parse_args() -> argparse.Namespace:
         help="persist true-device load stages to A:\\gam4980\\DIAG.TXT",
     )
     parser.add_argument(
+        "--aot-diagnostics",
+        action="store_true",
+        help="record per-AOT-block and per-HLE-path hotspot counters",
+    )
+    parser.add_argument(
+        "--lightweight-performance",
+        action="store_true",
+        help=(
+            "keep only low-overhead RTC/frame throughput logging and compile "
+            "hot AOT/HLE diagnostics out"
+        ),
+    )
+    parser.add_argument(
         "--memory-diagnostics",
         action="store_true",
         help="expose volatile load/ROM/frame counters for emulator inspection",
@@ -370,9 +492,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--firmware-hle-mask",
         type=lambda value: int(value, 0),
-        choices=range(32),
-        default=31,
+        choices=range(512),
+        default=1023,
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--aggressive-region-hle",
+        action="store_true",
+        help=(
+            "HLE complete rows of the E.BIN bitmap rectangle routine while "
+            "preserving CPU scheduling-slice boundaries"
+        ),
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="ignore the content-addressed object cache and rebuild every unit",
     )
     return parser.parse_args()
 
@@ -394,10 +529,14 @@ def main() -> None:
             switch_dispatch=args.switch_dispatch,
             enable_aot=args.aot,
             game_load_aot=args.game_load_aot and args.aot,
+            aot_diagnostics=args.aot_diagnostics,
+            lightweight_performance=args.lightweight_performance,
             load_diagnostics=args.load_diagnostics,
             memory_diagnostics=args.memory_diagnostics,
             optimization=args.optimization,
             firmware_hle_mask=args.firmware_hle_mask,
+            aggressive_region_hle=args.aggressive_region_hle,
+            rebuild=args.rebuild,
         )
     app = pack_kf2(payload)
     output.write_bytes(app)
