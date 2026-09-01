@@ -7,7 +7,7 @@
 #define TEST_PAGE 0x40u
 #define TEST_OFFSET 0x40u
 #define TEST_PC ((TEST_PAGE << 8) | TEST_OFFSET)
-#define TEST_CASES 10u
+#define TEST_CASES 8u
 #define SUPER_KINDS 5u
 #define FLAG_N 0x80u
 #define FLAG_V 0x40u
@@ -444,6 +444,92 @@ static int run_cross_page_lda(u32 case_index)
     return passed;
 }
 
+static int run_adc_abs_x(u32 case_index)
+{
+    static const u8 program[] = {0x7du, 0x00u, 0x20u, 0x00u};
+    s6502_iram_asm_context_t context;
+    u32 result;
+    int passed;
+
+    prepare_memory(program, sizeof(program));
+    g_code_pages[TEST_PAGE] = g_ram + (TEST_PAGE << 8);
+    g_ram[0x2066u] = 0x50u;
+    prepare_context(&context, 0x40u, 0xe7u, FLAG_U | FLAG_I | FLAG_C);
+    passed = execute_context(&context, &result);
+    passed = passed && check_common(
+        &context, result, TEST_PC + 3u, 4u, 1u, 0x91u,
+        FLAG_N | FLAG_V | FLAG_U | FLAG_I
+    ) && context.sp == 0xe7u && hits_are_zero();
+    record_case(case_index, &context, result, passed);
+    return passed;
+}
+
+static int run_sbc_abs_x_cross(u32 case_index)
+{
+    static const u8 program[] = {0xfdu, 0xf0u, 0x20u, 0x00u};
+    s6502_iram_asm_context_t context;
+    u32 result;
+    int passed;
+
+    prepare_memory(program, sizeof(program));
+    g_code_pages[TEST_PAGE] = g_ram + (TEST_PAGE << 8);
+    g_ram[0x2156u] = 0x01u;
+    prepare_context(&context, 0x10u, 0xe6u, FLAG_U | FLAG_I | FLAG_C);
+    passed = execute_context(&context, &result);
+    passed = passed && check_common(
+        &context, result, TEST_PC + 3u, 5u, 1u, 0x0fu,
+        FLAG_U | FLAG_I | FLAG_C
+    ) && context.sp == 0xe6u && hits_are_zero();
+    record_case(case_index, &context, result, passed);
+    return passed;
+}
+
+static int run_sta_abs_x(u32 case_index)
+{
+    static const u8 program[] = {0x9du, 0x00u, 0x20u, 0x00u};
+    s6502_iram_asm_context_t context;
+    u32 result;
+    int passed;
+
+    prepare_memory(program, sizeof(program));
+    g_code_pages[TEST_PAGE] = g_ram + (TEST_PAGE << 8);
+    prepare_context(&context, 0xa5u, 0xe5u, FLAG_U | FLAG_I | FLAG_C);
+    passed = execute_context(&context, &result);
+    passed = passed && check_common(
+        &context, result, TEST_PC + 3u, 5u, 1u, 0xa5u,
+        FLAG_U | FLAG_I | FLAG_C
+    ) && context.sp == 0xe5u && g_ram[0x2066u] == 0xa5u &&
+        hits_are_zero();
+    record_case(case_index, &context, result, passed);
+    return passed;
+}
+
+static int run_cross_page_jmp(u32 case_index)
+{
+    static const u8 program[] = {0x4cu, 0x34u, 0x12u};
+    s6502_iram_asm_context_t context;
+    u32 result;
+    int passed;
+
+    prepare_memory(program, 0u);
+    copy_bytes(g_ram + 0x40feu, program, sizeof(program));
+    g_code_pages[0x40u] = g_ram + 0x4000u;
+    g_code_pages[0x41u] = g_ram + 0x4100u;
+    prepare_context(&context, 0x5au, 0xe4u, FLAG_U | FLAG_I | FLAG_C);
+    context.pc = 0x40feu;
+    passed = execute_context(&context, &result);
+    passed = passed && result == 3u && context.pc == 0x1234u &&
+        context.cycles == 3u && context.instructions == 1u &&
+        context.control_transitions == 1u &&
+        context.exit_reason == S6502_IRAM_EXIT_SLOW &&
+        context.ac == 0x5au && context.ix == 0x66u &&
+        context.iy == 0x77u && context.sp == 0xe4u &&
+        context.status == (FLAG_U | FLAG_I | FLAG_C) &&
+        g_dirty == 0u && hits_are_zero();
+    record_case(case_index, &context, result, passed);
+    return passed;
+}
+
 static int run_pb_direct_write(u32 case_index)
 {
     static const u8 program[] = {
@@ -659,7 +745,7 @@ T_WORD App_Main(void)
     (void)fnGUI_MessageBox(
         HWND_DESKTOP,
         (const T_BYTE *)
-            "True S1C33 shadow-super equivalence probe.\n"
+            "True S1C33 IRAM v2 equivalence probe.\n"
             "Press OK, then wait for PASS/FAIL.",
         (const T_BYTE *)APP_TITLE, MB_OK
     );
@@ -675,16 +761,14 @@ T_WORD App_Main(void)
         return -1;
     }
     g_super_equiv_report.iram_size = gam4980_9288_iram_size();
-    passed &= run_load_oper1(0u);
-    passed &= run_load_oper2(1u);
-    passed &= run_stack_add(2u);
-    passed &= run_stack_sub(3u);
-    passed &= run_add16(4u);
-    passed &= run_decimal_fallback(5u);
-    passed &= run_cross_page_lda(6u);
-    passed &= run_pb_direct_write(7u);
-    passed &= run_apo_direct_write(8u);
-    passed &= run_native_shared_7c30(9u);
+    passed &= run_decimal_fallback(0u);
+    passed &= run_cross_page_lda(1u);
+    passed &= run_pb_direct_write(2u);
+    passed &= run_apo_direct_write(3u);
+    passed &= run_adc_abs_x(4u);
+    passed &= run_sbc_abs_x_cross(5u);
+    passed &= run_sta_abs_x(6u);
+    passed &= run_cross_page_jmp(7u);
     g_super_equiv_report.iram_status =
         (u32)gam4980_9288_iram_status();
     if (g_super_equiv_report.iram_status != GAM4980_IRAM_STATUS_RESTORED) {
@@ -701,8 +785,8 @@ T_WORD App_Main(void)
     (void)fnGUI_MessageBox(
         HWND_DESKTOP,
         (const T_BYTE *)(passed ?
-            "Supers + native shared ABI: PASS" :
-            "Shadow-super equivalence: FAIL"),
+            "IRAM v2 opcode equivalence: PASS" :
+            "IRAM v2 opcode equivalence: FAIL"),
         (const T_BYTE *)APP_TITLE, MB_OK
     );
     return passed ? 0 : -3;

@@ -5,7 +5,7 @@
  * 32-bit word so the assembly ABI is independent of C bit-field and narrow
  * type layout.  R15 is owned by the 9288 loader and is never touched here.
  *
- * This is the P0/P1 engine: it handles the measured top-77 opcode set.  Any
+ * This is the P0/P1 engine: it handles the measured top-84 opcode set.  Any
  * address with firmware side effects, an absent
  * mapped page, decimal ADC/SBC, or an opcode not listed in the dispatch table
  * leaves PC at the unexecuted instruction and returns SLOW to the complete C
@@ -1043,6 +1043,40 @@ s6502_iram_count_patch_super_add16:
     add   %r10, 4
     add   %r10, %r2
     jp    .Lset_nz_reload
+
+/* ADC/SBC absolute,X share address resolution and the read page penalty.
+ * Decimal arithmetic stays in the complete C engine.  R3 selects ADC/SBC
+ * and survives the direct mapped read. */
+.Lop7D:
+    ld.w  %r3, 1                    /* ADC */
+    jp    .Labs_x_arithmetic
+.LopFD:
+    ld.w  %r3, 2                    /* SBC */
+.Labs_x_arithmetic:
+    ld.w  %r12, %r9
+    and   %r12, FLAG_D
+    cmp   %r12, 0
+    jrne  .Lexit_slow1
+    FETCH16 .Lexit_slow1
+    ld.w  %r13, %r12               /* base */
+    add   %r12, %r5
+    ld.uh %r12, %r12               /* effective */
+    xor   %r13, %r12
+    srl   %r13, 8
+    ld.w  %r2, 0
+    cmp   %r13, 0
+    jreq  .Labs_x_arithmetic_no_cross
+    ld.w  %r2, 1
+.Labs_x_arithmetic_no_cross:
+    MAP_READ_VALUE .Lexit_slow3
+    add   %r10, 4
+    add   %r10, %r2
+    cmp   %r3, 2
+    jrne  .Lbinary_add
+    ext   255
+    xor   %r12, %r12
+    jp    .Lbinary_add
+
 .Lop8D:
     FETCH16 .Lexit_slow1
     ld.w  %r3, %r4
@@ -1055,6 +1089,17 @@ s6502_iram_count_patch_super_add16:
     FETCH16 .Lexit_slow1
     ld.w  %r3, %r5
     jp    .Lstore_abs
+
+/* STA absolute,X.  The indexed store has no page-cross cycle penalty. */
+.Lop9D:
+    FETCH16 .Lexit_slow1
+    add   %r12, %r5
+    ld.uh %r12, %r12
+    ld.w  %r3, %r4
+    MAP_WRITE_POINTER .Lexit_slow3
+    STORE_MAPPED_VALUE
+    add   %r10, 5
+    jp    .Lfinish_reload
 
 /* LDA/ADC/SBC/STA (zero page),Y share pointer validation and indexing. */
 .LopB1:
@@ -1158,7 +1203,7 @@ s6502_iram_count_patch_super_add16:
     jp    .Lcontrol_reload
 
 .Lop4C:
-    FETCH16 .Lexit_slow1
+    FETCH16_CROSS .Lexit_slow1
     ld.w  %r8, %r12
     add   %r10, 3
     ld.w  %r2, 0
@@ -1805,7 +1850,7 @@ s6502_iram_dispatch_table:
     /* 70 */ DISPATCH16 .Lslow_opcode, .Lop71, .Lslow_opcode, .Lslow_opcode
     /* 74 */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
     /* 78 */ DISPATCH16 .Lop78, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
-    /* 7c */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
+    /* 7c */ DISPATCH16 .Lslow_opcode, .Lop7D, .Lslow_opcode, .Lslow_opcode
     /* 80 */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
     /* 84 */ DISPATCH16 .Lop84, .Lop85, .Lop86, .Lslow_opcode
     /* 88 */ DISPATCH16 .Lop88, .Lslow_opcode, .Lop8A, .Lslow_opcode
@@ -1813,7 +1858,7 @@ s6502_iram_dispatch_table:
     /* 90 */ DISPATCH16 .Lop90, .Lop91, .Lslow_opcode, .Lslow_opcode
     /* 94 */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
     /* 98 */ DISPATCH16 .Lop98, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
-    /* 9c */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
+    /* 9c */ DISPATCH16 .Lslow_opcode, .Lop9D, .Lslow_opcode, .Lslow_opcode
     /* a0 */ DISPATCH16 .LopA0, .Lslow_opcode, .LopA2, .Lslow_opcode
     /* a4 */ DISPATCH16 .LopA4, .LopA5, .LopA6, .Lslow_opcode
     /* a8 */ DISPATCH16 .LopA8, .LopA9, .LopAA, .Lslow_opcode
@@ -1837,7 +1882,7 @@ s6502_iram_dispatch_table:
     /* f0 */ DISPATCH16 .LopF0, .LopF1, .Lslow_opcode, .Lslow_opcode
     /* f4 */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
     /* f8 */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
-    /* fc */ DISPATCH16 .Lslow_opcode, .Lslow_opcode, .Lslow_opcode, .Lslow_opcode
+    /* fc */ DISPATCH16 .Lslow_opcode, .LopFD, .Lslow_opcode, .Lslow_opcode
 s6502_iram_dispatch_table_end:
     .size s6502_iram_dispatch_table, \
         s6502_iram_dispatch_table_end-s6502_iram_dispatch_table

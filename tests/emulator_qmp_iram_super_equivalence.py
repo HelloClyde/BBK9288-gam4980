@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from emulator_qmp_smoke import QmpClient
 
 
-REPORT_WORDS = 84
+REPORT_WORDS = 70
 REPORT_MAGIC = 0x53555045
 IRAM_RESTORED = 2
 
@@ -127,34 +127,37 @@ def main() -> None:
             errors.append(
                 f"completed={completed} passed={passed} fail={fail_mask:08x}"
             )
-        if cases_run != 10 or cases_passed != 10:
+        if cases_run != 8 or cases_passed != 8:
             errors.append(f"cases={cases_passed}/{cases_run}")
         if iram_status != IRAM_RESTORED or not (0 < iram_size <= 0x16C8):
             errors.append(
                 f"iram_status={iram_status:08x} iram_size={iram_size}"
             )
-        if hits != [1, 1, 1, 1, 1]:
+        if hits != [0, 0, 0, 0, 0]:
             errors.append(f"super_hits={hits}")
         if decimal_fallbacks != 1:
             errors.append(f"decimal_fallbacks={decimal_fallbacks}")
 
         expected_pc = [
-            0x4048, 0x4048, 0x4050, 0x4050, 0x404D, 0x4040,
-            0x4101, 0x4045, 0x4045,
-            0x7C4A,
+            0x4040, 0x4101, 0x4045, 0x4045,
+            0x4043, 0x4043, 0x4043, 0x1234,
         ]
-        expected_cycles = [10, 10, 27, 27, 20, 0, 4, 6, 6, 35]
-        expected_instructions = [4, 4, 10, 10, 7, 0, 1, 2, 2, 10]
+        expected_cycles = [
+            0, 4, 6, 6, 4, 5, 5, 3,
+        ]
+        expected_instructions = [
+            0, 1, 2, 2, 1, 1, 1, 1,
+        ]
         expected_ac = [
-            0x80, 0x00, 0x14, 0x0F, 0x80, 0x5A, 0x80, 0x7F, 0x00,
-            0x00,
+            0x5A, 0x80, 0x7F, 0x00,
+            0x91, 0x0F, 0xA5, 0x5A,
         ]
         expected_status = [
-            0xA5, 0x27, 0x35, 0x34, 0xE4, 0x2D, 0xA5, 0x25, 0x27,
-            0x26,
+            0x2D, 0xA5, 0x25, 0x27,
+            0xE4, 0x25, 0x25, 0x25,
         ]
         observations = words[14:]
-        for index in range(10):
+        for index in range(8):
             case = observations[index * 7:(index + 1) * 7]
             if len(case) != 7:
                 errors.append(f"case{index}=truncated")

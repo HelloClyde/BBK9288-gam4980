@@ -137,13 +137,33 @@ Top-N 虚拟/物理 PC、dispatch 目标分类、slow opcode Top-16 和慢路径
 `NOP`；外层也停止逐 burst 累加
 指令、周期和退出计数。这个双路径没有给每条客机指令增加运行时开关分支。
 
-## C6502 影子解码超级指令（仅保留为旧版等价探针）
+## 84-opcode 真机热点轮次
+
+2026-09-02 的真机日志中，剩余 unsupported opcode 的前四项为 `$FD`、`$7D`、
+`$9D` 和跨页 `$4C`，合计占该类退出约 95.7%。默认 V2 现在把 ADC/SBC
+absolute,X、STA absolute,X 直接放入 IRAM，并让 JMP absolute 共用已验证的
+跨页 operand bridge。十进制 ADC/SBC、特殊 I/O 页和不可直接写页仍在改变任何
+客机状态前原子回退到完整 C 引擎。日志中的 `iram_exec_hot_opcode_count` 由旧的
+写死 77 修正为与汇编表一致的 84。
+
+目标审计结果为 5756/5832 字节，剩余 76 字节。真实 S1C33 等价探针使用和发布
+版相同的 `GAM4980_IRAM_V2` 配置，覆盖 ADC/SBC/STA absolute,X、跨页 JMP/LDA、
+直接写后处理与 decimal fallback，8/8 通过；随后完整《伏魔记》模拟器冒烟测试
+验证了文件选择、启动、开场剧情、短按退出和长按返回桌面。
+
+普通 V2 不分配动态原生 arena，因此 ROM cache 恢复为 128 个 4 KiB line；只有
+显式 `GAM4980_DYNAMIC_NATIVE_ALL` 实验版才使用 64-line cache 并把另外 256 KiB
+留给原生模块。这样默认版可以避免上一份真机日志中的 168 次会话内文件读取，
+也降低由 ROM miss 造成的按键扫描间隔尖峰。
+
+## C6502 影子解码超级指令（仅保留为旧版源码参考）
 
 真机日志显示旧影子模板在多次 bank 重建后仍无有效命中，自适应逻辑最终会把
 它关闭。默认 V2 因此在编译期直接移除 `$02` handler 和三个模板，并从实时
 `sys.mem_r` 取指，不再分配/复制 64 KiB shadow，也不再执行 marker 遍历。
-腾出的 IRAM 用于延迟 flags 和更通用的 opcode；旧实现仍由独立等价探针构建，
-用于防止历史路径腐化，但不进入真机默认 EXE。
+腾出的 IRAM 用于延迟 flags 和更通用的 opcode。旧实现仍保留在
+`#ifndef GAM4980_IRAM_V2` 中供源码参考；当前目标等价探针与真机发布版一样只构建
+V2，避免测试已经停用、且加入新 opcode 后不再能装入 5832 字节窗口的旧路径。
 
 加载 AOT CFG 后，虚拟 `$5000-$8fff` 的取指页会建立 16 KiB 影子副本。客机
 数据读取仍使用原始 `sys.mem_r`，因此游戏读取自身代码时看见的字节完全不变；
@@ -167,8 +187,8 @@ handler 因而只读取原始首字节分类和动态立即数，不再在每次
 bank 和源映射都未变化时直接复用。Flash byte-program/erase 会先关闭 AOT 并
 恢复原始取指页，避免陈旧标记。Debug 模式记录 `iram_shadow_rebuilds`、
 `iram_shadow_marker_visits` 和各模板命中数；关闭 Debug 时命中计数指针为零，
-handler 不写外部统计 RAM。加入普通 C ABI 模块桥后的当前执行引擎共 5716 字节，
-低于真机验证上限 5832 字节，剩余 116 字节；外部原生模块不计入 IRAM overlay。
+handler 不写外部统计 RAM。默认 V2 当前执行引擎共 5756 字节，低于真机验证
+上限 5832 字节，剩余 76 字节；实验性的外部原生模块不计入 IRAM overlay。
 
 影子解码还带有自适应止损：每 16 次 4 KiB 重建核对一次实际 super 命中收益，
 低于每次重建 16 次命中就关闭本次游戏会话的 shadow super；关闭 Debug 时没有

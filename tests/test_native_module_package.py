@@ -109,7 +109,9 @@ class NativeModulePackageTest(unittest.TestCase):
 
     def test_memory_split_keeps_old_total(self) -> None:
         core_h = (ROOT / "src" / "gam4980_core.h").read_text(encoding="utf-8")
+        self.assertIn("#ifdef GAM4980_DYNAMIC_NATIVE_ALL", core_h)
         self.assertIn("GAM4980_BARE_ROM_CACHE_LINES 64u", core_h)
+        self.assertIn("GAM4980_BARE_ROM_CACHE_LINES 128u", core_h)
         self.assertIn("GAM4980_NATIVE_CODE_ARENA_SIZE 0x40000u", core_h)
         self.assertEqual(64 * 0x1000 + 0x40000, 128 * 0x1000)
         native_h = (ROOT / "src" / "gam4980_native_module.h").read_text(

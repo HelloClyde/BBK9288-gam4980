@@ -46,6 +46,20 @@ class IramAsmPcFastPathTest(unittest.TestCase):
         self.assertIn("ld.ub %r2, [%r13]+", bridge)
         lda = between(self.source, ".LopAD:", ".Lop2D:")
         self.assertIn("FETCH16_CROSS .Lexit_slow1", lda)
+        jump = between(self.source, ".Lop4C:", ".Lop60:")
+        self.assertIn("FETCH16_CROSS .Lexit_slow1", jump)
+
+    def test_top_indexed_arithmetic_and_store_stay_in_iram(self) -> None:
+        arithmetic = between(self.source, ".Lop7D:", ".Lop8D:")
+        self.assertIn(".LopFD:", arithmetic)
+        self.assertIn("and   %r12, FLAG_D", arithmetic)
+        self.assertIn("add   %r12, %r5", arithmetic)
+        self.assertIn("MAP_READ_VALUE .Lexit_slow3", arithmetic)
+        self.assertIn("jp    .Lbinary_add", arithmetic)
+        store = between(self.source, ".Lop9D:", "/* LDA/ADC/SBC/STA")
+        self.assertIn("add   %r12, %r5", store)
+        self.assertIn("MAP_WRITE_POINTER .Lexit_slow3", store)
+        self.assertIn("add   %r10, 5", store)
 
     def test_direct_store_preserves_two_ram_write_post_rules(self) -> None:
         store = between(

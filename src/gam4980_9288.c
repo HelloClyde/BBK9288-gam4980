@@ -2201,7 +2201,7 @@ static void write_performance_log(void)
 #endif
 #ifdef GAM4980_IRAM_EXEC_ASM
     performance_log_u32(file, "iram_exec_engine_asm", 1u);
-    performance_log_u32(file, "iram_exec_hot_opcode_count", 77u);
+    performance_log_u32(file, "iram_exec_hot_opcode_count", 84u);
 #else
     performance_log_u32(file, "iram_exec_engine_asm", 0u);
     performance_log_u32(file, "iram_exec_hot_opcode_count", 0u);

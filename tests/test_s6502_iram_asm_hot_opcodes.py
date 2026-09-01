@@ -20,7 +20,9 @@ ADDED_HANDLERS = {
     0x49: ".Lop49",
     0x4E: ".Lop4E",
     0x6E: ".Lop6E",
+    0x7D: ".Lop7D",
     0x84: ".Lop84",
+    0x9D: ".Lop9D",
     0xA4: ".LopA4",
     0xA6: ".LopA6",
     0xAC: ".LopAC",
@@ -29,6 +31,7 @@ ADDED_HANDLERS = {
     0xE6: ".LopE6",
     0xE8: ".LopE8",
     0xEE: ".LopEE",
+    0xFD: ".LopFD",
 }
 
 
@@ -56,7 +59,7 @@ class IramAsmHotOpcodeTest(unittest.TestCase):
                 self.assertEqual(self.entries[opcode], handler)
                 self.assertIn(f"{handler}:\n", self.source)
 
-    def test_supported_coverage_grows_from_64_to_81(self) -> None:
+    def test_supported_coverage_grows_from_64_to_84(self) -> None:
         supported = sum(
             entry != ".Lslow_opcode" and entry != ".Lsuper"
             for entry in self.entries

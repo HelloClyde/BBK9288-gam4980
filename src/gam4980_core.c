@@ -4473,20 +4473,23 @@ static int s6502_iram_diagnostic_read16(uint16_t address, uint16_t *value)
 static int s6502_iram_opcode_supported(uint8_t opcode)
 {
     switch (opcode) {
-    case 0x06: case 0x08: case 0x09: case 0x0a: case 0x0d: case 0x0e:
+    case 0x05: case 0x06: case 0x08: case 0x09: case 0x0a: case 0x0d:
+    case 0x0e:
     case 0x10: case 0x18: case 0x1e: case 0x20: case 0x25: case 0x26:
     case 0x28: case 0x29: case 0x2a: case 0x2d: case 0x2e: case 0x30:
     case 0x38: case 0x3e: case 0x48: case 0x49: case 0x4a: case 0x4c:
     case 0x4e: case 0x50: case 0x60: case 0x65: case 0x68: case 0x69:
-    case 0x6a: case 0x6d: case 0x6e: case 0x71: case 0x78: case 0x85:
+    case 0x6a: case 0x6d: case 0x6e: case 0x71: case 0x78: case 0x7d:
+    case 0x84: case 0x85:
     case 0x86: case 0x88: case 0x8a: case 0x8d: case 0x8e: case 0x90:
-    case 0x91: case 0x98: case 0xa0: case 0xa2: case 0xa5: case 0xa8:
+    case 0x91: case 0x98: case 0x9d: case 0xa0: case 0xa2: case 0xa4:
+    case 0xa5: case 0xa6: case 0xa8:
     case 0xa9: case 0xaa: case 0xac: case 0xad: case 0xae: case 0xb0:
     case 0xb1: case 0xb9: case 0xbd: case 0xc0: case 0xc4:
     case 0xc5: case 0xc8: case 0xc9: case 0xca: case 0xcd: case 0xce:
     case 0xd0: case 0xde: case 0xe0: case 0xe5: case 0xe6:
     case 0xe8: case 0xe9: case 0xea: case 0xed: case 0xee: case 0xf0:
-    case 0xf1:
+    case 0xf1: case 0xfd:
         return 1;
     default:
         return 0;
@@ -4499,7 +4502,7 @@ static int s6502_iram_opcode_has_word_operand(uint8_t opcode)
     case 0x0d: case 0x0e: case 0x1e: case 0x20: case 0x2d: case 0x2e:
     case 0x3e: case 0x4c: case 0x4e: case 0x6d: case 0x6e: case 0x8d:
     case 0x8e: case 0xac: case 0xad: case 0xae: case 0xb9: case 0xbd:
-    case 0xcd: case 0xce: case 0xde: case 0xed: case 0xee:
+    case 0xcd: case 0xce: case 0xde: case 0xed: case 0xee: case 0xfd:
         return 1;
     default:
         return 0;
@@ -4528,21 +4531,24 @@ static uint32_t s6502_iram_slow_path_classify(
     if ((status & 0x08u) &&
         (opcode == 0x65u || opcode == 0x69u || opcode == 0x6du ||
          opcode == 0x71u || opcode == 0xe5u || opcode == 0xe9u ||
-         opcode == 0xedu || opcode == 0xf1u))
+         opcode == 0x7du || opcode == 0xedu || opcode == 0xf1u ||
+         opcode == 0xfdu))
         return GAM4980_IRAM_SLOW_DECIMAL_MODE;
 
     switch (opcode) {
     case 0x06: case 0x0e: case 0x1e: case 0x26: case 0x2e: case 0x3e:
-    case 0x4e: case 0x6e: case 0x85: case 0x86: case 0x8d: case 0x8e:
-    case 0x91: case 0xce: case 0xde: case 0xe6: case 0xee:
+    case 0x4e: case 0x6e: case 0x84: case 0x85: case 0x86: case 0x8d:
+    case 0x8e:
+    case 0x91: case 0x9d: case 0xce: case 0xde: case 0xe6: case 0xee:
         write = 1;
         break;
     default:
         break;
     }
     switch (opcode) {
-    case 0x06: case 0x25: case 0x26: case 0x65: case 0x85: case 0x86:
-    case 0xa5: case 0xc4: case 0xc5: case 0xe5: case 0xe6:
+    case 0x05: case 0x06: case 0x25: case 0x26: case 0x65: case 0x84:
+    case 0x85: case 0x86: case 0xa4: case 0xa5: case 0xa6: case 0xc4:
+    case 0xc5: case 0xe5: case 0xe6:
         zero_page = 1;
         if (!s6502_iram_diagnostic_read8((uint16_t)(pc + 1u), &operand8))
             return GAM4980_IRAM_SLOW_FETCH_PAGE;
@@ -4569,7 +4575,8 @@ static uint32_t s6502_iram_slow_path_classify(
             return GAM4980_IRAM_SLOW_FETCH_PAGE;
         address = operand16;
         break;
-    case 0x1e: case 0x3e: case 0xbd: case 0xde:
+    case 0x1e: case 0x3e: case 0x7d: case 0x9d: case 0xbd: case 0xde:
+    case 0xfd:
         if (!s6502_iram_diagnostic_read16(
                 (uint16_t)(pc + 1u), &operand16))
             return GAM4980_IRAM_SLOW_FETCH_PAGE;
@@ -6446,10 +6453,11 @@ int gam4980_warm_bare_rom_cache(void)
         uint16_t first_page;
         uint16_t last_page;
     } rom_warm_range_t;
-    /* Load complete profile ranges while they fit in the 96-line cache.  A
+    /* Load complete profile ranges while they fit in the configured cache. A
      * large late range is skipped rather than making the whole warm stage
-     * fail; its pages use the normal LRU/file gateway on demand.  The 128 KiB
-     * released here is the pageable native-code arena. */
+     * fail; its pages use the normal LRU/file gateway on demand.  Experimental
+     * dynamic-native builds trade 64 cache lines for their pageable code
+     * arena; the normal IRAM build keeps all 128 lines. */
     static const rom_warm_range_t ranges[] = {
         { GAM4980_ROM_REGION_8, 0x000u, 0x01du },
         { GAM4980_ROM_REGION_8, 0x022u, 0x022u },

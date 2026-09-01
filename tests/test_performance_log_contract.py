@@ -58,7 +58,7 @@ def test_warm_profile(core: str) -> None:
     if total != 116:
         raise AssertionError(f"warm profile has {total} pages, expected 116")
     if "#define ROM_CACHE_LINES GAM4980_BARE_ROM_CACHE_LINES" not in core:
-        raise AssertionError("bare ROM cache is not tied to the 96-line budget")
+        raise AssertionError("bare ROM cache is not tied to the configured budget")
     if "if (page_count > ROM_CACHE_LINES - next_line)\n            continue;" not in core:
         raise AssertionError("oversized warm ranges must be skipped atomically")
     print(
