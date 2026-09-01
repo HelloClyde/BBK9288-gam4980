@@ -13,6 +13,24 @@
      * the requested budget and returns only at a control-flow boundary.    \
      * Returning here would move IRQ delivery into the middle of a C6502    \
      * expression and is observably different on the real games. */        \
+    if (s6502_game_aot_enabled && s6502_game_aot_requested &&               \
+        game_aot_entry->linear_next_entry &&                                \
+        game_aot_entry->linear_next_entry <= s6502_game_aot_entry_limit) {  \
+        uint16_t aot_linear_id = game_aot_entry->linear_next_entry;         \
+        const s6502_game_aot_entry_t *aot_linear_entry =                    \
+            &s6502_game_aot_entries[aot_linear_id - 1u];                    \
+        if (!aot_linear_entry->semantic ||                                  \
+            (s6502_game_aot_semantic_mask &                                 \
+                (1u << (aot_linear_entry->semantic - 1u)))) {               \
+            game_aot_entry_id = aot_linear_id;                              \
+            game_aot_entry = aot_linear_entry;                              \
+            game_aot_physical_pc = aot_linear_entry->physical_pc;           \
+            game_aot_code = s6502_game_aot_code_base +                     \
+                (aot_linear_entry->physical_pc - 0x20d000u);                \
+            ++s6502_game_aot_linear_link_hits;                              \
+            goto _game_aot_dispatch;                                        \
+        }                                                                   \
+    }                                                                       \
     S6502_GAME_AOT_DISPATCH();                                              \
     goto _next;                                                             \
 } while (0)

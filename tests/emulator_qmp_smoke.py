@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--boot-wait", type=float, default=12.0)
     parser.add_argument(
+        "--game-wait",
+        type=float,
+        default=55.0,
+        help="seconds to wait after selecting the GAM before capture",
+    )
+    parser.add_argument(
         "--from-home",
         action="store_true",
         help="start with the emulator already showing the home screen",
@@ -89,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         "--enable-hle",
         action="store_true",
         help="enable firmware HLE in the file selector before starting",
+    )
+    parser.add_argument(
+        "--toggle-debug",
+        action="store_true",
+        help="toggle performance debug in settings before starting",
     )
     parser.add_argument(
         "--visit-settings",
@@ -127,7 +138,7 @@ def main() -> None:
         time.sleep(3.0)
         qmp.capture(args.output / "02-file-selector.ppm")
 
-        if args.enable_hle or args.visit_settings:
+        if args.enable_hle or args.toggle_debug or args.visit_settings:
             qmp.key("up")       # settings row immediately precedes the game
             time.sleep(0.5)
             qmp.key("ret")      # enter settings
@@ -137,6 +148,15 @@ def main() -> None:
                 time.sleep(0.5)
                 # HLE is enabled by default; leave it enabled and keep
                 # performance debug off for the gameplay smoke test.
+            if args.toggle_debug:
+                qmp.key("down")
+                if not args.enable_hle:
+                    qmp.key("down")
+                time.sleep(0.5)
+                qmp.key("ret")      # toggle performance debug
+                time.sleep(0.5)
+                return_steps = 2
+            elif args.enable_hle:
                 return_steps = 3
             else:
                 return_steps = 4
@@ -148,7 +168,7 @@ def main() -> None:
             qmp.capture(args.output / "02a-hle-enabled.ppm")
 
         qmp.key("ret", hold=1.0)  # select the highlighted .gam with a fresh press/release
-        time.sleep(55.0)      # allow the full 9288-speed logo/title sequence
+        time.sleep(args.game_wait)  # allow the logo/title sequence to complete
         qmp.capture(args.output / "03-game-menu.ppm")
 
         if args.title_exit:

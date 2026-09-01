@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,9 @@
 #define INITIAL_BUCKETS 4096u
 #define INVALID_RECORD ((size_t)-1)
 #define MAX_KEY_EVENTS 64u
+#define OPCODE_PAIR_COUNT 65536u
+#define OPCODE_TRIPLE_COUNT 16777216u
+#define SEQUENCE_TOP_COUNT 32u
 
 static u8 *stream_roms[2];
 
@@ -42,12 +46,24 @@ typedef struct profiler {
     size_t bucket_count;
     size_t current_record;
     uint64_t total_instructions;
+    uint64_t opcode_hits[256];
+    uint32_t *opcode_pair_hits;
+    uint32_t *opcode_triple_hits;
+    uint64_t total_pairs;
+    uint64_t total_triples;
     u32 previous_physical_pc;
     u16 previous_virtual_pc;
+    u16 previous_pair;
     u8 previous_opcode;
     int have_previous;
+    int have_previous_pair;
     int failed;
 } profiler_t;
+
+typedef struct sequence_rank {
+    uint32_t key;
+    uint32_t hits;
+} sequence_rank_t;
 
 typedef struct key_event {
     unsigned long frame;
@@ -180,13 +196,99 @@ static void profile_instruction(
             return;
         }
         ++profiler->records[profiler->current_record].entries;
+        profiler->have_previous_pair = 0;
+    } else {
+        uint16_t pair = (uint16_t)(
+            ((uint16_t)profiler->previous_opcode << 8) | opcode
+        );
+
+        if (profiler->opcode_pair_hits[pair] != UINT32_MAX)
+            ++profiler->opcode_pair_hits[pair];
+        ++profiler->total_pairs;
+        if (profiler->have_previous_pair) {
+            uint32_t triple = ((uint32_t)profiler->previous_pair << 8) |
+                opcode;
+
+            if (profiler->opcode_triple_hits[triple] != UINT32_MAX)
+                ++profiler->opcode_triple_hits[triple];
+            ++profiler->total_triples;
+        }
+        profiler->previous_pair = pair;
+        profiler->have_previous_pair = 1;
     }
     ++profiler->records[profiler->current_record].instructions;
     ++profiler->total_instructions;
+    ++profiler->opcode_hits[opcode];
     profiler->previous_virtual_pc = virtual_pc;
     profiler->previous_physical_pc = physical_pc;
     profiler->previous_opcode = opcode;
     profiler->have_previous = 1;
+}
+
+static void sequence_rank_insert(
+    sequence_rank_t *ranks, uint32_t key, uint32_t hits
+)
+{
+    size_t index;
+
+    if (!hits || hits <= ranks[SEQUENCE_TOP_COUNT - 1u].hits)
+        return;
+    index = SEQUENCE_TOP_COUNT - 1u;
+    while (index && hits > ranks[index - 1u].hits) {
+        ranks[index] = ranks[index - 1u];
+        --index;
+    }
+    ranks[index].key = key;
+    ranks[index].hits = hits;
+}
+
+static void print_sequence_histogram(
+    const profiler_t *profiler, unsigned length
+)
+{
+    sequence_rank_t ranks[SEQUENCE_TOP_COUNT];
+    const uint32_t *hits;
+    uint32_t count;
+    uint64_t total;
+    uint32_t key;
+    size_t rank;
+
+    memset(ranks, 0, sizeof(ranks));
+    if (length == 2u) {
+        hits = profiler->opcode_pair_hits;
+        count = OPCODE_PAIR_COUNT;
+        total = profiler->total_pairs;
+    } else {
+        hits = profiler->opcode_triple_hits;
+        count = OPCODE_TRIPLE_COUNT;
+        total = profiler->total_triples;
+    }
+    for (key = 0u; key < count; ++key)
+        sequence_rank_insert(ranks, key, hits[key]);
+
+    printf("opcode %s histogram:\n", length == 2u ? "pair" : "triple");
+    for (rank = 0u; rank < SEQUENCE_TOP_COUNT && ranks[rank].hits; ++rank) {
+        uint32_t value = ranks[rank].key;
+
+        if (length == 2u) {
+            printf(
+                "opcodes=%02x-%02x hits=%u coverage=%.6f%%\n",
+                (unsigned)(value >> 8), (unsigned)(value & 0xffu),
+                (unsigned)ranks[rank].hits,
+                total ? 100.0 * (double)ranks[rank].hits /
+                    (double)total : 0.0
+            );
+        } else {
+            printf(
+                "opcodes=%02x-%02x-%02x hits=%u coverage=%.6f%%\n",
+                (unsigned)(value >> 16),
+                (unsigned)((value >> 8) & 0xffu),
+                (unsigned)(value & 0xffu), (unsigned)ranks[rank].hits,
+                total ? 100.0 * (double)ranks[rank].hits /
+                    (double)total : 0.0
+            );
+        }
+    }
 }
 
 static int load_file(const char *path, u8 *data, u32 size)
@@ -369,6 +471,35 @@ static int write_report(
         (unsigned long long)profiler->total_instructions,
         profiler->record_count
     );
+    {
+        unsigned rank;
+
+        printf("opcode histogram:\n");
+        for (rank = 0u; rank < 256u; ++rank) {
+            unsigned opcode = 0u;
+            uint64_t hits = 0u;
+            unsigned candidate;
+
+            for (candidate = 0u; candidate < 256u; ++candidate) {
+                if (profiler->opcode_hits[candidate] > hits) {
+                    opcode = candidate;
+                    hits = profiler->opcode_hits[candidate];
+                }
+            }
+            if (!hits)
+                break;
+            printf(
+                "opcode=%02x hits=%llu coverage=%.6f%%\n",
+                opcode, (unsigned long long)hits,
+                profiler->total_instructions
+                    ? 100.0 * (double)hits /
+                        (double)profiler->total_instructions : 0.0
+            );
+            profiler->opcode_hits[opcode] = 0u;
+        }
+    }
+    print_sequence_histogram(profiler, 2u);
+    print_sequence_histogram(profiler, 3u);
     for (index = 0; index < profiler->record_count; ++index) {
         cumulative += profiler->records[index].instructions;
         while (threshold_index < sizeof(thresholds) / sizeof(thresholds[0]) &&
@@ -501,9 +632,19 @@ int main(int argc, char **argv)
     buffers.flash = (u8 *)malloc(GAM4980_FLASH_SIZE);
     buffers.rom_8 = (u8 *)malloc(GAM4980_ROM_SIZE);
     buffers.rom_e = (u8 *)malloc(GAM4980_ROM_SIZE);
+    profiler.opcode_pair_hits = (uint32_t *)calloc(
+        OPCODE_PAIR_COUNT, sizeof(*profiler.opcode_pair_hits)
+    );
+    profiler.opcode_triple_hits = (uint32_t *)calloc(
+        OPCODE_TRIPLE_COUNT, sizeof(*profiler.opcode_triple_hits)
+    );
     buffers.flash_size = GAM4980_FLASH_SIZE;
     if (!buffers.ram || !buffers.flash || !buffers.rom_8 || !buffers.rom_e) {
         fprintf(stderr, "out of memory\n");
+        goto cleanup;
+    }
+    if (!profiler.opcode_pair_hits || !profiler.opcode_triple_hits) {
+        fprintf(stderr, "out of memory for opcode sequence profiler\n");
         goto cleanup;
     }
     if (!load_file(paths[0], buffers.rom_8, GAM4980_ROM_SIZE) ||
@@ -528,6 +669,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "firmware HLE was not compiled into this profiler\n");
         goto cleanup;
     }
+#endif
+#ifdef GAM4980_ENABLE_GAME_LOAD_AOT
+    /* Match the 9288 frontend: game HLE templates are discovered as part of
+     * the load-time AOT pass, which is disabled by default in the core.  A
+     * profiler built with these features must opt in explicitly or it reports
+     * the pre-HLE instruction stream while claiming that HLE is enabled. */
+    gam4980_set_game_load_aot_enabled(1);
+    gam4980_set_game_aot_metrics_enabled(1);
+#endif
+#if defined(GAM4980_AOT_DIAGNOSTICS) || \
+    defined(GAM4980_RUNTIME_PERFORMANCE_LOG) || \
+    defined(GAM4980_ENABLE_FIRMWARE_HLE)
+    gam4980_set_performance_debug(1);
 #endif
     if (gam4980_init(&buffers) <= 0) {
         fprintf(stderr, "could not initialize the core\n");
@@ -614,6 +768,8 @@ cleanup_core:
 cleanup:
     free(profiler.buckets);
     free(profiler.records);
+    free(profiler.opcode_pair_hits);
+    free(profiler.opcode_triple_hits);
     free(buffers.ram);
     free(buffers.flash);
     free(stream_rom ? stream_roms[GAM4980_ROM_REGION_8] : buffers.rom_8);

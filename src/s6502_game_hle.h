@@ -112,6 +112,22 @@
       goto _exit;
     }
 
+  _hle_game_callback_scan:
+    {
+      CYCLES(s6502_game_hle_table_result.cycles);
+      S6502_HLE_RECORD(
+        S6502_HLE_ID_GAME_CALLBACK_SCAN,
+        s6502_game_hle_table_result.cycles
+      );
+      pc = s6502_game_hle_table_result.pc;
+      ac = s6502_game_hle_table_result.ac;
+      ix = s6502_game_hle_table_result.ix;
+      iy = s6502_game_hle_table_result.iy;
+      sp = s6502_game_hle_table_result.sp;
+      status = s6502_game_hle_table_result.status;
+      goto _exit;
+    }
+
   _hle_game_record_scan:
     {
       CYCLES(s6502_game_hle_scan_result.cycles);
@@ -277,6 +293,11 @@
       }
 
       pc = game_hle_bitmap->outer_virtual_pc;
+      et = s6502_game_hle_bitmap_row_body_cycles(game_hle_bitmap, ix);
+      if (et && (uint32_t)et <= cycles - executed) {
+        game_hle_bitmap_outer = 1u;
+        goto _hle_game_bitmap_row_body_fast;
+      }
       et = s6502_game_hle_bitmap_outer_cycles(game_hle_bitmap, ix);
       if (et && (uint32_t)et <= cycles - executed) {
         game_hle_bitmap_outer = 1u;
@@ -420,6 +441,11 @@
       SET_NZ(ix);
       pc = game_hle_bitmap->outer_virtual_pc;
 
+      et = s6502_game_hle_bitmap_row_body_cycles(game_hle_bitmap, ix);
+      if (et && (uint32_t)et <= cycles - executed) {
+        game_hle_bitmap_outer = 1u;
+        goto _hle_game_bitmap_row_body_fast;
+      }
       et = s6502_game_hle_bitmap_outer_cycles(game_hle_bitmap, ix);
       if (et && (uint32_t)et <= cycles - executed) {
         game_hle_bitmap_outer = 1u;
@@ -428,11 +454,120 @@
       goto _exit;
     }
 
+  _hle_game_bitmap_row_body_fast:
+    {
+      uint8_t hle_source_index;
+      uint8_t hle_destination_index;
+      uint8_t hle_width;
+      uint8_t hle_x;
+      uint8_t hle_source = 0u;
+      uint8_t hle_accumulator;
+      uint8_t hle_subpixel;
+      uint16_t hle_source_base;
+      uint16_t hle_destination_base;
+
+      CYCLES(et);
+      S6502_HLE_RECORD(S6502_HLE_ID_GAME_BITMAP, et);
+
+      hle_source_index = READ8(game_hle_bitmap->source_index_zp);
+      hle_destination_index = READ8(
+        game_hle_bitmap->destination_index_zp
+      );
+      hle_width = READ8(game_hle_bitmap->width_zp);
+      hle_x = (uint8_t)ix;
+      hle_accumulator = READ8(game_hle_bitmap->accumulator_zp);
+      hle_source_base = READ16W(game_hle_bitmap->source_pointer_zp);
+      hle_destination_base = READ16W(
+        game_hle_bitmap->destination_pointer_zp
+      );
+
+      do {
+        uint8_t hle_pixel;
+        uint8_t hle_compared;
+
+        /* LDY source_index / LDA (source),Y.  Y is overwritten only if this
+         * packed byte crosses a destination-byte boundary. */
+        iy = hle_source_index;
+        hle_source = READ8((uint16_t)(
+          hle_source_base + hle_source_index
+        ));
+        hle_subpixel = 0u;
+        for (hle_pixel = 0u; hle_pixel < 4u; ++hle_pixel) {
+          uint8_t hle_bits = (uint8_t)(hle_source & 0xc0u);
+
+          if (!hle_bits) {
+            hle_accumulator = (uint8_t)(
+              hle_accumulator & READ8((uint16_t)(
+                game_hle_bitmap->and_table + hle_x
+              ))
+            );
+          } else if (hle_bits == 0x40u) {
+            hle_accumulator = (uint8_t)(
+              hle_accumulator | READ8((uint16_t)(
+                game_hle_bitmap->or_table + hle_x
+              ))
+            );
+          }
+
+          hle_x = (uint8_t)(hle_x + 1u);
+          if (hle_x == 8u) {
+            WRITE8(
+              (uint16_t)(hle_destination_base + hle_destination_index),
+              hle_accumulator
+            );
+            hle_destination_index = (uint8_t)(
+              hle_destination_index + 1u
+            );
+            iy = hle_destination_index;
+            hle_accumulator = READ8((uint16_t)(
+              hle_destination_base + hle_destination_index
+            ));
+            hle_x = 0u;
+          }
+
+          ++hle_subpixel;
+          if (hle_subpixel != 4u)
+            hle_source = (uint8_t)(hle_source << 2);
+        }
+
+        hle_source_index = (uint8_t)(hle_source_index + 1u);
+        hle_compared = (uint8_t)(hle_source_index << 2);
+        if (hle_compared >= hle_width)
+          break;
+      } while (1);
+
+      /* Commit the exact zero-page and visible CPU state at $513E, the row
+       * suffix entry.  Intermediate flag values cannot be observed because
+       * the fused path is admitted only when the complete row fits before
+       * the current guest deadline. */
+      WRITE8(game_hle_bitmap->source_zp, hle_source);
+      WRITE8(game_hle_bitmap->accumulator_zp, hle_accumulator);
+      WRITE8(game_hle_bitmap->destination_index_zp, hle_destination_index);
+      WRITE8(game_hle_bitmap->subpixel_zp, 0u);
+      WRITE8(game_hle_bitmap->source_index_zp, hle_source_index);
+      ix = hle_x;
+      ac = (uint8_t)(hle_source_index << 2);
+      SET_NZ(ac);
+      dt = (uint8_t)~hle_width;
+      et = (uint16_t)(ac + dt + 1u);
+      SET_C(et > 0xffu);
+      SET_NZ((uint8_t)et);
+      pc = game_hle_bitmap->outer_exit_pc;
+
+      et = s6502_game_hle_bitmap_row_cycles(game_hle_bitmap, ix);
+      if (et && (uint32_t)et <= cycles - executed)
+        goto _hle_game_bitmap_row;
+      goto _exit;
+    }
+
   _hle_game_bitmap:
     {
       uint8_t hle_subpixel;
       uint16_t hle_base;
       uint16_t hle_address;
+
+      CYCLES(et);
+      S6502_HLE_RECORD(S6502_HLE_ID_GAME_BITMAP, et);
 
       if (game_hle_bitmap_outer) {
         iy = READ8(game_hle_bitmap->source_index_zp);
@@ -445,9 +580,6 @@
         WRITE8(game_hle_bitmap->source_zp, ac);
       }
       hle_subpixel = READ8(game_hle_bitmap->subpixel_zp);
-
-      CYCLES(et);
-      S6502_HLE_RECORD(S6502_HLE_ID_GAME_BITMAP, et);
 
       do {
         ac = READ8(game_hle_bitmap->source_zp);
@@ -546,6 +678,13 @@
             goto _hle_game_bitmap_row;
         } else {
           pc = game_hle_bitmap->outer_virtual_pc;
+          et = s6502_game_hle_bitmap_row_body_cycles(
+            game_hle_bitmap, ix
+          );
+          if (et && (uint32_t)et <= cycles - executed)
+          {
+            goto _hle_game_bitmap_row_body_fast;
+          }
           et = s6502_game_hle_bitmap_outer_cycles(game_hle_bitmap, ix);
           if (et && (uint32_t)et <= cycles - executed)
             goto _hle_game_bitmap;

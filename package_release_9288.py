@@ -9,6 +9,7 @@ import zipfile
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 APP_PATH = PROJECT_ROOT / "build" / "9288" / "GAM4980.exe"
+NATIVE_PATH = PROJECT_ROOT / "build" / "9288" / "GAM4980.NAT"
 ICON_PATHS = (
     PROJECT_ROOT / "assets" / "9288" / "ico1.bin",
     PROJECT_ROOT / "assets" / "9288" / "ico2.bin",
@@ -69,6 +70,23 @@ def validate() -> None:
             raise SystemExit(f"missing or invalid runtime ROM: {rom}")
         if sha256(rom) != ROM_SHA256[rom.name]:
             raise SystemExit(f"runtime ROM checksum mismatch: {rom}")
+    if not NATIVE_PATH.is_file() or NATIVE_PATH.stat().st_size < 64:
+        raise SystemExit(
+            f"missing pageable native module: {NATIVE_PATH}; "
+            "run build_9288.py with --iram-exec-engine first"
+        )
+    native = NATIVE_PATH.read_bytes()
+    magic, format_version, abi_version, header_size, file_size = (
+        struct.unpack_from("<5I", native)
+    )
+    if (magic, format_version, abi_version, header_size, file_size) != (
+        0x54414E47,
+        1,
+        4,
+        64,
+        len(native),
+    ):
+        raise SystemExit("pageable native module header is invalid")
 
 
 def add_file(archive: zipfile.ZipFile, source: Path, target: str) -> None:
@@ -96,6 +114,7 @@ def main() -> None:
         args.output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
     ) as archive:
         add_file(archive, APP_PATH, "系统/程序/GAM4980.exe")
+        add_file(archive, NATIVE_PATH, "gam4980/GAM4980.NAT")
         for rom in ROM_PATHS:
             add_file(archive, rom, f"gam4980/{rom.name}")
     with zipfile.ZipFile(args.output) as archive:

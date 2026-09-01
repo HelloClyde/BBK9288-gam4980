@@ -1,5 +1,7 @@
 
 #include "gam4980_types.h"
+#ifndef S6502_CPU_TYPE_DEFINED
+#define S6502_CPU_TYPE_DEFINED
 typedef struct {
   uint16_t pc;
   uint8_t ac;
@@ -8,8 +10,14 @@ typedef struct {
   uint8_t sp;
   uint8_t status;
 } s6502_t;
-uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
-#ifndef S6502_NO_COMPUTED_GOTO
+#endif
+#ifndef S6502_EXEC_FUNCTION
+#define S6502_EXEC_FUNCTION s6502_exec
+#define S6502_EXEC_FUNCTION_LOCAL
+#endif
+uint32_t S6502_EXEC_FUNCTION(s6502_t *u, uint32_t cycles) {
+#if !defined(S6502_NO_COMPUTED_GOTO) && \
+    !defined(S6502_NATIVE_CHAIN_ONLY)
   static void *_table[0x100] = {
       &&_00, &&_01, &&_02, &&_03, &&_04, &&_05, &&_06, &&_07, &&_08, &&_09,
       &&_0a, &&_0b, &&_0c, &&_0d, &&_0e, &&_0f, &&_10, &&_11, &&_12, &&_13,
@@ -37,6 +45,12 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
       &&_e6, &&_e7, &&_e8, &&_e9, &&_ea, &&_eb, &&_ec, &&_ed, &&_ee, &&_ef,
       &&_f0, &&_f1, &&_f2, &&_f3, &&_f4, &&_f5, &&_f6, &&_f7, &&_f8, &&_f9,
       &&_fa, &&_fb, &&_fc, &&_fd, &&_fe, &&_ff};
+#endif
+#if defined(S6502_AOT_DISPATCH) && !defined(S6502_NATIVE_HLE_ONLY) && \
+    !defined(S6502_FIRMWARE_AOT_EXTERNAL)
+#define S6502_AOT_DEFINE_TOKEN_TABLE
+#include "s6502_aot_ebin_generated.h"
+#undef S6502_AOT_DEFINE_TOKEN_TABLE
 #endif
 #define CYCLES(n) executed += n
 #define EXIT goto _exit
@@ -84,6 +98,10 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
 #endif
   {
     uint32_t executed = 0;
+#if defined(S6502_AOT_DISPATCH) && !defined(S6502_NATIVE_HLE_ONLY) && \
+    !defined(S6502_FIRMWARE_AOT_EXTERNAL)
+    uint16_t aot_next_token = 0u;
+#endif
     uint8_t dt = 0;
     uint16_t et = 0;
     uint16_t ea = 0;
@@ -94,11 +112,15 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
     uint8_t sp = u->sp;
     uint8_t status = u->status;
 #ifdef S6502_GAME_AOT_DISPATCH
+#ifndef S6502_NATIVE_HLE_ONLY
     uint16_t game_aot_entry_id = 0;
     uint16_t game_aot_hash_slot = 0;
+#endif
     uint32_t game_aot_physical_pc = 0;
+#ifndef S6502_NATIVE_HLE_ONLY
     const s6502_game_aot_entry_t *game_aot_entry = 0;
     const uint8_t *game_aot_code = 0;
+#endif
 #ifdef S6502_GAME_HLE_LOCALS
     S6502_GAME_HLE_LOCALS
 #endif
@@ -130,7 +152,9 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
     }
 #endif
     if ((executed >= cycles) || sys_halt_p()) {
-#ifdef S6502_AOT_DISPATCH
+#if (defined(S6502_AOT_DISPATCH) && !defined(S6502_NATIVE_HLE_ONLY) && \
+    !defined(S6502_FIRMWARE_AOT_EXTERNAL)) || \
+    defined(S6502_GAME_AOT_DISPATCH)
   _aot_return:
 #endif
       u->pc = pc;
@@ -141,6 +165,19 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
       u->status = status;
       return (executed);
     } else {
+#if defined(S6502_AOT_DISPATCH) && !defined(S6502_NATIVE_HLE_ONLY) && \
+    !defined(S6502_FIRMWARE_AOT_EXTERNAL)
+      if (aot_next_token) {
+        uint16_t aot_token_id = (uint16_t)(aot_next_token - 1u);
+
+        aot_next_token = 0u;
+        if (aot_token_id < S6502_AOT_BLOCK_COUNT &&
+            s6502_aot_match(aot_token_id)) {
+          ++s6502_aot_token_link_hits;
+          goto *s6502_aot_token_table[aot_token_id];
+        }
+      }
+#endif
 #ifdef S6502_AOT_DISPATCH
       S6502_AOT_DISPATCH();
 #endif
@@ -163,6 +200,45 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
       u->sp = sp;
       u->status = status;
       return executed;
+    }
+#endif
+#ifdef S6502_NATIVE_CHAIN_ACTIVE
+    if (S6502_NATIVE_CHAIN_ACTIVE()) {
+      u->pc = pc;
+      u->ac = ac;
+      u->ix = ix;
+      u->iy = iy;
+      u->sp = sp;
+      u->status = status;
+      return executed;
+    }
+#endif
+#ifdef S6502_NATIVE_CHAIN_ONLY
+    /* The wrapper fastcall enters this compact copy only at a native dispatch
+     * boundary.  If no HLE owns the PC, return zero immediately so the outer
+     * full core can execute the real instruction/AOT block.  Re-dispatching
+     * here would retry a condition-rejected HLE forever. */
+    u->pc = pc;
+    u->ac = ac;
+    u->ix = ix;
+    u->iy = iy;
+    u->sp = sp;
+    u->status = status;
+    return executed;
+#else
+#ifdef S6502_IRAM_EXEC_BURST
+    {
+      uint32_t iram_budget = executed < cycles ? cycles - executed : 0u;
+      uint32_t iram_result = S6502_IRAM_EXEC_BURST(
+          &pc, &ac, &ix, &iy, &sp, &status, iram_budget);
+      uint32_t iram_executed = iram_result & 0x7fffffffu;
+
+      if (iram_executed) {
+        executed += iram_executed;
+        if (iram_result & 0x80000000u)
+          goto _exit;
+        goto _next;
+      }
     }
 #endif
 #ifdef S6502_NO_COMPUTED_GOTO
@@ -2377,7 +2453,9 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
     };
     CYCLES(5);
     NEXT;
-#ifdef S6502_AOT_DISPATCH
+#endif /* !S6502_NATIVE_CHAIN_ONLY */
+#if defined(S6502_AOT_DISPATCH) && !defined(S6502_NATIVE_HLE_ONLY) && \
+    !defined(S6502_FIRMWARE_AOT_EXTERNAL)
 #define S6502_AOT_EMIT_BLOCKS
 #include "s6502_aot_ebin_generated.h"
 #undef S6502_AOT_EMIT_BLOCKS
@@ -2421,3 +2499,7 @@ uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
 #undef POP
 #undef S6502_FETCH_OPCODE
 }
+#ifdef S6502_EXEC_FUNCTION_LOCAL
+#undef S6502_EXEC_FUNCTION_LOCAL
+#undef S6502_EXEC_FUNCTION
+#endif

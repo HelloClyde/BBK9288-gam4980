@@ -1,5 +1,7 @@
 #include "Dsys.h"
 #include "gam4980_core.h"
+#include "gam4980_9288_bare.h"
+#include "gam4980_9288_iram.h"
 
 /* ROM caches are completely filled before their first read.  Keep the large
  * scratch buffers outside .bss so startup only clears the small state block.
@@ -23,6 +25,17 @@
 #define FRAME_TIMER_ID 1
 #define FRAME_TIMER_SPEED 1
 #define EXIT_HOLD_TIMER_TICKS 40u
+#define BARE_CLOCK_HZ 256u
+#define BARE_EXIT_HOLD_TICKS 256u
+#define BARE_KEY_REPEAT_DELAY_TICKS 96u
+#define BARE_KEY_REPEAT_INTERVAL_TICKS 16u
+#define BARE_KEY_RELEASE_TIMEOUT_TICKS (2u * BARE_CLOCK_HZ)
+#define BARE_MAX_FRAMES_PER_BATCH 4u
+/* A complete guest frame can occupy the true device for 75 ms or more and a
+ * four-frame catch-up batch can therefore hide a short physical key press.
+ * Poll between <=8K-cycle CPU slices (about eight points per guest frame)
+ * while leaving guest timing and scheduler batching unchanged. */
+#define BARE_INPUT_POLL_GUEST_CYCLES 8192u
 #define SETTINGS_VERSION 2u
 
 /* Keep the public 9288 SDK ABI compile-checked.  Its SysBltFrame member is at
@@ -42,6 +55,9 @@ typedef char T_9288_PublicSysBltFrameOffsetMustBe59c[
 
 static const char k_rom_8_path[] = "a:\\gam4980\\8.BIN";
 static const char k_rom_e_path[] = "a:\\gam4980\\E.BIN";
+static const char k_native_module_path[] = "a:\\gam4980\\GAM4980.NAT";
+static const char k_native_game_fallback_path[] =
+    "a:\\gam4980\\GAME.GNA";
 static const char k_game_root[] = "a:\\gam4980";
 static const char k_game_dir[] = "a:\\gam4980\\";
 static const char k_game_pattern[] = "a:\\gam4980\\*.*";
@@ -105,6 +121,12 @@ static const T_BYTE k_loading_hle[] = "MATCHING GAME HLE";
 static const T_BYTE k_loading_cfg[] = "ANALYZING GAME CODE";
 static const T_BYTE k_loading_aot[] = "BUILDING AOT INDEX";
 static const T_BYTE k_loading_save[] = "LOADING SAVE DATA";
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+static const T_BYTE k_loading_native[] = "LOADING NATIVE CODE";
+#endif
+#ifdef GAM4980_ENABLE_BARE_SESSION
+static const T_BYTE k_loading_warm_rom[] = "WARMING ROM CACHE";
+#endif
 static const T_BYTE k_loading_start[] = "STARTING GAME";
 
 /* Compact 5x7 glyph rows for a true framebuffer Loading page.  The 9288
@@ -166,6 +188,7 @@ static T_GUI_HDC g_game_hdc;
 static gam4980_buffers_t g_buffers;
 static char g_game_path[PATH_CAPACITY];
 static char g_save_path[PATH_CAPACITY];
+static char g_native_game_path[PATH_CAPACITY];
 static char g_game_names[MAX_GAME_FILES][GAME_NAME_CAPACITY]
     __attribute__((aligned(4), section(".scratch")));
 static struct ffblk g_find_block
@@ -195,6 +218,8 @@ static int g_setting_double_speed;
 static u8 g_static_ram[GAM4980_RAM_SIZE]
     __attribute__((aligned(4), section(".scratch")));
 static FS_FILE *g_rom_files[2];
+static FS_FILE *g_native_module_file;
+static int g_native_module_game_specific;
 static int g_close_requested;
 static int g_escape_down;
 static u32 g_exit_hold_timer_ticks;
@@ -203,6 +228,10 @@ static u32 g_timer_frame_phase;
 static int g_first_frame_logged;
 #endif
 static int g_frame_tick_pending;
+/* A failed preload is non-fatal: the GUI execution path can service ROM
+ * misses through the SDK normally, but bare mode must not enter with a cache
+ * that is known to require filesystem gateways immediately. */
+static int g_bare_rom_cache_ready;
 typedef struct T_GAM4980_PerformanceMetrics {
     u32 load_begin_tick;
     u32 session_last_tick;
@@ -291,6 +320,24 @@ typedef struct T_GAM4980_PerformanceMetrics {
     u32 paint_invalidate_failures;
     u32 rom_reads;
     u32 rom_bytes;
+    u32 bare_session_started;
+    u32 bare_clock_ticks;
+    u32 bare_clock_max_step;
+    u32 bare_loop_iterations;
+    u32 bare_key_scans;
+    u32 bare_key_poll_callbacks;
+    u32 bare_key_scan_max_gap;
+    u32 bare_key_scan_gap_over_4;
+    u32 bare_key_scan_gap_over_8;
+    u32 bare_core_ticks;
+    u32 bare_core_max_ticks;
+    u32 bare_render_ticks;
+    u32 bare_render_max_ticks;
+    u32 bare_present_ticks;
+    u32 bare_present_max_ticks;
+    u32 bare_direct_fs_ticks;
+    u32 bare_exit_reason;
+    u32 bare_restore_ok;
 } T_GAM4980_PerformanceMetrics;
 
 typedef struct T_GAM4980_RtcMarker {
@@ -319,6 +366,16 @@ static u32 g_last_paint_tick;
 /* The 9288 GUI game interface submits a complete 0x4b00-byte virtual screen. */
 static u8 g_screen_frame[SCREEN_FRAME_BYTES]
     __attribute__((aligned(4), section(".scratch")));
+/* Snapshot the physical launcher screen before creating any application
+ * window.  The final restore is delayed until all application cleanup is
+ * complete and the launcher's queued work plus HSDMA channel have settled. */
+static u8 g_desktop_frame[SCREEN_FRAME_BYTES]
+    __attribute__((aligned(4), section(".scratch")));
+static int g_desktop_frame_valid;
+static T_GUI_HWND g_launcher_window;
+static T_GUI_HWND g_launcher_focus;
+static T_GUI_HWND g_launcher_restore_closed_window;
+static int g_launcher_restore_pending;
 /* Each entry expands one packed 1-bpp source byte into four already aligned
  * 2-bpp output bytes.  The first index selects the two-bit carry from the
  * preceding source byte (black or white).  Building this small table once
@@ -625,6 +682,11 @@ static void release_buffers(void)
             g_rom_files[index] = 0;
         }
     }
+    gam4980_native_modules_close();
+    if (g_native_module_file) {
+        fs_fclose(g_native_module_file);
+        g_native_module_file = 0;
+    }
     if (g_buffers.flash)
         free(g_buffers.flash);
     memset(&g_buffers, 0, sizeof(g_buffers));
@@ -632,18 +694,54 @@ static void release_buffers(void)
 
 static int allocate_buffers(u32 game_size)
 {
-    u32 flash_size = (0x15000u + game_size + 0xfffu) & ~0xfffu;
+    u32 flash_size;
+    u32 allocation_size;
+    u8 *allocation;
 
+    if (game_size > 0xffffffffu - 0x15000u - 0xfffu)
+        return 0;
+    flash_size = (0x15000u + game_size + 0xfffu) & ~0xfffu;
     if (flash_size > GAM4980_FLASH_SIZE)
+        return 0;
+    allocation_size = flash_size;
+#ifdef GAM4980_ENABLE_BARE_SESSION
+    if (GAM4980_BARE_ROM_CACHE_SIZE > 0xffffffffu - allocation_size)
+        return 0;
+    allocation_size += GAM4980_BARE_ROM_CACHE_SIZE;
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+    if (GAM4980_NATIVE_CODE_ARENA_SIZE > 0xffffffffu - allocation_size)
+        return 0;
+    allocation_size += GAM4980_NATIVE_CODE_ARENA_SIZE;
+#endif
+#endif
+    allocation = (u8 *)malloc(allocation_size);
+    if (!allocation)
         return 0;
     memset(&g_buffers, 0, sizeof(g_buffers));
     g_buffers.ram = g_static_ram;
-    g_buffers.flash = (u8 *)malloc(flash_size);
+    g_buffers.flash = allocation;
     g_buffers.flash_size = flash_size;
+#ifdef GAM4980_ENABLE_BARE_SESSION
+    g_buffers.rom_cache = allocation + flash_size;
+    g_buffers.rom_cache_size = GAM4980_BARE_ROM_CACHE_SIZE;
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+    g_buffers.native_code = g_buffers.rom_cache +
+        GAM4980_BARE_ROM_CACHE_SIZE;
+    g_buffers.native_code_size = GAM4980_NATIVE_CODE_ARENA_SIZE;
+#else
+    g_buffers.native_code = 0;
+    g_buffers.native_code_size = 0u;
+#endif
+#else
+    g_buffers.rom_cache = 0;
+    g_buffers.rom_cache_size = 0u;
+    g_buffers.native_code = 0;
+    g_buffers.native_code_size = 0u;
+#endif
     g_buffers.framebuffer = 0;
     g_buffers.rom_read = read_rom_bank;
     g_buffers.rom_context = 0;
-    return g_buffers.flash != 0;
+    return 1;
 }
 
 static int read_exact(FS_FILE *file, u8 *out, u32 size)
@@ -781,6 +879,7 @@ static void reset_performance_metrics(void)
     g_first_pending_submit_tick = 0u;
     g_last_pending_submit_tick = 0u;
     g_last_paint_tick = 0u;
+    g_bare_rom_cache_ready = 0;
 }
 
 static void performance_begin_paint_tracking(void)
@@ -972,6 +1071,10 @@ static int read_rom_bank(
 )
 {
     FS_FILE *file;
+    int bare_suspended = 0;
+    int bare_direct = 0;
+    int read_ok = 0;
+    u32 bare_direct_start = 0u;
 
     (void)context;
 #ifndef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
@@ -994,20 +1097,154 @@ static int read_rom_bank(
 #endif
         return 0;
     }
+    if (gam4980_9288_bare_active()) {
+#ifdef GAM4980_BARE_DIRECT_FS
+        if (!gam4980_9288_bare_direct_sdk_begin()) {
+#ifdef GAM4980_MEMORY_DIAGNOSTICS
+            ++g_gam4980_memory_diagnostic.rom_failures;
+#endif
+            return 0;
+        }
+        bare_direct = 1;
+        bare_direct_start = gam4980_9288_bare_clock();
+#else
+        if (!gam4980_9288_bare_suspend_for_sdk()) {
+#ifdef GAM4980_MEMORY_DIAGNOSTICS
+            ++g_gam4980_memory_diagnostic.rom_failures;
+#endif
+            return 0;
+        }
+        bare_suspended = 1;
+#endif
+    }
     file = g_rom_files[region];
     if (!file || fs_fseek(file, (long)offset, SEEK_SET) < 0) {
 #ifdef GAM4980_MEMORY_DIAGNOSTICS
         ++g_gam4980_memory_diagnostic.rom_failures;
 #endif
-        return 0;
+        goto finish;
     }
     if (!read_exact(file, out, size)) {
 #ifdef GAM4980_MEMORY_DIAGNOSTICS
         ++g_gam4980_memory_diagnostic.rom_failures;
 #endif
-        return 0;
+        goto finish;
     }
+    read_ok = 1;
+finish:
+    if (bare_direct) {
+        if (!gam4980_9288_bare_direct_sdk_end())
+            read_ok = 0;
+        g_performance.bare_direct_fs_ticks +=
+            gam4980_9288_bare_clock() - bare_direct_start;
+    } else if (bare_suspended &&
+               !gam4980_9288_bare_resume_after_sdk()) {
+        read_ok = 0;
+    }
+    return read_ok;
+}
+
+static int read_native_module(
+    void *context, u32 offset, u8 *out, u32 size
+)
+{
+    int bare_suspended = 0;
+    int bare_direct = 0;
+    int read_ok = 0;
+
+    (void)context;
+    if (!g_native_module_file || (!out && size))
+        return 0;
+    if (gam4980_9288_bare_active()) {
+#ifdef GAM4980_BARE_DIRECT_FS
+        if (!gam4980_9288_bare_direct_sdk_begin())
+            return 0;
+        bare_direct = 1;
+#else
+        if (!gam4980_9288_bare_suspend_for_sdk())
+            return 0;
+        bare_suspended = 1;
+#endif
+    }
+    if (fs_fseek(g_native_module_file, (long)offset, SEEK_SET) >= 0 &&
+        read_exact(g_native_module_file, out, size))
+        read_ok = 1;
+    if (bare_direct) {
+        if (!gam4980_9288_bare_direct_sdk_end())
+            read_ok = 0;
+    } else if (bare_suspended &&
+               !gam4980_9288_bare_resume_after_sdk()) {
+        read_ok = 0;
+    }
+    return read_ok;
+}
+
+static int copy_path(char *destination, const char *source, u32 capacity);
+
+static int make_native_game_path(const char *game_path)
+{
+    u32 index = 0u;
+    char *extension = 0;
+
+    if (!copy_path(
+            g_native_game_path, game_path, sizeof(g_native_game_path)
+        ))
+        return 0;
+    while (g_native_game_path[index]) {
+        if (g_native_game_path[index] == '\\' ||
+            g_native_game_path[index] == '/')
+            extension = 0;
+        else if (g_native_game_path[index] == '.')
+            extension = g_native_game_path + index;
+        ++index;
+    }
+    if (!extension || extension + 4 != g_native_game_path + index)
+        return 0;
+    extension[1] = 'G';
+    extension[2] = 'N';
+    extension[3] = 'A';
     return 1;
+}
+
+static u32 open_native_module_path(const char *path, int game_specific)
+{
+    long size;
+
+    g_native_module_file = fs_fopen(path, FS_O_RDONLY);
+    if (!g_native_module_file)
+        return 0u;
+    g_native_module_game_specific = game_specific;
+    if (fs_fseek(g_native_module_file, 0, SEEK_END) < 0) {
+        fs_fclose(g_native_module_file);
+        g_native_module_file = 0;
+        return 0u;
+    }
+    size = fs_ftell(g_native_module_file);
+    if (size <= 0 || (unsigned long)size > 0xfffffffful ||
+        fs_fseek(g_native_module_file, 0, SEEK_SET) < 0) {
+        fs_fclose(g_native_module_file);
+        g_native_module_file = 0;
+        return 0u;
+    }
+    return (u32)size;
+}
+
+static u32 open_native_module(void)
+{
+    u32 size = 0u;
+
+    g_native_module_game_specific = 0;
+    if (make_native_game_path(g_game_path))
+        size = open_native_module_path(g_native_game_path, 1);
+    /* Some 9288 FAT images expose a GBK long GAM filename even when the
+     * installed short-name entry is GAME.GAM.  Accept the matching portable
+     * sidecar alias before falling back to firmware-only native code; the
+     * package's full game hash still prevents binding it to another GAM. */
+    if (!size)
+        size = open_native_module_path(k_native_game_fallback_path, 1);
+    if (!size)
+        size = open_native_module_path(k_native_module_path, 0);
+    return size;
 }
 
 static int verify_rom_files(void)
@@ -1235,6 +1472,237 @@ static void performance_log_u32(
     *out++ = '\n';
     (void)fs_fwrite(line, 1, (size_t)(out - line), file);
 }
+
+static void performance_log_rom_miss_trace(FS_FILE *file)
+{
+    u32 index;
+
+    performance_log_u32(
+        file, "rom_cache_miss_trace_count", gam4980_rom_miss_trace_count()
+    );
+    performance_log_u32(
+        file, "rom_cache_miss_trace_dropped",
+        gam4980_rom_miss_trace_dropped()
+    );
+    for (index = 0u; index < gam4980_rom_miss_trace_count(); ++index) {
+        char line[88];
+        char *out = append_text(line, "rom_cache_miss id=");
+
+        out = append_u32_decimal(out, index);
+        out = append_text(out, " kind=");
+        out = append_u32_decimal(out, gam4980_rom_miss_trace_kind(index));
+        out = append_text(out, " slot=");
+        out = append_u32_decimal(out, gam4980_rom_miss_trace_slot(index));
+        out = append_text(out, " region=");
+        out = append_u32_decimal(out, gam4980_rom_miss_trace_region(index));
+        out = append_text(out, " page=");
+        out = append_u32_hex(
+            out, gam4980_rom_miss_trace_page(index), 3
+        );
+        *out++ = '\r';
+        *out++ = '\n';
+        (void)fs_fwrite(line, 1, (size_t)(out - line), file);
+    }
+}
+
+static void performance_log_native_module_transitions(FS_FILE *file)
+{
+    u32 rank;
+    u32 count = gam4980_native_module_transition_count();
+
+    performance_log_u32(file, "native_module_transition_count", count);
+    for (rank = 0u; rank < count; ++rank) {
+        char line[128];
+        char *out = append_text(line, "native_module_transition rank=");
+
+        out = append_u32_decimal(out, rank);
+        out = append_text(out, " from=");
+        out = append_u32_hex(
+            out, gam4980_native_module_transition_from(rank), 8
+        );
+        out = append_text(out, " to=");
+        out = append_u32_hex(
+            out, gam4980_native_module_transition_to(rank), 8
+        );
+        out = append_text(out, " hits=");
+        out = append_u32_decimal(
+            out, gam4980_native_module_transition_hits(rank)
+        );
+        out = append_text(out, " error=");
+        out = append_u32_decimal(
+            out, gam4980_native_module_transition_error(rank)
+        );
+        *out++ = '\r';
+        *out++ = '\n';
+        (void)fs_fwrite(line, 1, (size_t)(out - line), file);
+    }
+}
+
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+static void performance_log_iram_exit_diagnostics(FS_FILE *file)
+{
+    static const char *const burst_keys[GAM4980_IRAM_BURST_BUCKET_COUNT] = {
+        "iram_burst_0", "iram_burst_1_4", "iram_burst_5_16",
+        "iram_burst_17_64", "iram_burst_65_256", "iram_burst_gt_256"
+    };
+    static const char *const dispatch_keys[
+        GAM4980_IRAM_DISPATCH_TARGET_COUNT
+    ] = {
+        "iram_dispatch_unknown_hits",
+        "iram_dispatch_firmware_aot_hits",
+        "iram_dispatch_firmware_hle_hits",
+        "iram_dispatch_game_hle_hits",
+        "iram_dispatch_game_aot_hits"
+    };
+    static const char *const slow_class_keys[
+        GAM4980_IRAM_SLOW_PATH_CLASS_COUNT
+    ] = {
+        "iram_slow_unsupported_opcode",
+        "iram_slow_fetch_page",
+        "iram_slow_decimal_mode",
+        "iram_slow_zero_page_special",
+        "iram_slow_page_read",
+        "iram_slow_page_write",
+        "iram_slow_indirect_read",
+        "iram_slow_indirect_write",
+        "iram_slow_other"
+    };
+    u32 index;
+
+    performance_log_u32(
+        file, "iram_exit_sample_rate", gam4980_iram_exit_sample_rate()
+    );
+    performance_log_u32(
+        file, "iram_exit_samples", gam4980_iram_exit_samples()
+    );
+    for (index = 0u; index < GAM4980_IRAM_BURST_BUCKET_COUNT; ++index)
+        performance_log_u32(
+            file, burst_keys[index], gam4980_iram_burst_bucket_hits(index)
+        );
+    for (index = 0u; index < GAM4980_IRAM_DISPATCH_TARGET_COUNT; ++index)
+        performance_log_u32(
+            file, dispatch_keys[index],
+            gam4980_iram_dispatch_target_hits(index)
+        );
+    for (index = 0u; index < GAM4980_IRAM_SLOW_PATH_CLASS_COUNT; ++index)
+        performance_log_u32(
+            file, slow_class_keys[index],
+            gam4980_iram_slow_path_class_hits(index)
+        );
+
+    {
+        u32 reason;
+
+        for (reason = 0u;
+             reason < GAM4980_IRAM_EXIT_HOTSPOT_REASON_COUNT; ++reason) {
+            u32 emitted = 0u;
+            u32 rank;
+
+            for (rank = 0u;
+                 rank < GAM4980_IRAM_EXIT_HOTSPOT_CAPACITY; ++rank) {
+                u32 best = GAM4980_IRAM_EXIT_HOTSPOT_CAPACITY;
+                u32 best_hits = 0u;
+
+                for (index = 0u;
+                     index < GAM4980_IRAM_EXIT_HOTSPOT_CAPACITY; ++index) {
+                    u32 hits;
+
+                    if (emitted & ((u32)1u << index))
+                        continue;
+                    hits = gam4980_iram_exit_hotspot_hits(reason, index);
+                    if (hits > best_hits) {
+                        best_hits = hits;
+                        best = index;
+                    }
+                }
+                if (!best_hits)
+                    break;
+                emitted |= (u32)1u << best;
+                {
+                    char line[144];
+                    char *out = append_text(line, "iram_exit_hot reason=");
+
+                    out = append_u32_decimal(out, reason);
+                    out = append_text(out, " rank=");
+                    out = append_u32_decimal(out, rank);
+                    out = append_text(out, " vpc=");
+                    out = append_u32_hex(
+                        out,
+                        gam4980_iram_exit_hotspot_virtual_pc(reason, best),
+                        4
+                    );
+                    out = append_text(out, " ppc=");
+                    out = append_u32_hex(
+                        out,
+                        gam4980_iram_exit_hotspot_physical_pc(reason, best),
+                        6
+                    );
+                    out = append_text(out, " bank=");
+                    out = append_u32_hex(
+                        out, gam4980_iram_exit_hotspot_bank(reason, best), 4
+                    );
+                    out = append_text(out, " opcode=");
+                    out = append_u32_hex(
+                        out, gam4980_iram_exit_hotspot_opcode(reason, best), 2
+                    );
+                    out = append_text(out, " hits=");
+                    out = append_u32_decimal(out, best_hits);
+                    out = append_text(out, " error=");
+                    out = append_u32_decimal(
+                        out,
+                        gam4980_iram_exit_hotspot_error(reason, best)
+                    );
+                    *out++ = '\r';
+                    *out++ = '\n';
+                    (void)fs_fwrite(
+                        line, 1, (size_t)(out - line), file
+                    );
+                }
+            }
+        }
+    }
+
+    {
+        u32 emitted[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        u32 rank;
+
+        for (rank = 0u; rank < 16u; ++rank) {
+            u32 best_opcode = 256u;
+            u32 best_hits = 0u;
+
+            for (index = 0u; index < 256u; ++index) {
+                u32 hits;
+
+                if (emitted[index >> 5] &
+                    ((u32)1u << (index & 31u)))
+                    continue;
+                hits = gam4980_iram_slow_opcode_hits(index);
+                if (hits > best_hits) {
+                    best_hits = hits;
+                    best_opcode = index;
+                }
+            }
+            if (!best_hits)
+                break;
+            emitted[best_opcode >> 5] |=
+                (u32)1u << (best_opcode & 31u);
+            {
+                char line[80];
+                char *out = append_text(line, "iram_slow_opcode rank=");
+
+                out = append_u32_decimal(out, rank);
+                out = append_text(out, " opcode=");
+                out = append_u32_hex(out, best_opcode, 2);
+                out = append_text(out, " hits=");
+                out = append_u32_decimal(out, best_hits);
+                *out++ = '\r';
+                *out++ = '\n';
+                (void)fs_fwrite(line, 1, (size_t)(out - line), file);
+            }
+        }
+    }
+}
+#endif
 
 /* The 9288 build is freestanding and intentionally does not link a 64-bit
  * division runtime.  Performance logging only needs a saturated 32-bit
@@ -1535,6 +2003,14 @@ static void performance_log_aot_blocks(FS_FILE *file)
         gam4980_game_aot_direct_link_hits()
     );
     performance_log_u32(
+        file, "game_aot_linear_links",
+        gam4980_game_aot_linear_link_count()
+    );
+    performance_log_u32(
+        file, "game_aot_linear_link_hits",
+        gam4980_game_aot_linear_link_hits()
+    );
+    performance_log_u32(
         file, "game_aot_code_size", gam4980_game_aot_code_size()
     );
     performance_log_u32(
@@ -1690,6 +2166,425 @@ static void write_performance_log(void)
         file, "expected_guest_hz", g_setting_double_speed ? 120u : 60u
     );
     performance_log_u32(file, "debug", 1u);
+#ifdef GAM4980_ENABLE_IRAM_HOT_CORE
+    performance_log_u32(file, "iram_hot_core_enabled", 1u);
+    performance_log_u32(
+        file, "iram_hot_core_size", (u32)gam4980_9288_iram_size()
+    );
+    performance_log_u32(
+        file, "iram_hot_core_restored",
+        gam4980_9288_iram_status() == GAM4980_IRAM_STATUS_RESTORED
+    );
+    performance_log_u32(
+        file, "iram_hot_core_status", (u32)gam4980_9288_iram_status()
+    );
+    performance_log_u32(
+        file, "iram_hot_core_calls", (u32)gam4980_9288_iram_calls()
+    );
+    performance_log_u32(
+        file, "iram_hot_core_bytes_installed",
+        (u32)gam4980_9288_iram_bytes_installed()
+    );
+#else
+    performance_log_u32(file, "iram_hot_core_enabled", 0u);
+    performance_log_u32(file, "iram_hot_core_size", 0u);
+    performance_log_u32(file, "iram_hot_core_restored", 0u);
+    performance_log_u32(file, "iram_hot_core_status", 0u);
+    performance_log_u32(file, "iram_hot_core_calls", 0u);
+    performance_log_u32(file, "iram_hot_core_bytes_installed", 0u);
+#endif
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+#ifdef GAM4980_FORCE_EXTERNAL_EXEC
+    performance_log_u32(file, "iram_exec_engine_enabled", 0u);
+#else
+    performance_log_u32(file, "iram_exec_engine_enabled", 1u);
+#endif
+#ifdef GAM4980_IRAM_EXEC_ASM
+    performance_log_u32(file, "iram_exec_engine_asm", 1u);
+    performance_log_u32(file, "iram_exec_hot_opcode_count", 77u);
+#else
+    performance_log_u32(file, "iram_exec_engine_asm", 0u);
+    performance_log_u32(file, "iram_exec_hot_opcode_count", 0u);
+#endif
+    performance_log_u32(
+        file, "iram_exec_calls", gam4980_iram_exec_calls()
+    );
+    performance_log_u32(
+        file, "iram_exec_instructions", gam4980_iram_exec_instructions()
+    );
+    performance_log_u32(
+        file, "iram_exec_guest_cycles", gam4980_iram_exec_cycles()
+    );
+    performance_log_u32(
+        file, "iram_exec_zero_fallbacks",
+        gam4980_iram_exec_zero_fallbacks()
+    );
+    performance_log_u32(
+        file, "iram_exec_control_exits",
+        gam4980_iram_exec_control_exits()
+    );
+    performance_log_u32(
+        file, "iram_exec_deadline_exits",
+        gam4980_iram_exec_deadline_exits()
+    );
+    performance_log_u32(
+        file, "iram_exec_dispatch_exits",
+        gam4980_iram_exec_dispatch_exits()
+    );
+    performance_log_u32(
+        file, "iram_exec_slow_exits",
+        gam4980_iram_exec_slow_exits()
+    );
+    performance_log_u32(
+        file, "iram_exec_max_instructions",
+        gam4980_iram_exec_max_instructions()
+    );
+    performance_log_u32(
+        file, "iram_fastchain_calls", gam4980_iram_fastchain_calls()
+    );
+    performance_log_u32(
+        file, "iram_fastchain_guest_cycles",
+        gam4980_iram_fastchain_cycles()
+    );
+    performance_log_u32(
+        file, "iram_fastchain_reentries",
+        gam4980_iram_fastchain_reentries()
+    );
+    performance_log_u32(
+        file, "iram_fastchain_zero_returns",
+        gam4980_iram_fastchain_zero_returns()
+    );
+    performance_log_u32(
+        file, "iram_fastchain_reinstall_failures",
+        gam4980_iram_fastchain_reinstall_failures()
+    );
+    performance_log_u32(
+        file, "iram_fastchain_non_dispatch_skips",
+        gam4980_iram_fastchain_non_dispatch_skips()
+    );
+    performance_log_u32(
+        file, "native_shared_validation",
+        gam4980_native_shared_validation()
+    );
+    performance_log_u32(
+        file, "native_shared_calls", gam4980_native_shared_calls()
+    );
+    performance_log_u32(
+        file, "native_shared_blocks", gam4980_native_shared_blocks()
+    );
+    performance_log_u32(
+        file, "native_shared_guest_cycles",
+        gam4980_native_shared_guest_cycles()
+    );
+    performance_log_u32(
+        file, "native_shared_7c30_entries",
+        gam4980_native_shared_7c30_entries()
+    );
+    performance_log_u32(
+        file, "native_shared_misses", gam4980_native_shared_misses()
+    );
+    performance_log_u32(
+        file, "native_shared_chain_links",
+        gam4980_native_shared_chain_links()
+    );
+    performance_log_u32(
+        file, "native_shared_max_chain",
+        gam4980_native_shared_max_chain()
+    );
+    performance_log_u32(
+        file, "native_shared_direct_links",
+        gam4980_native_shared_direct_links()
+    );
+    performance_log_u32(
+        file, "native_module_status", gam4980_native_module_status()
+    );
+    performance_log_u32(
+        file, "native_module_count", gam4980_native_module_count()
+    );
+    performance_log_u32(
+        file, "native_module_format", gam4980_native_module_format()
+    );
+    performance_log_u32(
+        file, "native_module_game_bound",
+        gam4980_native_module_game_bound()
+    );
+    performance_log_u32(
+        file, "native_module_game_blocks",
+        gam4980_native_module_game_blocks()
+    );
+    performance_log_u32(
+        file, "native_module_game_bytes",
+        gam4980_native_module_game_bytes()
+    );
+    performance_log_u32(
+        file, "native_module_match_count",
+        gam4980_native_module_match_count()
+    );
+    performance_log_u32(
+        file, "native_module_package_size",
+        gam4980_native_module_package_size()
+    );
+    performance_log_u32(
+        file, "native_module_preloaded", gam4980_native_module_preloaded()
+    );
+    performance_log_u32(
+        file, "native_module_loads", gam4980_native_module_loads()
+    );
+    performance_log_u32(
+        file, "native_module_evictions", gam4980_native_module_evictions()
+    );
+    performance_log_u32(
+        file, "native_module_bytes_loaded",
+        gam4980_native_module_bytes_loaded()
+    );
+    performance_log_u32(
+        file, "native_module_fallbacks", gam4980_native_module_fallbacks()
+    );
+    performance_log_u32(
+        file, "native_module_fault_attempts",
+        gam4980_native_module_fault_attempts()
+    );
+    performance_log_u32(
+        file, "native_module_fault_deferred",
+        gam4980_native_module_fault_deferred()
+    );
+    performance_log_u32(
+        file, "native_module_cooldown_deferred",
+        gam4980_native_module_cooldown_deferred()
+    );
+    performance_log_u32(
+        file, "native_module_thrash_suppressions",
+        gam4980_native_module_thrash_suppressions()
+    );
+    performance_log_u32(
+        file, "native_module_batches", gam4980_native_module_batches()
+    );
+    performance_log_native_module_transitions(file);
+    performance_log_u32(
+        file, "native_module_arena_size",
+        gam4980_native_module_arena_size()
+    );
+    performance_log_u32(
+        file, "native_module_slot_size", gam4980_native_module_slot_size()
+    );
+    performance_log_u32(
+        file, "native_module_resident_count",
+        gam4980_native_module_resident_count()
+    );
+    performance_log_u32(
+        file, "native_module_alloc_units_used",
+        gam4980_native_module_alloc_units_used()
+    );
+    performance_log_u32(
+        file, "native_module_alloc_units_total",
+        gam4980_native_module_alloc_units_total()
+    );
+    performance_log_u32(
+        file, "iram_dispatch_firmware_aot_entries",
+        gam4980_iram_dispatch_firmware_aot_entries()
+    );
+    performance_log_u32(
+        file, "iram_dispatch_firmware_hle_entries",
+        gam4980_iram_dispatch_firmware_hle_entries()
+    );
+    performance_log_u32(
+        file, "iram_dispatch_game_hle_entries",
+        gam4980_iram_dispatch_game_hle_entries()
+    );
+    performance_log_u32(
+        file, "iram_dispatch_game_aot_entries",
+        gam4980_iram_dispatch_game_aot_entries()
+    );
+#ifdef GAM4980_IRAM_EXEC_ASM
+    performance_log_u32(
+        file, "iram_shadow_rebuilds", gam4980_iram_shadow_rebuilds()
+    );
+    performance_log_u32(
+        file, "iram_shadow_marker_visits",
+        gam4980_iram_shadow_marker_visits()
+    );
+    performance_log_u32(
+        file, "iram_shadow_super_enabled_end",
+        gam4980_iram_shadow_super_enabled()
+    );
+    performance_log_u32(
+        file, "iram_shadow_adaptive_checks",
+        gam4980_iram_shadow_adaptive_checks()
+    );
+    performance_log_u32(
+        file, "iram_shadow_adaptive_disables",
+        gam4980_iram_shadow_adaptive_disables()
+    );
+    performance_log_u32(
+        file, "iram_shadow_disable_reason",
+        gam4980_iram_shadow_disable_reason()
+    );
+    performance_log_u32(
+        file, "iram_super_load_oper1_imm16_match_builds",
+        gam4980_iram_super_match_builds(
+            GAM4980_IRAM_SUPER_LOAD_OPER1_IMM16
+        )
+    );
+    performance_log_u32(
+        file, "iram_super_load_oper1_imm16_hits",
+        gam4980_iram_super_hits(GAM4980_IRAM_SUPER_LOAD_OPER1_IMM16)
+    );
+    performance_log_u32(
+        file, "iram_super_load_oper2_imm16_match_builds",
+        gam4980_iram_super_match_builds(
+            GAM4980_IRAM_SUPER_LOAD_OPER2_IMM16
+        )
+    );
+    performance_log_u32(
+        file, "iram_super_load_oper2_imm16_hits",
+        gam4980_iram_super_hits(GAM4980_IRAM_SUPER_LOAD_OPER2_IMM16)
+    );
+    performance_log_u32(
+        file, "iram_super_stack_add16_match_builds",
+        gam4980_iram_super_match_builds(GAM4980_IRAM_SUPER_STACK_ADD16)
+    );
+    performance_log_u32(
+        file, "iram_super_stack_add16_hits",
+        gam4980_iram_super_hits(GAM4980_IRAM_SUPER_STACK_ADD16)
+    );
+    performance_log_u32(
+        file, "iram_super_stack_sub16_match_builds",
+        gam4980_iram_super_match_builds(GAM4980_IRAM_SUPER_STACK_SUB16)
+    );
+    performance_log_u32(
+        file, "iram_super_stack_sub16_hits",
+        gam4980_iram_super_hits(GAM4980_IRAM_SUPER_STACK_SUB16)
+    );
+    performance_log_u32(
+        file, "iram_super_add16_oper1_oper2_match_builds",
+        gam4980_iram_super_match_builds(
+            GAM4980_IRAM_SUPER_ADD16_OPER1_OPER2
+        )
+    );
+    performance_log_u32(
+        file, "iram_super_add16_oper1_oper2_hits",
+        gam4980_iram_super_hits(
+            GAM4980_IRAM_SUPER_ADD16_OPER1_OPER2
+        )
+    );
+#endif
+    performance_log_iram_exit_diagnostics(file);
+#else
+    performance_log_u32(file, "iram_exec_engine_enabled", 0u);
+    performance_log_u32(file, "iram_exec_engine_asm", 0u);
+    performance_log_u32(file, "iram_exec_hot_opcode_count", 0u);
+#endif
+#ifdef GAM4980_ENABLE_BARE_SESSION
+    performance_log_u32(file, "bare_session_enabled", 1u);
+    performance_log_u32(
+        file, "bare_rom_cache_ready", (u32)g_bare_rom_cache_ready
+    );
+    performance_log_u32(
+        file, "rom_cache_lines", gam4980_rom_cache_lines()
+    );
+    performance_log_u32(
+        file, "rom_cache_warm_pages", gam4980_rom_cache_warm_pages()
+    );
+    performance_log_u32(
+        file, "rom_cache_runtime_misses",
+        gam4980_rom_cache_runtime_misses()
+    );
+#else
+    performance_log_u32(file, "bare_session_enabled", 0u);
+    performance_log_u32(file, "bare_rom_cache_ready", 0u);
+    performance_log_u32(file, "rom_cache_lines", 0u);
+    performance_log_u32(file, "rom_cache_warm_pages", 0u);
+    performance_log_u32(file, "rom_cache_runtime_misses", 0u);
+#endif
+    performance_log_rom_miss_trace(file);
+    performance_log_u32(
+        file, "bare_session_started", g_performance.bare_session_started
+    );
+    performance_log_u32(
+        file, "bare_status", (u32)gam4980_9288_bare_status()
+    );
+    performance_log_u32(
+        file, "bare_clock_ticks", g_performance.bare_clock_ticks
+    );
+    performance_log_u32(
+        file, "bare_clock_max_step", g_performance.bare_clock_max_step
+    );
+    performance_log_u32(
+        file, "bare_loop_iterations", g_performance.bare_loop_iterations
+    );
+    performance_log_u32(
+        file, "bare_key_scans", g_performance.bare_key_scans
+    );
+    performance_log_u32(
+        file, "bare_key_poll_callbacks",
+        g_performance.bare_key_poll_callbacks
+    );
+    performance_log_u32(
+        file, "bare_key_scan_max_gap_ticks",
+        g_performance.bare_key_scan_max_gap
+    );
+    performance_log_u32(
+        file, "bare_key_scan_gap_over_4",
+        g_performance.bare_key_scan_gap_over_4
+    );
+    performance_log_u32(
+        file, "bare_key_scan_gap_over_8",
+        g_performance.bare_key_scan_gap_over_8
+    );
+    performance_log_u32(file, "bare_host_tick_hz", BARE_CLOCK_HZ);
+    performance_log_u32(
+        file, "bare_core_ticks", g_performance.bare_core_ticks
+    );
+    performance_log_u32(
+        file, "bare_core_max_ticks", g_performance.bare_core_max_ticks
+    );
+    performance_log_u32(
+        file, "bare_render_ticks", g_performance.bare_render_ticks
+    );
+    performance_log_u32(
+        file, "bare_render_max_ticks", g_performance.bare_render_max_ticks
+    );
+    performance_log_u32(
+        file, "bare_present_ticks", g_performance.bare_present_ticks
+    );
+    performance_log_u32(
+        file, "bare_present_max_ticks",
+        g_performance.bare_present_max_ticks
+    );
+    performance_log_u32(
+        file, "bare_direct_fs_calls",
+        gam4980_9288_bare_direct_sdk_calls()
+    );
+    performance_log_u32(
+        file, "bare_direct_fs_failures",
+        gam4980_9288_bare_direct_sdk_failures()
+    );
+    performance_log_u32(
+        file, "bare_direct_fs_ticks", g_performance.bare_direct_fs_ticks
+    );
+    performance_log_u32(
+        file, "bare_direct_fs_iram_repairs",
+        (u32)gam4980_9288_iram_session_repairs()
+    );
+    performance_log_u32(
+        file, "bare_exit_reason", g_performance.bare_exit_reason
+    );
+    performance_log_u32(
+        file, "bare_restore_ok", g_performance.bare_restore_ok
+    );
+    performance_log_u32(
+        file, "bare_entries", gam4980_9288_bare_entries()
+    );
+    performance_log_u32(
+        file, "bare_restores", gam4980_9288_bare_restores()
+    );
+    performance_log_u32(
+        file, "bare_rom_suspends", gam4980_9288_bare_rom_suspends()
+    );
+    performance_log_u32(
+        file, "bare_new_irq_factors",
+        gam4980_9288_bare_new_irq_factors()
+    );
 #ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
     performance_log_u32(file, "lightweight_benchmark", 1u);
 #endif
@@ -1795,6 +2690,40 @@ static void write_performance_log(void)
         file, "rtc_elapsed_valid", g_performance.rtc_elapsed_valid
     );
     performance_log_wall_throughput(file);
+#ifdef GAM4980_ENABLE_AOT
+    performance_log_u32(
+        file, "firmware_aot_token_link_hits",
+        gam4980_aot_token_link_hits()
+    );
+    performance_log_u32(
+        file, "native_trace_aot_enabled",
+        (u32)gam4980_native_trace_aot_enabled()
+    );
+    performance_log_u32(
+        file, "native_trace_7c30_validation",
+        gam4980_native_trace_7c30_validation()
+    );
+    performance_log_u32(
+        file, "native_trace_7c30_calls",
+        gam4980_native_trace_7c30_calls()
+    );
+    performance_log_u32(
+        file, "native_trace_7c30_iterations",
+        gam4980_native_trace_7c30_iterations()
+    );
+    performance_log_u32(
+        file, "native_trace_7c30_guest_cycles",
+        gam4980_native_trace_7c30_guest_cycles()
+    );
+    performance_log_u32(
+        file, "native_trace_7c30_slice_exits",
+        gam4980_native_trace_7c30_slice_exits()
+    );
+    performance_log_u32(
+        file, "native_trace_7c30_terminal_exits",
+        gam4980_native_trace_7c30_terminal_exits()
+    );
+#endif
 #ifdef GAM4980_LIGHTWEIGHT_PERFORMANCE_LOG
     performance_log_u32(
         file, "timer_messages_received",
@@ -1879,6 +2808,14 @@ static void write_performance_log(void)
     performance_log_u32(
         file, "game_aot_direct_link_hits",
         gam4980_game_aot_direct_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_linear_links",
+        gam4980_game_aot_linear_link_count()
+    );
+    performance_log_u32(
+        file, "game_aot_linear_link_hits",
+        gam4980_game_aot_linear_link_hits()
     );
     performance_log_u32(
         file, "game_aot_code_size", gam4980_game_aot_code_size()
@@ -2116,6 +3053,14 @@ static void write_performance_log(void)
     performance_log_u32(
         file, "game_aot_direct_link_hits",
         gam4980_game_aot_direct_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_linear_links",
+        gam4980_game_aot_linear_link_count()
+    );
+    performance_log_u32(
+        file, "game_aot_linear_link_hits",
+        gam4980_game_aot_linear_link_hits()
     );
     performance_log_u32(
         file, "game_aot_code_size", gam4980_game_aot_code_size()
@@ -2524,7 +3469,7 @@ static void render_loading_stage(void)
     out = append_text((char *)progress_text, "LOADING ");
     out = append_u32_decimal(out, g_loading_step);
     *out++ = '/';
-    out = append_u32_decimal(out, 7u);
+    out = append_u32_decimal(out, 8u);
     if (g_loading_total > 1u) {
         out = append_text(out, "  PASS ");
         out = append_u32_decimal(out, g_loading_current);
@@ -2548,6 +3493,92 @@ static void commit_loading_frame_direct(void)
      * this official early-screen path. */
     for (word = 0u; word < SCREEN_FRAME_BYTES / sizeof(u32); ++word)
         video[word] = source[word];
+}
+
+static void capture_desktop_frame_direct(void)
+{
+    const volatile u32 *video =
+        (const volatile u32 *)(unsigned long)0x003c0000u;
+    u32 *destination = (u32 *)(void *)g_desktop_frame;
+    u32 word;
+
+    for (word = 0u; word < SCREEN_FRAME_BYTES / sizeof(u32); ++word)
+        destination[word] = video[word];
+    g_desktop_frame_valid = 1;
+}
+
+static void restore_desktop_frame_direct(void)
+{
+    if (g_desktop_frame_valid)
+        gam4980_9288_bare_submit(
+            g_desktop_frame, sizeof(g_desktop_frame)
+        );
+}
+
+static void remember_launcher_windows(void)
+{
+    T_GUI_HWND window = fnGUI_GetActiveWindow();
+    T_GUI_HWND focus = fnGUI_GetFocus();
+
+    g_launcher_window =
+        window && fnGUI_IsWindow(window) ? window : (T_GUI_HWND)0;
+    g_launcher_focus =
+        focus && fnGUI_IsWindow(focus) ? focus : (T_GUI_HWND)0;
+}
+
+static void rebuild_launcher_page(T_GUI_HWND closed_window)
+{
+    T_GUI_Msg message;
+    T_GUI_HWND launcher = fnGUI_GetActiveWindow();
+    T_GUI_HWND target;
+    u32 round;
+
+    /* Direct LCD writes do not invalidate the launcher's saved page.  Obtain
+     * a live handle only after our own filtered Quit and cleanup are complete,
+     * then let its close-time repaint settle before restoring the snapshot. */
+    if (!launcher || launcher == closed_window ||
+        !fnGUI_IsWindow(launcher)) {
+        launcher = g_launcher_window;
+    }
+    if (!launcher || launcher == closed_window ||
+        !fnGUI_IsWindow(launcher))
+        return;
+    target = g_launcher_focus;
+    if (!target || target == closed_window || !fnGUI_IsWindow(target))
+        target = launcher;
+
+    (void)fnGUI_SetActiveWindow(launcher);
+    (void)fnGUI_SetFocus(target);
+
+    /* The launcher does not enqueue MSG_PAINT when another application has
+     * changed the physical LCD behind its saved DC.  Invalidating it here is
+     * worse: on V1.5 it schedules a late white-page transfer without exposing
+     * a MSG_PAINT through this window filter.  Instead wait for two ordinary
+     * launcher dispatch boundaries.  They settle close-time GUI work while
+     * preserving the launcher's still-valid page state. */
+    for (round = 0u; round < 2u; ++round) {
+        u32 pending_limit = 32u;
+
+        if (!fnGUI_GetMessage(&message, launcher))
+            return;
+        fnGUI_TranslateMessage(&message);
+        fnGUI_DispatchMessage(&message);
+
+        /* Drain only messages already pending for this launcher.  Never use a
+         * global GetMessage here: that can consume the firmware loader's Quit
+         * or another application's message. */
+        while (pending_limit-- != 0u &&
+               fnGUI_HavePendingMessage(launcher)) {
+            if (!fnGUI_GetMessage(&message, launcher))
+                return;
+            fnGUI_TranslateMessage(&message);
+            fnGUI_DispatchMessage(&message);
+        }
+
+        if (!gam4980_9288_bare_wait_video_idle(262144u))
+            return;
+        restore_desktop_frame_direct();
+    }
 }
 
 static void draw_loading_stage(
@@ -2705,7 +3736,13 @@ static void submit_screen_frame(void)
 static void clear_screen(void)
 {
     memset(g_screen_frame, 0xff, sizeof(g_screen_frame));
+    /* Update both display paths before guest execution starts.  SysBltFrame
+     * keeps the window/DC copy coherent for the GUI-timer fallback, while the
+     * direct framebuffer copy is immediately visible when the bare session
+     * suppresses firmware paints.  Both copies contain the same white frame,
+     * so a late HSDMA completion cannot bring the Loading text back. */
     submit_screen_frame();
+    commit_loading_frame_direct();
 }
 
 static void init_screen_expansion(void)
@@ -2736,7 +3773,7 @@ static void init_screen_expansion(void)
     }
 }
 
-static void present_2x(const u8 *packed)
+static void expand_2x(const u8 *packed)
 {
     int source_y;
 
@@ -2773,7 +3810,20 @@ static void present_2x(const u8 *packed)
             incoming_white = (value & 1u) == 0u;
         }
     }
+}
+
+static void present_2x(const u8 *packed)
+{
+    expand_2x(packed);
     submit_screen_frame();
+}
+
+static void present_2x_bare(const u8 *packed)
+{
+    expand_2x(packed);
+    gam4980_9288_bare_submit(g_screen_frame, sizeof(g_screen_frame));
+    if (g_setting_performance_debug)
+        ++g_performance.screen_submissions;
 }
 
 static u8 map_scancode(T_UHWORD scancode)
@@ -2847,6 +3897,329 @@ static u8 map_scancode(T_UHWORD scancode)
     default: return 0xffu;
     }
 }
+
+#ifdef GAM4980_ENABLE_BARE_SESSION
+/* V1.5's 64-byte matrix table at firmware 0x021994dc, translated directly
+ * to the GAM4980 key values.  Each row has seven real columns; the firmware's
+ * unused one-based column zero is not represented here. */
+static const u8 k_bare_key_map[8][7] = {
+    {GAM4980_KEY_0, GAM4980_KEY_Q, GAM4980_KEY_A, GAM4980_KEY_Z,
+     GAM4980_KEY_O, GAM4980_KEY_POWER, GAM4980_KEY_EXIT},
+    {GAM4980_KEY_1, GAM4980_KEY_W, GAM4980_KEY_S, GAM4980_KEY_X,
+     GAM4980_KEY_P, GAM4980_KEY_SPEAK, GAM4980_KEY_ENTER},
+    {GAM4980_KEY_2, GAM4980_KEY_E, GAM4980_KEY_D, GAM4980_KEY_C,
+     GAM4980_KEY_L, GAM4980_KEY_MENU, GAM4980_KEY_PAGE_UP},
+    {GAM4980_KEY_3, GAM4980_KEY_R, GAM4980_KEY_F, GAM4980_KEY_V,
+     GAM4980_KEY_8, GAM4980_KEY_INPUT, GAM4980_KEY_PAGE_DOWN},
+    {GAM4980_KEY_4, GAM4980_KEY_T, GAM4980_KEY_G, GAM4980_KEY_B,
+     GAM4980_KEY_9, GAM4980_KEY_HELP, GAM4980_KEY_SHIFT},
+    {GAM4980_KEY_5, GAM4980_KEY_Y, GAM4980_KEY_H, GAM4980_KEY_N,
+     0xffu, GAM4980_KEY_DELETE, GAM4980_KEY_EXIT},
+    {GAM4980_KEY_6, GAM4980_KEY_U, GAM4980_KEY_J, GAM4980_KEY_M,
+     0xffu, GAM4980_KEY_SPACE, 0xffu},
+    {GAM4980_KEY_7, GAM4980_KEY_I, GAM4980_KEY_K, GAM4980_KEY_UP,
+     GAM4980_KEY_DOWN, GAM4980_KEY_LEFT, GAM4980_KEY_RIGHT}
+};
+
+enum {
+    BARE_EXIT_NONE = 0,
+    BARE_EXIT_GUEST_SHUTDOWN = 1,
+    BARE_EXIT_KEY_HOLD = 2,
+    BARE_EXIT_ROM_GATEWAY = 3,
+    BARE_EXIT_IRAM_NESTED_READ = 4,
+    BARE_EXIT_RESTORE_FAILED = 5
+};
+
+static int process_bare_keys(
+    const T_GAM4980_9288_BareKeys *keys,
+    T_GAM4980_9288_BareKeys *previous,
+    u32 *down_tick, u32 *repeat_tick, u32 now
+)
+{
+    u32 row;
+
+    for (row = 0u; row < 8u; ++row) {
+        u32 column;
+
+        for (column = 0u; column < 7u; ++column) {
+            u32 index = row * 7u + column;
+            u8 mask = (u8)(1u << column);
+            int down = (keys->row[row] & mask) != 0u;
+            int was_down = (previous->row[row] & mask) != 0u;
+            u8 key = k_bare_key_map[row][column];
+
+            if (down && !was_down) {
+                down_tick[index] = now;
+                repeat_tick[index] = now;
+                if (key != 0xffu && key != GAM4980_KEY_EXIT)
+                    gam4980_key_down(key);
+            } else if (down && was_down && key == GAM4980_KEY_EXIT) {
+                if ((u32)(now - down_tick[index]) >=
+                    BARE_EXIT_HOLD_TICKS)
+                    return 1;
+            } else if (down && was_down && key != 0xffu &&
+                       (u32)(now - down_tick[index]) >=
+                           BARE_KEY_REPEAT_DELAY_TICKS &&
+                       (u32)(now - repeat_tick[index]) >=
+                           BARE_KEY_REPEAT_INTERVAL_TICKS) {
+                repeat_tick[index] = now;
+                gam4980_key_down(key);
+            } else if (!down && was_down && key == GAM4980_KEY_EXIT &&
+                       (u32)(now - down_tick[index]) <
+                           BARE_EXIT_HOLD_TICKS) {
+                gam4980_key_down(GAM4980_KEY_EXIT);
+            }
+        }
+        previous->row[row] = keys->row[row];
+    }
+    return 0;
+}
+
+typedef struct T_BareInputPollState {
+    T_GAM4980_9288_BareKeys keys;
+    T_GAM4980_9288_BareKeys previous;
+    u32 down_tick[56];
+    u32 repeat_tick[56];
+    u32 last_scan_clock;
+} T_BareInputPollState;
+
+/* System keyboard IRQs are intentionally masked during a bare session.  Poll
+ * from inside the guest CPU scheduler as well as from the outer frame loop;
+ * otherwise one slow four-frame batch only samples the matrix a few times a
+ * second and can miss a complete press/release pair. */
+static void poll_bare_input(void *context)
+{
+    T_BareInputPollState *state = (T_BareInputPollState *)context;
+    u32 now;
+    u32 gap;
+
+    if (!state || !gam4980_9288_bare_active())
+        return;
+    ++g_performance.bare_key_poll_callbacks;
+    now = gam4980_9288_bare_clock();
+    if (now == state->last_scan_clock)
+        return;
+    gap = now - state->last_scan_clock;
+    if (gap > g_performance.bare_key_scan_max_gap)
+        g_performance.bare_key_scan_max_gap = gap;
+    if (gap > 4u)
+        ++g_performance.bare_key_scan_gap_over_4;
+    if (gap > 8u)
+        ++g_performance.bare_key_scan_gap_over_8;
+    state->last_scan_clock = now;
+    gam4980_9288_bare_scan_keys(&state->keys);
+    ++g_performance.bare_key_scans;
+    if (process_bare_keys(
+            &state->keys, &state->previous, state->down_tick,
+            state->repeat_tick, now)) {
+        g_performance.bare_exit_reason = BARE_EXIT_KEY_HOLD;
+        g_close_requested = 1;
+    }
+}
+
+static void wait_for_bare_keys_released(void)
+{
+    T_GAM4980_9288_BareKeys keys;
+    u32 start = gam4980_9288_bare_clock();
+
+    for (;;) {
+        u32 row;
+        int any_down = 0;
+
+        gam4980_9288_bare_scan_keys(&keys);
+        for (row = 0u; row < 8u; ++row)
+            any_down |= keys.row[row] != 0u;
+        if (!any_down ||
+            (u32)(gam4980_9288_bare_clock() - start) >=
+                BARE_KEY_RELEASE_TIMEOUT_TICKS)
+            return;
+    }
+}
+
+static int run_bare_emulator_window(void)
+{
+    T_GUI_HWND window;
+    T_BareInputPollState input;
+    u32 start_clock;
+    u32 last_clock;
+    u32 last_scan_clock;
+    u32 phase = 0u;
+    u32 last_rom_suspends;
+    u32 enter_attempt;
+    int entered = 0;
+    int completed = 0;
+
+    if (!g_main_window)
+        return 0;
+    window = g_main_window;
+    init_screen_expansion();
+    g_close_requested = 0;
+
+    /* App_Main has already replaced STARTING GAME with a coherent white frame
+     * in both the SDK surface and physical LCD.  Do not submit an
+     * uninitialised guest LCD here; the first actual guest update replaces the
+     * white transition frame.  A few complete prepare/enter retries safely
+     * close the small quiescence race without changing the display. */
+    for (enter_attempt = 0u; enter_attempt < 3u; ++enter_attempt) {
+        if (!gam4980_9288_bare_prepare())
+            break;
+        if (gam4980_9288_bare_enter()) {
+            entered = 1;
+            break;
+        }
+        if (gam4980_9288_bare_status() !=
+            GAM4980_BARE_STATUS_BACKGROUND_BUSY)
+            break;
+    }
+    if (!entered)
+        return 0;
+    performance_begin_session();
+#if defined(GAM4980_ENABLE_IRAM_EXEC_ENGINE) && \
+    !defined(GAM4980_FORCE_EXTERNAL_EXEC)
+    gam4980_set_iram_exec_enabled(1);
+#endif
+    g_performance.bare_session_started = 1u;
+    memset(&input, 0, sizeof(input));
+    gam4980_9288_bare_scan_keys(&input.previous);
+    start_clock = gam4980_9288_bare_clock();
+    last_clock = start_clock;
+    last_scan_clock = start_clock;
+    input.last_scan_clock = start_clock;
+    gam4980_set_runtime_poll_callback(
+        poll_bare_input, &input, BARE_INPUT_POLL_GUEST_CYCLES
+    );
+    last_rom_suspends = gam4980_9288_bare_rom_suspends();
+
+    while (!g_close_requested && !gam4980_shutdown_requested()) {
+        u32 now = gam4980_9288_bare_clock();
+        u32 delta = now - last_clock;
+        u32 frames_this_batch;
+        u32 frame;
+        u32 path_start;
+        u32 path_end;
+        u32 path_ticks;
+        int frame_changed;
+
+        ++g_performance.bare_loop_iterations;
+        if (delta > g_performance.bare_clock_max_step)
+            g_performance.bare_clock_max_step = delta;
+        last_clock = now;
+        if (now != last_scan_clock) {
+            poll_bare_input(&input);
+            last_scan_clock = input.last_scan_clock;
+            if (g_close_requested)
+                break;
+        }
+
+        phase += delta * FRAME_RATE_HZ *
+            (g_setting_double_speed ? 2u : 1u);
+        frames_this_batch = phase / BARE_CLOCK_HZ;
+        phase %= BARE_CLOCK_HZ;
+        if (frames_this_batch > BARE_MAX_FRAMES_PER_BATCH)
+            frames_this_batch = BARE_MAX_FRAMES_PER_BATCH;
+        if (!frames_this_batch)
+            continue;
+        if (g_setting_performance_debug) {
+            ++g_performance.timer_batches;
+            g_performance.guest_frames += frames_this_batch;
+        }
+        path_start = gam4980_9288_bare_clock();
+        for (frame = 0u; frame < frames_this_batch; ++frame) {
+            gam4980_step_frame();
+#ifdef GAM4980_MEMORY_DIAGNOSTICS
+            ++g_gam4980_memory_diagnostic.frames;
+#endif
+            if (g_close_requested || gam4980_shutdown_requested() ||
+                !gam4980_9288_bare_active())
+                break;
+        }
+        path_end = gam4980_9288_bare_clock();
+        path_ticks = path_end - path_start;
+        g_performance.bare_core_ticks += path_ticks;
+        if (path_ticks > g_performance.bare_core_max_ticks)
+            g_performance.bare_core_max_ticks = path_ticks;
+        if (!gam4980_9288_bare_active()) {
+            g_performance.bare_exit_reason = BARE_EXIT_ROM_GATEWAY;
+            break;
+        }
+        if (gam4980_9288_bare_status() != GAM4980_BARE_STATUS_ACTIVE) {
+            g_performance.bare_exit_reason =
+                gam4980_9288_bare_status() ==
+                    GAM4980_BARE_STATUS_NESTED_ROM_READ
+                ? BARE_EXIT_IRAM_NESTED_READ
+                : BARE_EXIT_ROM_GATEWAY;
+            break;
+        }
+        if (last_rom_suspends != gam4980_9288_bare_rom_suspends()) {
+            /* Filesystem service time is host work, not guest time.  Restart
+             * the deadline after a cache fill instead of trying to catch up
+             * every frame that elapsed while the SDK was temporarily live. */
+            last_rom_suspends = gam4980_9288_bare_rom_suspends();
+            last_clock = gam4980_9288_bare_clock();
+            last_scan_clock = last_clock;
+            input.last_scan_clock = last_clock;
+        }
+        path_start = path_end;
+        frame_changed = gam4980_render_frame();
+        path_end = gam4980_9288_bare_clock();
+        path_ticks = path_end - path_start;
+        g_performance.bare_render_ticks += path_ticks;
+        if (path_ticks > g_performance.bare_render_max_ticks)
+            g_performance.bare_render_max_ticks = path_ticks;
+        if (frame_changed) {
+            /* The white transition frame remains visible until guest
+             * execution really changes its LCD.  Clearing this flag before
+             * the first physical submit switches subsequent paints and
+             * metrics to the normal gameplay path. */
+            g_loading_active = 0;
+            if (g_setting_performance_debug)
+                ++g_performance.render_updates;
+            path_start = path_end;
+            present_2x_bare(gam4980_packed_frame());
+            path_end = gam4980_9288_bare_clock();
+            path_ticks = path_end - path_start;
+            g_performance.bare_present_ticks += path_ticks;
+            if (path_ticks > g_performance.bare_present_max_ticks)
+                g_performance.bare_present_max_ticks = path_ticks;
+        }
+    }
+    if (gam4980_shutdown_requested())
+        g_performance.bare_exit_reason = BARE_EXIT_GUEST_SHUTDOWN;
+    gam4980_set_runtime_poll_callback(0, 0, 0u);
+    if (gam4980_9288_bare_active()) {
+        /* The guest normally shuts down while the Enter key that selected
+         * its Exit menu item is still physically held.  The verified bare
+         * probe waits for release before restoring keyboard IRQs; otherwise
+         * that same key transition escapes into the firmware loader. */
+        wait_for_bare_keys_released();
+        /* Restore the original launcher pixels before keyboard/IRQ/PSR.  A
+         * second copy after window cleanup repairs any close-time GUI paint. */
+        restore_desktop_frame_direct();
+    }
+    g_performance.bare_clock_ticks =
+        gam4980_9288_bare_clock() - start_clock;
+#if defined(GAM4980_ENABLE_IRAM_EXEC_ENGINE) && \
+    !defined(GAM4980_FORCE_EXTERNAL_EXEC)
+    gam4980_set_iram_exec_enabled(0);
+#endif
+    if (gam4980_9288_bare_active()) {
+        g_performance.bare_restore_ok =
+            (u32)gam4980_9288_bare_leave();
+    } else {
+        g_performance.bare_restore_ok =
+            gam4980_9288_bare_status() >= 0;
+    }
+    if (!g_performance.bare_restore_ok)
+        g_performance.bare_exit_reason = BARE_EXIT_RESTORE_FAILED;
+    else
+        completed = 1;
+    performance_end_session();
+    finish_emulator_window(window);
+    g_launcher_restore_closed_window = window;
+    g_launcher_restore_pending = 1;
+    return completed ? 1 : -1;
+}
+#endif
 
 static void run_timer_frame(void)
 {
@@ -2956,6 +4329,7 @@ static void run_timer_frame(void)
     }
 #endif
     if (frame_changed) {
+        g_loading_active = 0;
         if (g_setting_performance_debug)
             ++g_performance.render_updates;
         present_2x(gam4980_packed_frame());
@@ -3140,8 +4514,13 @@ static void finish_emulator_window(T_GUI_HWND window)
     if (!window)
         return;
 
-    if (g_main_window == window)
-        (void)fnGUI_PostMessage(window, MSG_CLOSE, 0, 0);
+    if (g_main_window == window &&
+        !fnGUI_PostMessage(window, MSG_CLOSE, 0, 0)) {
+        /* PostMessage can fail when the firmware queue is saturated by
+         * factors accumulated during the bare interval.  Close synchronously
+         * before waiting so the filtered loop always has a Quit to consume. */
+        (void)gam_window_proc(window, MSG_CLOSE, 0, 0);
+    }
 
     /* Match the 9288 SDK's downsample.c exactly here: the closing loop is
      * filtered to this window.  A global GetMessage(0) can consume messages
@@ -3158,6 +4537,8 @@ static void finish_emulator_window(T_GUI_HWND window)
 
     fnGUI_ThrowAwayMessages(window);
     fnGUI_MainWindowCleanup(window);
+    /* App_Main performs the durable launcher restore only after save/log/file
+     * cleanup, so no later application work can enqueue another GUI transfer. */
 }
 
 static int run_emulator_window(void)
@@ -3167,12 +4548,18 @@ static int run_emulator_window(void)
 
     if (!g_main_window)
         return 0;
-    g_loading_active = 0;
+#ifdef GAM4980_ENABLE_BARE_SESSION
+    if (g_bare_rom_cache_ready) {
+        int bare_result = run_bare_emulator_window();
+
+        if (bare_result != 0)
+            return bare_result > 0;
+    }
+#endif
     window = g_main_window;
     write_load_diagnostic(0x0bu, 0u, 0u);
     init_screen_expansion();
     performance_begin_paint_tracking();
-    clear_screen();
     g_close_requested = 0;
     g_escape_down = 0;
     g_exit_hold_timer_ticks = 0;
@@ -3181,8 +4568,6 @@ static int run_emulator_window(void)
     g_first_frame_logged = 0;
 #endif
     g_frame_tick_pending = 0;
-    (void)gam4980_render_frame();
-    present_2x(gam4980_packed_frame());
     write_load_diagnostic(0x0cu, 0u, 0u);
     if (!fnGUI_SetTimer(g_main_window, FRAME_TIMER_ID, FRAME_TIMER_SPEED)) {
         destroy_emulator_window();
@@ -3209,6 +4594,8 @@ static int run_emulator_window(void)
 
     performance_end_session();
     finish_emulator_window(window);
+    g_launcher_restore_closed_window = window;
+    g_launcher_restore_pending = 1;
     return 1;
 }
 
@@ -3218,8 +4605,28 @@ T_WORD App_Main(void)
     int initialized = 0;
     int rom_status;
     u32 operation_tick;
+    u32 native_module_size;
     long game_size;
 
+    /* Save validated launcher handles before creating our windows.  The LCD
+     * snapshot provides the immediate bare-exit transition and, after cleanup
+     * plus an HSDMA-idle barrier, the durable launcher-page restoration. */
+    g_launcher_restore_closed_window = (T_GUI_HWND)0;
+    g_launcher_restore_pending = 0;
+    g_desktop_frame_valid = 0;
+    remember_launcher_windows();
+    capture_desktop_frame_direct();
+
+#ifdef GAM4980_ENABLE_IRAM_HOT_CORE
+    if (!gam4980_9288_iram_enter()) {
+        show_error(
+            gam4980_9288_iram_status() == GAM4980_IRAM_STATUS_AMR_BUSY
+                ? "IRAM is occupied by audio. Stop audio and retry."
+                : "Could not install the IRAM hot core."
+        );
+        return -6;
+    }
+#endif
     (void)fs_mkdir(k_game_root);
     load_settings();
     memory_diagnostic(0x00u, 0u, 0u);
@@ -3317,7 +4724,49 @@ T_WORD App_Main(void)
         destroy_emulator_window();
         return -4;
     }
-    draw_loading_stage(k_loading_start, 7u, 1u, 1u);
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+    draw_loading_stage(k_loading_native, 7u, 0u, 1u);
+    native_module_size = open_native_module();
+    if (native_module_size && !gam4980_native_modules_open(
+            read_native_module, 0, native_module_size
+        )) {
+        int retry_generic = g_native_module_game_specific;
+
+        fs_fclose(g_native_module_file);
+        g_native_module_file = 0;
+        g_native_module_game_specific = 0;
+        if (retry_generic) {
+            native_module_size = open_native_module_path(
+                k_native_module_path, 0
+            );
+            if (native_module_size && !gam4980_native_modules_open(
+                    read_native_module, 0, native_module_size
+                )) {
+                fs_fclose(g_native_module_file);
+                g_native_module_file = 0;
+            }
+        }
+    }
+    draw_loading_stage(k_loading_native, 7u, 1u, 1u);
+#else
+    (void)native_module_size;
+#endif
+#ifdef GAM4980_ENABLE_BARE_SESSION
+    draw_loading_stage(k_loading_warm_rom, 8u, 0u, 1u);
+    g_bare_rom_cache_ready = gam4980_warm_bare_rom_cache() != 0;
+    draw_loading_stage(k_loading_warm_rom, 8u, 1u, 1u);
+#endif
+    /* Consume the core's initial all-white LCD snapshot without presenting
+     * it.  Otherwise the first render in either the bare or GUI loop reports
+     * a change and immediately erases STARTING GAME with an initialization
+     * frame that the guest never drew. */
+    (void)gam4980_render_frame();
+    draw_loading_stage(k_loading_start, 9u, 1u, 1u);
+    /* STARTING GAME is useful while the synchronous preparation is running,
+     * but must not remain underneath games that update only part of their LCD
+     * on the first frame.  Clear both the SDK surface and physical LCD before
+     * either the bare loop or GUI-timer loop can execute guest code. */
+    clear_screen();
     load_rtc_end_total();
     g_performance.load_total_ticks = tick_elapsed(
         g_performance.load_begin_tick, (u32)fnGUI_GetTickCount()
@@ -3328,10 +4777,23 @@ T_WORD App_Main(void)
         release_buffers();
         return -5;
     }
+#ifdef GAM4980_ENABLE_IRAM_HOT_CORE
+    /* No core code runs after this point.  Restore the system's original
+     * IRAM before file I/O and record the verified restoration in PERF.LOG. */
+    gam4980_9288_iram_leave();
+#endif
     if (initialized)
         write_save();
     write_performance_log();
     release_buffers();
+    /* This must be the last firmware-facing operation before returning to the
+     * loader.  Restoring the launcher earlier lets save/log/filesystem work
+     * accumulate another close-time GUI transfer that overwrites the saved
+     * page after it was copied. */
+    if (g_launcher_restore_pending) {
+        rebuild_launcher_page(g_launcher_restore_closed_window);
+        g_launcher_restore_pending = 0;
+    }
     return 0;
 }
 

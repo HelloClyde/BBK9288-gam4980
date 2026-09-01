@@ -4,6 +4,7 @@ from tools.generate_aot_ebin import (
     CpuFlag,
     InstructionIR,
     analyze_flag_liveness,
+    chain_terminator,
     emit_block_ir,
     flag_effects,
 )
@@ -89,6 +90,40 @@ class AotIrFlagLivenessTest(unittest.TestCase):
         self.assertEqual(fusion_count, 0)
         self.assertFalse(requires_binary)
         self.assertEqual(len(emitted), len(instructions))
+
+
+class AotCrossBlockLinkTest(unittest.TestCase):
+    @staticmethod
+    def block(pc: int, *, chain: bool, bank2: bool = False) -> dict[str, object]:
+        return {
+            "virtual_pc": pc,
+            "chain_enabled": chain,
+            "requires_bank2": bank2,
+            "may_change_mapping": False,
+        }
+
+    def test_cold_known_successor_uses_token(self) -> None:
+        blocks = [self.block(0x6000, chain=True), self.block(0x6100, chain=False)]
+        emitted = chain_terminator(
+            "S6502_AOT_JMP(0x6100u);", {0x6100: 1}, blocks, blocks[0]
+        )
+        self.assertEqual(emitted, "S6502_AOT_JMP_TOKEN(0x6100u, 1u);")
+
+    def test_hot_successor_keeps_direct_label_chain(self) -> None:
+        blocks = [self.block(0x6000, chain=True), self.block(0x6100, chain=True)]
+        emitted = chain_terminator(
+            "S6502_AOT_JMP(0x6100u);", {0x6100: 1}, blocks, blocks[0]
+        )
+        self.assertIn("S6502_AOT_JMP_CHAIN", emitted)
+        self.assertIn("_aot_01", emitted)
+
+    def test_hle_entry_is_never_bypassed(self) -> None:
+        blocks = [self.block(0x6000, chain=True), self.block(0x5C5D, chain=False)]
+        original = "S6502_AOT_JMP(0x5c5du);"
+        emitted = chain_terminator(
+            original, {0x5C5D: 1}, blocks, blocks[0]
+        )
+        self.assertEqual(emitted, original)
 
 
 if __name__ == "__main__":

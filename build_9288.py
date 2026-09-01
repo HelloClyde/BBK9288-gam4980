@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
+import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -22,6 +24,8 @@ MACHINE_9288 = 1
 APP_MODULE = 8
 APP_NAME = b"GAM4980"
 APP_LOAD_ADDRESS = 0x02700000
+APP_RAM_END = 0x02800000
+APP_MAX_PAYLOAD_SIZE = APP_RAM_END - APP_LOAD_ADDRESS
 
 
 def run(command: list[str], step: str) -> None:
@@ -177,10 +181,18 @@ def compile_app(
     optimization: str,
     firmware_hle_mask: int,
     aggressive_region_hle: bool,
+    iram_hot_core: bool,
+    iram_exec_engine: bool,
+    iram_exec_asm: bool,
+    external_exec: bool,
+    bare_session: bool,
+    dynamic_native_all: bool,
+    native_game: Path | None,
     rebuild: bool,
 ) -> bytes:
     clang = find_tool(toolchain, "clang")
     objcopy = find_tool(toolchain, "llvm-objcopy")
+    objdump = find_tool(toolchain, "llvm-objdump")
     readelf = find_tool(toolchain, "llvm-readelf")
     generated_include = BUILD_ROOT / "sdk-include"
     prepare_sdk_headers(sdk, generated_include)
@@ -226,6 +238,58 @@ def compile_app(
         if not enable_aot:
             raise SystemExit("--aggressive-region-hle requires AOT/HLE")
         common_flags.append("-DGAM4980_ENABLE_AGGRESSIVE_REGION_HLE")
+    if iram_hot_core:
+        if not aggressive_region_hle:
+            raise SystemExit(
+                "--iram-hot-core requires --aggressive-region-hle"
+            )
+        common_flags.append("-DGAM4980_ENABLE_IRAM_HOT_CORE")
+    if iram_exec_engine:
+        if not iram_hot_core or not bare_session:
+            raise SystemExit(
+                "--iram-exec-engine requires --iram-hot-core and "
+                "--bare-session"
+            )
+        common_flags.append("-DGAM4980_ENABLE_IRAM_EXEC_ENGINE")
+    if iram_exec_asm:
+        if not iram_exec_engine:
+            raise SystemExit(
+                "--iram-exec-asm requires --iram-exec-engine"
+            )
+        common_flags.append("-DGAM4980_IRAM_EXEC_ASM")
+        # The true-device default spends the scarce resident overlay on the
+        # generic interpreter.  The legacy shadow-superinstruction probe is
+        # still built separately without this define, while pageable native
+        # modules retain their own explicitly requested bridge.
+        if not dynamic_native_all:
+            common_flags.append("-DGAM4980_IRAM_V2")
+    if dynamic_native_all:
+        if not iram_exec_asm:
+            raise SystemExit(
+                "--dynamic-native-all requires the S1C33 IRAM ASM engine"
+            )
+        common_flags.append("-DGAM4980_DYNAMIC_NATIVE_ALL")
+    if external_exec:
+        if not iram_exec_engine or not bare_session:
+            raise SystemExit(
+                "--external-exec requires --iram-exec-engine and "
+                "--bare-session"
+            )
+        common_flags.append("-DGAM4980_FORCE_EXTERNAL_EXEC")
+    if bare_session:
+        if not iram_hot_core:
+            raise SystemExit("--bare-session requires --iram-hot-core")
+        if not lightweight_performance:
+            raise SystemExit(
+                "--bare-session requires --lightweight-performance"
+            )
+        common_flags.extend(
+            [
+                "-DGAM4980_ENABLE_BARE_SESSION",
+                "-DGAM4980_BARE_DIRECT_FS",
+                "-DGAM4980_ENABLE_NATIVE_TRACE_AOT",
+            ]
+        )
     if game_load_aot:
         if not enable_aot:
             raise SystemExit("--game-load-aot requires the normal AOT dispatcher")
@@ -255,16 +319,20 @@ def compile_app(
     # offline translation invalidates the core object, while changing only the
     # 9288 frontend source leaves that expensive object reusable.
     dependencies = sorted(SOURCE_ROOT.rglob("*.h"))
+    dependencies.extend(sorted(SOURCE_ROOT.rglob("*.inc")))
     dependencies.extend(sorted(generated_include.rglob("*.h")))
-    compile_units = (
+    compile_units = [
         (SOURCE_ROOT / "gam4980_9288_start.c", []),
         (SOURCE_ROOT / "gam4980_9288_runtime.c", []),
+        (SOURCE_ROOT / "gam4980_9288_bare.c", []),
         (
             SOURCE_ROOT / "gam4980_9288.c",
             ["-DGAM4980_SEPARATE_CORE_OBJECT"],
         ),
         (SOURCE_ROOT / "gam4980_core.c", []),
-    )
+    ]
+    if iram_exec_asm:
+        compile_units.append((SOURCE_ROOT / "s6502_iram_asm.S", []))
     for source, unit_flags in compile_units:
         if not source.is_file():
             raise SystemExit(f"missing source: {source}")
@@ -279,6 +347,53 @@ def compile_app(
             rebuild,
         )
         objects.append(output)
+
+    if dynamic_native_all:
+        run(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "tools" / "pack_native_module.py"),
+                "--clang",
+                clang,
+                "--objcopy",
+                objcopy,
+                "--readelf",
+                readelf,
+                "--include-dir",
+                str(SOURCE_ROOT),
+                "--aot-header",
+                str(SOURCE_ROOT / "s6502_aot_ebin_generated.h"),
+                "--optimization",
+                optimization,
+                "--output",
+                str(BUILD_ROOT / "GAM4980.NAT"),
+            ],
+            "pack pageable native module",
+        )
+        if native_game is not None:
+            run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "tools" / "pack_native_module.py"),
+                    "--clang",
+                    clang,
+                    "--objcopy",
+                    objcopy,
+                    "--readelf",
+                    readelf,
+                    "--include-dir",
+                    str(SOURCE_ROOT),
+                    "--aot-header",
+                    str(SOURCE_ROOT / "s6502_aot_ebin_generated.h"),
+                    "--optimization",
+                    optimization,
+                    "--game",
+                    str(native_game),
+                    "--output",
+                    str(BUILD_ROOT / f"{native_game.stem}.GNA"),
+                ],
+                "pack full-GAM native sidecar",
+            )
 
     elf = BUILD_ROOT / "GAM4980.elf"
     map_path = BUILD_ROOT / "GAM4980.map"
@@ -298,16 +413,135 @@ def compile_app(
         ],
         "link 9288 ELF",
     )
-    raw = BUILD_ROOT / "GAM4980.bin"
-    run(
-        [objcopy, "-O", "binary", "--gap-fill", "255", str(elf), str(raw)],
-        "extract 9288 payload",
-    )
-    run([readelf, "-h", "-S", str(elf)], "inspect 9288 ELF")
-    payload = raw.read_bytes()
     bss_start = read_map_symbol(map_path, "__bss_start")
     scratch_end = read_map_symbol(map_path, "__scratch_end")
     payload_end = read_map_symbol(map_path, "__payload_end")
+    if payload_end > APP_RAM_END:
+        raise SystemExit(
+            "9288 payload exceeds the 8 MiB SDRAM window: "
+            f"end=0x{payload_end:08x}, limit=0x{APP_RAM_END:08x}"
+        )
+    iram_start = read_map_symbol(map_path, "__iram_start")
+    iram_end = read_map_symbol(map_path, "__iram_end")
+    iram_size = iram_end - iram_start
+    if iram_hot_core and not (0 < iram_size <= 0x16C8):
+        raise SystemExit(
+            f"invalid IRAM hot-core size: {iram_size} bytes"
+        )
+    if not iram_hot_core and iram_size != 0:
+        raise SystemExit(
+            f"unexpected IRAM contents without --iram-hot-core: {iram_size}"
+        )
+    if iram_exec_engine:
+        iram_exec_start = read_map_symbol(
+            map_path, "__iram_exec_engine_start"
+        )
+        iram_exec_end = read_map_symbol(
+            map_path, "__iram_exec_engine_end"
+        )
+        if (iram_exec_start | iram_exec_end) & 3:
+            raise SystemExit(
+                "IRAM execution engine range is not 32-bit aligned: "
+                f"0x{iram_exec_start:x}..0x{iram_exec_end:x}"
+            )
+    if iram_hot_core:
+        print("+", objdump, "-d --section=.iram", elf)
+        iram_disassembly = subprocess.check_output(
+            [objdump, "-d", "--section=.iram", str(elf)], text=True
+        )
+        (BUILD_ROOT / "GAM4980.iram.dis.txt").write_text(
+            iram_disassembly, encoding="utf-8"
+        )
+        # S1C33 relative calls are safe only when both caller and callee live
+        # in the copied low-IRAM overlay.  Calls through registers are valid;
+        # reject symbol-resolved direct calls whose linked target is outside
+        # the complete IRAM range while allowing resident helper calls.
+        iram_symbols: dict[str, int] = {}
+        for line in iram_disassembly.splitlines():
+            match = re.match(
+                r"^\s*([0-9a-fA-F]+)\s+<([^>]+)>:$", line
+            )
+            if match is not None:
+                name = match.group(2).split("+", 1)[0]
+                iram_symbols[name] = int(match.group(1), 16)
+        direct_external_transfers: list[str] = []
+        for line in iram_disassembly.splitlines():
+            match = re.search(
+                r"\b(?:call|jp(?:\.d)?)\b.*<([^>]+)>", line
+            )
+            if match is None:
+                continue
+            name = match.group(1).split("+", 1)[0]
+            target = iram_symbols.get(name)
+            if target is None or not (iram_start <= target < iram_end):
+                direct_external_transfers.append(line.strip())
+        if direct_external_transfers:
+            raise SystemExit(
+                "IRAM hot core contains unsafe direct control transfers:\n" +
+                "\n".join(direct_external_transfers)
+            )
+        audit_command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tests" / "audit_9288_iram_exec.py"),
+            "--map",
+            str(map_path),
+            "--disassembly",
+            str(BUILD_ROOT / "GAM4980.iram.dis.txt"),
+            "--max-size",
+            "0x16c8",
+        ]
+        if iram_exec_asm:
+            audit_command.extend(
+                [
+                    "--expect-asm",
+                    "--required-symbol",
+                    "s6502_iram_exec_burst_asm",
+                    "--dispatch-table-symbol",
+                    "s6502_iram_dispatch_table",
+                    "--allow-indirect-call-register",
+                    "r13",
+                    "--expected-indirect-calls",
+                    "1" if dynamic_native_all else "0",
+                ]
+            )
+        run(audit_command, "audit 9288 IRAM execution engine")
+    raw = BUILD_ROOT / "GAM4980.bin"
+    # The flat KF2 payload is addressed from 0x02700000.  llvm-objcopy's
+    # binary backend keys its span from .iram's low VMA (0x800), despite the
+    # section having the correct 0x02700100 LMA.  Extract the external image
+    # without .iram, then place the raw overlay at the SDK's load-image
+    # offset.  Relocations remain resolved for the 0x800 run address.
+    run(
+        [
+            objcopy, "-O", "binary", "--gap-fill", "255",
+            "--remove-section=.iram", str(elf), str(raw),
+        ],
+        "extract external 9288 payload",
+    )
+    payload_bytes = bytearray(raw.read_bytes())
+    if iram_size:
+        iram_raw = BUILD_ROOT / "GAM4980.iram.bin"
+        run(
+            [
+                objcopy, "-O", "binary", "--only-section=.iram",
+                str(elf), str(iram_raw),
+            ],
+            "extract IRAM load image",
+        )
+        iram_image = iram_raw.read_bytes()
+        if len(iram_image) != iram_size:
+            raise SystemExit(
+                "IRAM image size mismatch: "
+                f"{len(iram_image)} bytes, expected {iram_size}"
+            )
+        iram_load_offset = 0x100
+        iram_load_end = iram_load_offset + iram_size
+        if iram_load_end > len(payload_bytes):
+            raise SystemExit("IRAM load image falls outside the KF2 payload")
+        payload_bytes[iram_load_offset:iram_load_end] = iram_image
+    payload = bytes(payload_bytes)
+    raw.write_bytes(payload)
+    run([readelf, "-h", "-S", str(elf)], "inspect 9288 ELF")
     expected_size = payload_end - APP_LOAD_ADDRESS
     if expected_size <= 0 or len(payload) != expected_size:
         raise SystemExit(
@@ -351,6 +585,11 @@ def read_icon(path: Path, width: int, height: int) -> bytes:
 
 
 def pack_kf2(payload: bytes) -> bytes:
+    if len(payload) > APP_MAX_PAYLOAD_SIZE:
+        raise SystemExit(
+            "9288 KF2 payload is too large for the application RAM window: "
+            f"{len(payload)} bytes, maximum {APP_MAX_PAYLOAD_SIZE}"
+        )
     icon1 = read_icon(ICON_ROOT / "ico1.bin", 40, 40)
     icon2 = read_icon(ICON_ROOT / "ico2.bin", 16, 16)
     code_offset = HEADER_SIZE + len(icon1) + len(icon2)
@@ -492,7 +731,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--firmware-hle-mask",
         type=lambda value: int(value, 0),
-        choices=range(512),
+        choices=range(1024),
         default=1023,
         help=argparse.SUPPRESS,
     )
@@ -505,15 +744,90 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--iram-hot-core",
+        action="store_true",
+        help=(
+            "place the hottest verified picture HLE routines in the 9288 "
+            "SDK IRAM overlay"
+        ),
+    )
+    parser.add_argument(
+        "--bare-session",
+        action="store_true",
+        help=(
+            "run gameplay with system IRQs masked, direct 256 Hz clock, "
+            "matrix keyboard, LCD framebuffer, and session-resident IRAM"
+        ),
+    )
+    parser.add_argument(
+        "--iram-exec-engine",
+        action="store_true",
+        help=(
+            "use the SDK IRAM overlay for a session-resident 65C02 "
+            "execution loop instead of picture-specific HLE"
+        ),
+    )
+    iram_exec_implementation = parser.add_mutually_exclusive_group()
+    iram_exec_implementation.add_argument(
+        "--iram-exec-asm",
+        dest="iram_exec_asm",
+        action="store_true",
+        default=None,
+        help=(
+            "compile the register-resident S1C33 assembly execution engine "
+            "(the default when --iram-exec-engine is enabled)"
+        ),
+    )
+    iram_exec_implementation.add_argument(
+        "--iram-exec-c",
+        dest="iram_exec_asm",
+        action="store_false",
+        help=(
+            "retain the previous C IRAM execution engine for A/B and "
+            "equivalence testing"
+        ),
+    )
+    parser.add_argument(
+        "--external-exec",
+        action="store_true",
+        help=(
+            "keep the bare session but force the normal execution engine "
+            "to remain in external RAM; used as a strict IRAM A/B control"
+        ),
+    )
+    parser.add_argument(
         "--rebuild",
         action="store_true",
         help="ignore the content-addressed object cache and rebuild every unit",
+    )
+    parser.add_argument(
+        "--dynamic-native-all",
+        action="store_true",
+        help=(
+            "experimentally page all firmware/game native code from .NAT/.GNA; "
+            "disabled by default because physical 9288 external-code fetches "
+            "are much slower than the emulator models"
+        ),
+    )
+    parser.add_argument(
+        "--native-game",
+        type=Path,
+        help=(
+            "offline-compile all statically recoverable code in this GAM "
+            "to a same-name .GNA sidecar"
+        ),
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.iram_exec_asm is not None and not args.iram_exec_engine:
+        raise SystemExit(
+            "--iram-exec-asm/--iram-exec-c require --iram-exec-engine"
+        )
+    if args.native_game is not None and not args.dynamic_native_all:
+        raise SystemExit("--native-game requires --dynamic-native-all")
     sdk = args.sdk.resolve()
     output = args.output.resolve()
     BUILD_ROOT.mkdir(parents=True, exist_ok=True)
@@ -536,10 +850,39 @@ def main() -> None:
             optimization=args.optimization,
             firmware_hle_mask=args.firmware_hle_mask,
             aggressive_region_hle=args.aggressive_region_hle,
+            iram_hot_core=args.iram_hot_core,
+            iram_exec_engine=args.iram_exec_engine,
+            iram_exec_asm=(
+                args.iram_exec_engine
+                if args.iram_exec_asm is None
+                else args.iram_exec_asm
+            ),
+            external_exec=args.external_exec,
+            bare_session=args.bare_session,
+            dynamic_native_all=args.dynamic_native_all,
+            native_game=(
+                args.native_game.resolve()
+                if args.native_game is not None else None
+            ),
             rebuild=args.rebuild,
         )
     app = pack_kf2(payload)
     output.write_bytes(app)
+    native_package = BUILD_ROOT / "GAM4980.NAT"
+    if native_package.is_file() and args.dynamic_native_all and (
+        args.iram_exec_asm is None or args.iram_exec_asm
+    ):
+        native_output = output.parent / "GAM4980.NAT"
+        if native_package.resolve() != native_output.resolve():
+            shutil.copyfile(native_package, native_output)
+        print(f"native module: {native_output}")
+    if args.native_game is not None:
+        game_native_package = BUILD_ROOT / f"{args.native_game.stem}.GNA"
+        if game_native_package.is_file():
+            game_native_output = output.parent / game_native_package.name
+            if game_native_package.resolve() != game_native_output.resolve():
+                shutil.copyfile(game_native_package, game_native_output)
+            print(f"game native module: {game_native_output}")
     digest = hashlib.sha256(app).hexdigest()
     print(f"built: {output}")
     print(f"payload: {len(payload)} bytes")

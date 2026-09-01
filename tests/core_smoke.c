@@ -6,6 +6,15 @@
 
 static u8 *stream_roms[2];
 static u32 stream_rom_reads;
+static u32 stream_rom_page_bits[2][GAM4980_ROM_SIZE / 0x1000u / 32u];
+static u32 runtime_poll_calls;
+
+static void runtime_poll(void *context)
+{
+    u32 *calls = (u32 *)context;
+
+    ++*calls;
+}
 
 static int stream_rom_read(
     void *context, u8 region, u32 offset, u8 *out, u32 size
@@ -17,6 +26,16 @@ static int stream_rom_read(
         return 0;
     memcpy(out, stream_roms[region] + offset, size);
     ++stream_rom_reads;
+    if (size) {
+        u32 page = offset >> 12;
+        u32 last_page = (offset + size - 1u) >> 12;
+
+        while (page <= last_page) {
+            stream_rom_page_bits[region][page >> 5] |=
+                1u << (page & 31u);
+            ++page;
+        }
+    }
     return 1;
 }
 
@@ -143,11 +162,46 @@ int main(int argc, char **argv)
         fprintf(stderr, "gam4980_init failed: %d\n", result);
         return 5;
     }
+    if (getenv("GAM4980_SMOKE_RUNTIME_POLL"))
+        gam4980_set_runtime_poll_callback(
+            runtime_poll, &runtime_poll_calls, 4096u
+        );
+    if (getenv("GAM4980_SMOKE_WARM_ROM") &&
+        !gam4980_warm_bare_rom_cache()) {
+        fprintf(stderr, "gam4980_warm_bare_rom_cache failed\n");
+        return 8;
+    }
+    if (getenv("GAM4980_SMOKE_WARM_ROM") &&
+        getenv("GAM4980_STREAM_ROM") &&
+        gam4980_rom_cache_warm_pages() != 92u) {
+        fprintf(
+            stderr, "unexpected warm ROM page count: %u (expected 92)\n",
+            (unsigned)gam4980_rom_cache_warm_pages()
+        );
+        return 8;
+    }
     if (argc == 4) {
         unsigned long frame_number;
+        const char *raw_exec_text;
 
         if (!load_game(argv[3], buffers.flash))
             return 6;
+#ifdef GAM4980_IRAM_EXEC_NATIVE_TEST
+        gam4980_set_iram_exec_enabled(
+            getenv("GAM4980_SMOKE_IRAM_RESIDENT") != 0
+        );
+#endif
+        raw_exec_text = getenv("GAM4980_SMOKE_RAW_EXECS");
+#ifdef GAM4980_IRAM_EXEC_NATIVE_TEST
+        if (raw_exec_text && *raw_exec_text) {
+            unsigned long raw_execs = strtoul(raw_exec_text, 0, 10);
+
+            for (frame_number = 0; frame_number < raw_execs; ++frame_number)
+                (void)gam4980_debug_exec_slice(1u);
+        } else
+#else
+        (void)raw_exec_text;
+#endif
         for (frame_number = 0; frame_number < frame_count; ++frame_number) {
             if (story_input) {
                 if (frame_number == 3300 || frame_number == 3480 ||
@@ -155,6 +209,21 @@ int main(int argc, char **argv)
                     gam4980_key_down(GAM4980_KEY_ENTER);
             }
             gam4980_run_frame();
+        }
+        if (getenv("GAM4980_SMOKE_RUNTIME_POLL")) {
+            gam4980_set_runtime_poll_callback(0, 0, 0u);
+            if (runtime_poll_calls <= frame_count) {
+                fprintf(
+                    stderr,
+                    "runtime poll did not split frames: calls=%u frames=%lu\n",
+                    (unsigned)runtime_poll_calls, frame_count
+                );
+                return 9;
+            }
+            printf(
+                "runtime poll calls=%u frames=%lu\n",
+                (unsigned)runtime_poll_calls, frame_count
+            );
         }
     } else {
         (void)gam4980_render_frame();
@@ -171,6 +240,61 @@ int main(int argc, char **argv)
         (unsigned)GAM4980_LCD_PACKED_SIZE, (unsigned)checksum,
         gam4980_cpu_halted(), (unsigned)stream_rom_reads
     );
+    if (getenv("GAM4980_STREAM_ROM")) {
+        u32 region;
+
+        for (region = 0u; region < 2u; ++region) {
+            u32 pages = 0u;
+            u32 word;
+
+            for (word = 0u;
+                 word < GAM4980_ROM_SIZE / 0x1000u / 32u; ++word) {
+                u32 bits = stream_rom_page_bits[region][word];
+
+                while (bits) {
+                    bits &= bits - 1u;
+                    ++pages;
+                }
+            }
+            printf(
+                "stream rom region=%u unique_pages=%u\n",
+                (unsigned)region, (unsigned)pages
+            );
+            if (getenv("GAM4980_STREAM_ROM_PAGES")) {
+                u32 page;
+
+                printf("stream rom region=%u pages=", (unsigned)region);
+                for (page = 0u; page < GAM4980_ROM_SIZE / 0x1000u;
+                     ++page) {
+                    if (stream_rom_page_bits[region][page >> 5] &
+                        (1u << (page & 31u)))
+                        printf("%x,", (unsigned)page);
+                }
+                putchar('\n');
+            }
+        }
+    }
+    if (getenv("GAM4980_SMOKE_ROM_MISS_TRACE")) {
+        u32 miss_id;
+
+        printf(
+            "rom miss trace count=%u dropped=%u runtime=%u\n",
+            (unsigned)gam4980_rom_miss_trace_count(),
+            (unsigned)gam4980_rom_miss_trace_dropped(),
+            (unsigned)gam4980_rom_cache_runtime_misses()
+        );
+        for (miss_id = 0u; miss_id < gam4980_rom_miss_trace_count();
+             ++miss_id) {
+            printf(
+                "rom miss id=%u kind=%u slot=%u region=%u page=%03x\n",
+                (unsigned)miss_id,
+                (unsigned)gam4980_rom_miss_trace_kind(miss_id),
+                (unsigned)gam4980_rom_miss_trace_slot(miss_id),
+                (unsigned)gam4980_rom_miss_trace_region(miss_id),
+                (unsigned)gam4980_rom_miss_trace_page(miss_id)
+            );
+        }
+    }
 #if defined(GAM4980_ENABLE_AOT) && defined(GAM4980_AOT_DIAGNOSTICS)
     printf(
         "aot instructions=%llu\n",
@@ -247,6 +371,126 @@ int main(int argc, char **argv)
         (unsigned)gam4980_performance_sample_count(),
         (unsigned)gam4980_performance_sample_dropped()
     );
+#endif
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+    {
+        u32 burst_total = 0u;
+        u32 dispatch_total = 0u;
+        u32 slow_opcode_total = 0u;
+        u32 slow_class_total = 0u;
+        u32 sampled_total;
+        u32 expected_samples;
+        u32 metric;
+
+        for (metric = 0u; metric < GAM4980_IRAM_BURST_BUCKET_COUNT;
+             ++metric)
+            burst_total += gam4980_iram_burst_bucket_hits(metric);
+        for (metric = 0u; metric < GAM4980_IRAM_DISPATCH_TARGET_COUNT;
+             ++metric)
+            dispatch_total += gam4980_iram_dispatch_target_hits(metric);
+        for (metric = 0u; metric < 256u; ++metric)
+            slow_opcode_total += gam4980_iram_slow_opcode_hits(metric);
+        for (metric = 0u; metric < GAM4980_IRAM_SLOW_PATH_CLASS_COUNT;
+             ++metric)
+            slow_class_total += gam4980_iram_slow_path_class_hits(metric);
+        sampled_total = dispatch_total + slow_opcode_total;
+        expected_samples = (
+            gam4980_iram_exec_dispatch_exits() +
+            gam4980_iram_exec_zero_fallbacks() +
+            gam4980_iram_exec_slow_exits()
+        ) / gam4980_iram_exit_sample_rate();
+        if ((!getenv("GAM4980_DISABLE_PERFORMANCE_DEBUG") &&
+             (burst_total != gam4980_iram_exec_calls() ||
+              sampled_total != gam4980_iram_exit_samples() ||
+              sampled_total != expected_samples ||
+              slow_class_total != slow_opcode_total)) ||
+            (getenv("GAM4980_DISABLE_PERFORMANCE_DEBUG") &&
+             (burst_total || dispatch_total || slow_opcode_total ||
+              slow_class_total || gam4980_iram_exit_samples()))) {
+            fprintf(
+                stderr,
+                "IRAM diagnostics mismatch: bursts=%u calls=%u "
+                "dispatch=%u/%u slow=%u/%u classes=%u "
+                "samples=%u/%u rate=%u debug_off=%u\n",
+                (unsigned)burst_total,
+                (unsigned)gam4980_iram_exec_calls(),
+                (unsigned)dispatch_total,
+                (unsigned)gam4980_iram_exec_dispatch_exits(),
+                (unsigned)slow_opcode_total,
+                (unsigned)(gam4980_iram_exec_zero_fallbacks() +
+                    gam4980_iram_exec_slow_exits()),
+                (unsigned)slow_class_total,
+                (unsigned)gam4980_iram_exit_samples(),
+                (unsigned)expected_samples,
+                (unsigned)gam4980_iram_exit_sample_rate(),
+                getenv("GAM4980_DISABLE_PERFORMANCE_DEBUG") != 0
+            );
+            return 9;
+        }
+    }
+    printf(
+        "iram exec calls=%u instructions=%u cycles=%u zero=%u "
+        "controls=%u deadline=%u dispatch=%u slow=%u max=%u\n",
+        (unsigned)gam4980_iram_exec_calls(),
+        (unsigned)gam4980_iram_exec_instructions(),
+        (unsigned)gam4980_iram_exec_cycles(),
+        (unsigned)gam4980_iram_exec_zero_fallbacks(),
+        (unsigned)gam4980_iram_exec_control_exits(),
+        (unsigned)gam4980_iram_exec_deadline_exits(),
+        (unsigned)gam4980_iram_exec_dispatch_exits(),
+        (unsigned)gam4980_iram_exec_slow_exits(),
+        (unsigned)gam4980_iram_exec_max_instructions()
+    );
+    printf(
+        "iram fastchain calls=%u cycles=%u reentries=%u zero=%u "
+        "reinstall_failures=%u\n",
+        (unsigned)gam4980_iram_fastchain_calls(),
+        (unsigned)gam4980_iram_fastchain_cycles(),
+        (unsigned)gam4980_iram_fastchain_reentries(),
+        (unsigned)gam4980_iram_fastchain_zero_returns(),
+        (unsigned)gam4980_iram_fastchain_reinstall_failures()
+    );
+#ifdef GAM4980_ENABLE_AOT
+    printf(
+        "aot token hits=%u",
+        (unsigned)gam4980_aot_token_link_hits()
+    );
+#ifdef GAM4980_ENABLE_GAME_LOAD_AOT
+    printf(
+        " game_linear_links=%u game_linear_hits=%u",
+        (unsigned)gam4980_game_aot_linear_link_count(),
+        (unsigned)gam4980_game_aot_linear_link_hits()
+    );
+#endif
+    printf("\n");
+#endif
+#ifdef GAM4980_IRAM_EXEC_NATIVE_TEST
+    printf(
+        "debug cpu pc=%04x regs=%08x status=%02x\n",
+        (unsigned)gam4980_debug_cpu_pc(),
+        (unsigned)gam4980_debug_cpu_regs(),
+        (unsigned)gam4980_debug_cpu_status()
+    );
+    if (getenv("GAM4980_SMOKE_DUMP_PC")) {
+        u32 debug_pc = gam4980_debug_cpu_pc();
+        u32 debug_index;
+
+        printf("debug bytes");
+        for (debug_index = 0u; debug_index < 48u; ++debug_index)
+            printf(
+                " %02x", (unsigned)gam4980_debug_read8(
+                    (debug_pc + debug_index) & 0xffffu
+                )
+            );
+        printf("\n");
+        printf(
+            "debug mem 000e=%02x 03d5=%02x 03d6=%02x\n",
+            (unsigned)gam4980_debug_read8(0x000eu),
+            (unsigned)gam4980_debug_read8(0x03d5u),
+            (unsigned)gam4980_debug_read8(0x03d6u)
+        );
+    }
+#endif
 #endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
     {

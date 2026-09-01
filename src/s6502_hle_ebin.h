@@ -3,7 +3,7 @@
 #ifdef GAM4980_ENABLE_AGGRESSIVE_REGION_HLE
   _hle_ebin_picture_head:
     {
-      int hle_status = s6502_firmware_hle_picture_head(
+      int hle_status = s6502_firmware_hle_picture_head_call(
           ac, iy, sp, status, cycles - executed,
           &s6502_hle_direct_result);
 
@@ -69,7 +69,7 @@
        * advance, $6646 LCD row-address update and the mode-3 row counter. */
       ea = (uint16_t)(s6502_stack_ram[0x3au] |
           ((uint16_t)s6502_stack_ram[0x3bu] << 8));
-      hle_status = s6502_firmware_hle_picture_tail(
+      hle_status = s6502_firmware_hle_picture_tail_call(
           dt != 0u, sp, status, cycles - executed, &hle_result);
       if (hle_status <= 0) {
         if (hle_status < 0)
@@ -101,7 +101,7 @@
 
       /* Merge the common mode-3 row beginning at $6988, including the
        * $6A75 inner loop, masked tail and shared $6646 row update. */
-      hle_status = s6502_firmware_hle_shift_region(
+      hle_status = s6502_firmware_hle_shift_region_call(
           sp, status, cycles - executed, &hle_result);
       if (hle_status <= 0) {
         if (hle_status < 0)
@@ -130,7 +130,7 @@
       /* Execute complete rows while they fit the current CPU slice.  Keeping
        * the $5C5D row boundary preserves the firmware timer/IRQ schedule but
        * still removes every inner AOT/interpreter dispatch in those rows. */
-      hle_status = s6502_firmware_hle_bitmap_region(
+      hle_status = s6502_firmware_hle_bitmap_region_call(
           sp, status, cycles - executed, &hle_result);
       if (hle_status <= 0) {
         if (hle_status < 0)

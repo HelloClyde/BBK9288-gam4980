@@ -278,12 +278,12 @@ BRANCH_FLAG_READS = {
 }
 
 NZ_WRITERS = {
-    0x05, 0x09, 0x0D, 0x1D,             # ORA
-    0x29, 0x2D, 0x31,                   # AND
-    0x49,                               # EOR
+    0x05, 0x09, 0x0D, 0x11, 0x1D,       # ORA
+    0x25, 0x29, 0x2D, 0x31,             # AND
+    0x45, 0x49, 0x51,                   # EOR
     0x68,                               # PLA
     0x88, 0x8A, 0x98,                   # DEY/TXA/TYA
-    0xA0, 0xA2, 0xA5, 0xA6, 0xA8,      # loads/transfers
+    0xA0, 0xA2, 0xA4, 0xA5, 0xA6, 0xA8, # loads/transfers
     0xA9, 0xAA, 0xAC, 0xAD, 0xAE,
     0xB1, 0xBA, 0xBD,
     0xC6, 0xC8, 0xCA, 0xCE, 0xDE,       # DEC/INY/DEX
@@ -501,6 +501,10 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
             f"S6502_AOT_BRANCH(!NEGATIVE_p, 0x{(pc + 2) & 0xffff:04x}u, "
             f"0x{target:04x}u);"
         )
+    elif opcode == 0x11:
+        line = (
+            f"S6502_AOT_ORA_INDY({indirect_base_expr(byte)}, {flags});"
+        )
     elif opcode == 0x18:
         line = f"S6502_AOT_CLC({flags});"
     elif opcode == 0x1E:
@@ -509,6 +513,8 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         line = f"S6502_AOT_ORA_ABSX(0x{word:04x}u, {flags});"
     elif opcode == 0x20:
         line = f"S6502_AOT_JSR(0x{(pc + 2) & 0xffff:04x}u, 0x{word:04x}u);"
+    elif opcode == 0x25:
+        line = f"S6502_AOT_AND({read_expr(byte)}, 3, {flags});"
     elif opcode == 0x26:
         line = f"S6502_AOT_ROL_ZP(0x{byte:02x}u, {flags});"
     elif opcode == 0x28:
@@ -535,18 +541,30 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         line = f"S6502_AOT_ROL_ABSX(0x{word:04x}u, {flags});"
     elif opcode == 0x40:
         line = "S6502_AOT_RTI();"
+    elif opcode == 0x45:
+        line = f"S6502_AOT_EOR({read_expr(byte)}, 3, {flags});"
     elif opcode == 0x46:
         line = f"S6502_AOT_LSR_ZP(0x{byte:02x}u, {flags});"
     elif opcode == 0x48:
         line = "S6502_AOT_PHA();"
     elif opcode == 0x49:
         line = f"S6502_AOT_EOR(0x{byte:02x}u, 2, {flags});"
+    elif opcode == 0x51:
+        line = (
+            f"S6502_AOT_EOR_INDY({indirect_base_expr(byte)}, {flags});"
+        )
     elif opcode == 0x4A:
         line = f"S6502_AOT_LSR_A({flags});"
     elif opcode == 0x4E:
         line = rmw_line("LSR_M", word, flags)
     elif opcode == 0x4C:
         line = f"S6502_AOT_JMP(0x{word:04x}u);"
+    elif opcode == 0x50:
+        target = branch_target(pc, byte)
+        line = (
+            f"S6502_AOT_BRANCH(!OVERFLOW_p, 0x{(pc + 2) & 0xffff:04x}u, "
+            f"0x{target:04x}u);"
+        )
     elif opcode == 0x60:
         line = "S6502_AOT_RTS();"
     elif opcode == 0x65:
@@ -575,6 +593,8 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         line = f"S6502_AOT_ADC_INDY({indirect_base_expr(byte)}, {flags});"
     elif opcode == 0x78:
         line = f"S6502_AOT_SEI({flags});"
+    elif opcode == 0x84:
+        line = f"S6502_AOT_STY(0x{byte:02x}u, 3);"
     elif opcode == 0x85:
         line = store_line("A", byte, 3)
     elif opcode == 0x86:
@@ -609,6 +629,8 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         line = f"S6502_AOT_LDY(0x{byte:02x}u, 2, {flags});"
     elif opcode == 0xA2:
         line = f"S6502_AOT_LDX(0x{byte:02x}u, 2, {flags});"
+    elif opcode == 0xA4:
+        line = f"S6502_AOT_LDY({read_expr(byte)}, 3, {flags});"
     elif opcode == 0xA5:
         line = f"S6502_AOT_LDA({read_expr(byte)}, 3, {flags});"
     elif opcode == 0xA6:
@@ -757,6 +779,10 @@ MACROS = r"""
     if (s6502_aot_match(id)) goto label;                                     \
     goto _next;                                                              \
 } while (0)
+#define S6502_AOT_TOKEN(id) do {                                             \
+    aot_next_token = (uint16_t)((id) + 1u);                                 \
+    goto _exit;                                                              \
+} while (0)
 #define S6502_AOT_ZP_READ(addr) S6502_FAST_STACK_RAM[(uint8_t)(addr)]
 #define S6502_AOT_RAM_READ(addr) S6502_FAST_STACK_RAM[(uint16_t)(addr)]
 #define S6502_AOT_PAGE3_READ(addr) s6502_page3[(uint8_t)(addr)]
@@ -893,6 +919,12 @@ MACROS = r"""
     ac = (uint8_t)(ac | (uint8_t)(value));                                  \
     S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(cost);         \
 } while (0)
+#define S6502_AOT_ORA_INDY(base, flags) do {                                 \
+    et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
+    CYCLES((!!(0xff00 & (et ^ ea))));                                       \
+    ac = (uint8_t)(ac | READ8(ea));                                         \
+    S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(5);            \
+} while (0)
 #define S6502_AOT_ORA_ABSX(base, flags) do {                                 \
     et = (uint16_t)(base); ea = (uint16_t)(et + ix);                         \
     CYCLES((!!(0xff00 & (et ^ ea))));                                       \
@@ -902,6 +934,12 @@ MACROS = r"""
 #define S6502_AOT_EOR(value, cost, flags) do {                               \
     ac = (uint8_t)(ac ^ (uint8_t)(value));                                  \
     S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(cost);         \
+} while (0)
+#define S6502_AOT_EOR_INDY(base, flags) do {                                 \
+    et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
+    CYCLES((!!(0xff00 & (et ^ ea))));                                       \
+    ac = (uint8_t)(ac ^ READ8(ea));                                         \
+    S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(5);            \
 } while (0)
 #define S6502_AOT_COMPARE(reg, value, cost, flags) do {                      \
     dt = (uint8_t)~(uint8_t)(value); et = (uint16_t)((reg) + dt + 1u);       \
@@ -1157,6 +1195,32 @@ MACROS = r"""
     }                                                                        \
     CYCLES(2); fall_chain(fall_id, fall_label);             \
 } while (0)
+#define S6502_AOT_BRANCH_TOKEN_TARGET(condition, fallthrough, target, target_id) do { \
+    pc = (uint16_t)(fallthrough);                                            \
+    if (condition) {                                                         \
+        CYCLES(1); CYCLES((!!(0xff00 & (pc ^ (uint16_t)(target)))));         \
+        pc = (uint16_t)(target); CYCLES(2);                                 \
+        S6502_AOT_TOKEN(target_id);                                          \
+    }                                                                        \
+    CYCLES(2); goto _exit;                                                   \
+} while (0)
+#define S6502_AOT_BRANCH_TOKEN_FALL(condition, fallthrough, target, fall_id) do { \
+    pc = (uint16_t)(fallthrough);                                            \
+    if (condition) {                                                         \
+        CYCLES(1); CYCLES((!!(0xff00 & (pc ^ (uint16_t)(target)))));         \
+        pc = (uint16_t)(target); CYCLES(2); goto _exit;                     \
+    }                                                                        \
+    CYCLES(2); S6502_AOT_TOKEN(fall_id);                                    \
+} while (0)
+#define S6502_AOT_BRANCH_TOKEN_BOTH(condition, fallthrough, target, fall_id, target_id) do { \
+    pc = (uint16_t)(fallthrough);                                            \
+    if (condition) {                                                         \
+        CYCLES(1); CYCLES((!!(0xff00 & (pc ^ (uint16_t)(target)))));         \
+        pc = (uint16_t)(target); CYCLES(2);                                 \
+        S6502_AOT_TOKEN(target_id);                                          \
+    }                                                                        \
+    CYCLES(2); S6502_AOT_TOKEN(fall_id);                                    \
+} while (0)
 #define S6502_AOT_JSR(return_pc, target) do {                                \
     PUSH((uint16_t)(return_pc) >> 8); PUSH((uint16_t)(return_pc) & 0xff);    \
     pc = (uint16_t)(target); CYCLES(6);                    \
@@ -1166,6 +1230,11 @@ MACROS = r"""
     PUSH((uint16_t)(return_pc) >> 8); PUSH((uint16_t)(return_pc) & 0xff);    \
     pc = (uint16_t)(target); CYCLES(6);                    \
     chain(id, label);                                                        \
+} while (0)
+#define S6502_AOT_JSR_TOKEN(return_pc, target, id) do {                      \
+    PUSH((uint16_t)(return_pc) >> 8); PUSH((uint16_t)(return_pc) & 0xff);    \
+    pc = (uint16_t)(target); CYCLES(6);                                     \
+    S6502_AOT_TOKEN(id);                                                     \
 } while (0)
 #define S6502_AOT_JMP(target) do {                                           \
     pc = (uint16_t)(target); CYCLES(3);                    \
@@ -1178,6 +1247,10 @@ MACROS = r"""
 #define S6502_AOT_JMP_CHAIN(chain, target, id, label) do {                   \
     pc = (uint16_t)(target); CYCLES(3);                    \
     chain(id, label);                                                        \
+} while (0)
+#define S6502_AOT_JMP_TOKEN(target, id) do {                                \
+    pc = (uint16_t)(target); CYCLES(3);                                     \
+    S6502_AOT_TOKEN(id);                                                     \
 } while (0)
 #define S6502_AOT_RTS() do {                                                 \
     pc = POP(); pc = (uint16_t)(pc | (POP() << 8)); pc += 1;                \
@@ -1194,6 +1267,7 @@ MACROS = r"""
 
 MACRO_NAMES = (
     "S6502_AOT_DISPATCH", "S6502_AOT_CHAIN", "S6502_AOT_CHAIN_FAST",
+    "S6502_AOT_TOKEN",
     "S6502_AOT_ZP_READ",
     "S6502_AOT_RAM_READ", "S6502_AOT_PAGE3_READ",
     "S6502_AOT_ZP16",
@@ -1206,7 +1280,9 @@ MACRO_NAMES = (
     "S6502_AOT_LDA_INDY", "S6502_AOT_LDA_ABSX",
     "S6502_AOT_STA_INDY", "S6502_AOT_STA_ABSX", "S6502_AOT_STA_ABSY",
     "S6502_AOT_AND", "S6502_AOT_AND_INDY",
-    "S6502_AOT_ORA", "S6502_AOT_ORA_ABSX", "S6502_AOT_EOR",
+    "S6502_AOT_ORA", "S6502_AOT_ORA_INDY", "S6502_AOT_ORA_ABSX",
+    "S6502_AOT_EOR",
+    "S6502_AOT_EOR_INDY",
     "S6502_AOT_COMPARE", "S6502_AOT_CLC",
     "S6502_AOT_SEC", "S6502_AOT_SEI", "S6502_AOT_TAX", "S6502_AOT_TAY",
     "S6502_AOT_TXA", "S6502_AOT_TYA", "S6502_AOT_TSX", "S6502_AOT_TXS",
@@ -1227,8 +1303,11 @@ MACRO_NAMES = (
     "S6502_AOT_SBC_INDY",
     "S6502_AOT_BRANCH", "S6502_AOT_BRANCH_TARGET",
     "S6502_AOT_BRANCH_FALL", "S6502_AOT_BRANCH_BOTH",
-    "S6502_AOT_JSR", "S6502_AOT_JSR_CHAIN",
+    "S6502_AOT_BRANCH_TOKEN_TARGET", "S6502_AOT_BRANCH_TOKEN_FALL",
+    "S6502_AOT_BRANCH_TOKEN_BOTH",
+    "S6502_AOT_JSR", "S6502_AOT_JSR_CHAIN", "S6502_AOT_JSR_TOKEN",
     "S6502_AOT_JMP", "S6502_AOT_JMP_INDIRECT", "S6502_AOT_JMP_CHAIN",
+    "S6502_AOT_JMP_TOKEN",
     "S6502_AOT_RTS", "S6502_AOT_RTI", "S6502_AOT_NOP",
 )
 
@@ -1237,18 +1316,23 @@ def chain_terminator(
     line: str, entries: dict[int, int], blocks: list[dict[str, object]],
     source: dict[str, object],
 ) -> str:
-    def entry_for(target: int) -> int | None:
+    def entry_for_any(target: int) -> int | None:
+        if target in HLE_ENTRY_PCS:
+            return None
+        return entries.get(target)
+
+    def entry_for_direct(target: int) -> int | None:
         target_id: int | None
 
-        if target in HLE_ENTRY_PCS:
+        target_id = entry_for_any(target)
+        if target_id is None:
             return None
         # Every direct edge still performs the same cycle/halt boundary check
         # as _exit.  Ambiguous physical mappings return through dispatch, and
         # every HLE entry above deliberately remains visible to its hook.
         if not source["chain_enabled"]:
             return None
-        target_id = entries.get(target)
-        if target_id is None or not blocks[target_id]["chain_enabled"]:
+        if not blocks[target_id]["chain_enabled"]:
             return None
         return target_id
 
@@ -1272,8 +1356,8 @@ def chain_terminator(
         condition, fall_text, target_text = branch.groups()
         fallthrough = int(fall_text, 16)
         target = int(target_text, 16)
-        fall_id = entry_for(fallthrough)
-        target_id = entry_for(target)
+        fall_id = entry_for_direct(fallthrough)
+        target_id = entry_for_direct(target)
         if fall_id is not None and target_id is not None:
             return (
                 f"S6502_AOT_BRANCH_BOTH({chain_for(fall_id)}, "
@@ -1293,6 +1377,24 @@ def chain_terminator(
                 f"0x{fallthrough:04x}u, "
                 f"0x{target:04x}u, {fall_id}u, _aot_{fall_id:02d});"
             )
+        fall_id = entry_for_any(fallthrough)
+        target_id = entry_for_any(target)
+        if fall_id is not None and target_id is not None:
+            return (
+                f"S6502_AOT_BRANCH_TOKEN_BOTH({condition}, "
+                f"0x{fallthrough:04x}u, 0x{target:04x}u, "
+                f"{fall_id}u, {target_id}u);"
+            )
+        if target_id is not None:
+            return (
+                f"S6502_AOT_BRANCH_TOKEN_TARGET({condition}, "
+                f"0x{fallthrough:04x}u, 0x{target:04x}u, {target_id}u);"
+            )
+        if fall_id is not None:
+            return (
+                f"S6502_AOT_BRANCH_TOKEN_FALL({condition}, "
+                f"0x{fallthrough:04x}u, 0x{target:04x}u, {fall_id}u);"
+            )
         return line
 
     jsr = re.fullmatch(
@@ -1300,24 +1402,35 @@ def chain_terminator(
     )
     if jsr:
         return_pc, target = (int(value, 16) for value in jsr.groups())
-        target_id = entry_for(target)
+        target_id = entry_for_direct(target)
         if target_id is not None:
             return (
                 f"S6502_AOT_JSR_CHAIN({chain_for(target_id)}, "
                 f"0x{return_pc:04x}u, 0x{target:04x}u, "
                 f"{target_id}u, _aot_{target_id:02d});"
             )
+        target_id = entry_for_any(target)
+        if target_id is not None:
+            return (
+                f"S6502_AOT_JSR_TOKEN(0x{return_pc:04x}u, "
+                f"0x{target:04x}u, {target_id}u);"
+            )
         return line
 
     jump = re.fullmatch(r"S6502_AOT_JMP\(0x([0-9a-f]+)u\);", line)
     if jump:
         target = int(jump.group(1), 16)
-        target_id = entry_for(target)
+        target_id = entry_for_direct(target)
         if target_id is not None:
             return (
                 f"S6502_AOT_JMP_CHAIN({chain_for(target_id)}, "
                 f"0x{target:04x}u, {target_id}u, "
                 f"_aot_{target_id:02d});"
+            )
+        target_id = entry_for_any(target)
+        if target_id is not None:
+            return (
+                f"S6502_AOT_JMP_TOKEN(0x{target:04x}u, {target_id}u);"
             )
     return line
 
@@ -1377,6 +1490,12 @@ def render(
                 1 if block["requires_bank2"] else 0,
             )
         )
+    out.extend(("};", "", "#elif defined(S6502_AOT_DEFINE_TOKEN_TABLE)", ""))
+    out.append(
+        "static void *const s6502_aot_token_table[S6502_AOT_BLOCK_COUNT] = {"
+    )
+    for index in range(len(blocks)):
+        out.append(f"    &&_aot_{index:02d},")
     out.extend(
         (
             "};",
@@ -1530,6 +1649,14 @@ def render(
         out.append(f"  _aot_{index:02d}:")
         if block["requires_binary"]:
             out.append("    if (DECIMAL_p) goto _next;")
+        if block["virtual_pc"] == 0x7C30 and all(
+            pc in entries for pc in (0x7C38, 0x7C47, 0x7C44, 0x7C4A)
+        ):
+            out.append(
+                "    S6502_AOT_NATIVE_TRACE_7C30("
+                f"{index}u, {entries[0x7C38]}u, {entries[0x7C47]}u, "
+                f"{entries[0x7C44]}u, {entries[0x7C4A]}u);"
+            )
         out.append(
             f"    S6502_AOT_HIT({index}u, {block['instruction_count']}u);"
         )
