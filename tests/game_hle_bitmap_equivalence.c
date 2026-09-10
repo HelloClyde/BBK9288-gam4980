@@ -92,6 +92,7 @@ int main(int argc, char **argv)
     for (match_index = 0u; match_index < bitmap_count; ++match_index) {
         const s6502_game_hle_bitmap_t *match =
             &s6502_game_hle_bitmaps[match_index];
+        printf("bitmap tables and=%x or=%x\n",match->and_table,match->or_table);
         u32 source;
         u32 subpixel;
         u32 x;
@@ -230,7 +231,7 @@ int main(int argc, char **argv)
                     (u8)((outer_case >> 4) & 0x1fu);
                 buffers.ram[match->destination_pointer_zp] = 0x00u;
                 buffers.ram[(u8)(match->destination_pointer_zp + 1u)] =
-                    0x04u;
+                    (outer_case & 1u) ? 0x34u : 0x04u;
                 buffers.ram[match->subpixel_zp] = 0u;
                 buffers.ram[match->width_zp] = (outer_case & 0x40u)
                     ? compared : 0xfcu;
@@ -457,5 +458,7 @@ int main(int argc, char **argv)
         outer_batch_hit_count, row_case_count,
         (unsigned)s6502_firmware_hle_path_hits[S6502_HLE_ID_GAME_BITMAP]
     );
+    if (!hle_bitmap_packed_groups) return 8;
+    printf("packed pixel groups=%u\n",hle_bitmap_packed_groups);
     return 0;
 }

@@ -37,6 +37,12 @@
     .equ CTX_NATIVE_METRICS,     76
     .equ CTX_READ8,              80
     .equ CTX_WRITE8,             84
+    .equ CTX_SAVED_FETCH,        100
+
+    .macro SAVE_FETCH
+    ext   CTX_SAVED_FETCH
+    ld.w  [%r0], %r2
+    .endm
 
     .equ PAGE_WRITE_DIRECT,      2
     .equ PAGE_FORCE_PB_ZERO,     8
@@ -130,6 +136,21 @@
  * special: 0..3 are DATA channels and 0x0c..0x0e are bank registers; both
  * ranges must retain the firmware slow path.  Other zero-page bytes are RAM.
  */
+    /* Known zero-page operands do not need the generic high-page lookup.
+     * Keep DATA $00..$03 and bank $0c..$0e on the exact slow path. */
+    .macro READ_ZP_VALUE slow
+    cmp   %r12, 14
+    jrugt .Lread_zp_ram_\@
+    cmp   %r12, 3
+    jrule \slow
+    cmp   %r12, 12
+    jruge \slow
+.Lread_zp_ram_\@:
+    ld.w  %r13, %r14
+    add   %r13, %r12
+    ld.ub %r12, [%r13]
+    .endm
+
     .macro MAP_READ_VALUE slow
     ld.w  %r13, %r12
     srl   %r13, 8
@@ -347,7 +368,6 @@ s6502_iram_exec_burst_asm:
     add   %r12, 1
     sll   %r12, 8
     or    %r9, %r12
-    jp    .Lfinish
 
 .Lfinish:
 s6502_iram_count_patch_finish:
@@ -358,7 +378,14 @@ s6502_iram_count_patch_finish:
     ext   255
     cmp   %r12, %r12
     jreq  .Ldispatch_page_tail
-    jp    .Ldispatch_fetch
+    /* Fuse the common completion with the next opcode dispatch. */
+    ld.ub %r12, [%r2]+
+    add   %r8, 1
+    sll   %r12, 1
+    ld.w  %r13, %r3
+    add   %r13, %r12
+    ld.uh %r13, [%r13]
+    jp    %r13
 
 /* R2 no longer contains host PC. */
 .Lfinish_remap:
@@ -408,6 +435,24 @@ s6502_iram_count_patch_reload:
     ld.w  %r3, s6502_iram_dispatch_table@l
     jp    .Lmap_fetch
 
+/* Selected data handlers saved the post-operand host PC before using R2/R3
+ * as scratch. RAM writes cannot change the code mapping on this guarded
+ * path; ordinary .Lfinish still handles xxff/page wrap before fetching. */
+.Lset_nz_restore_fetch:
+    ld.ub %r12, %r12
+    ld.ub %r9, %r9
+    add   %r12, 1
+    sll   %r12, 8
+    or    %r9, %r12
+.Lrestore_fetch:
+    ext   CTX_SAVED_FETCH
+    ld.w  %r2, [%r0]
+.Lreload_dispatch_finish:
+    ext   s6502_iram_dispatch_table@h
+    ext   s6502_iram_dispatch_table@m
+    ld.w  %r3, s6502_iram_dispatch_table@l
+    jp    .Lfinish
+
 .Lcontrol_reload:
     ext   s6502_iram_dispatch_table@h
     ext   s6502_iram_dispatch_table@m
@@ -448,7 +493,8 @@ s6502_iram_count_patch_control:
     jrne  .Lexit_dispatch
 
 .Lcontrol_native_check:
-#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+#if !defined(GAM4980_AUTHORED_FIRMWARE) && \
+    (defined(GAM4980_DYNAMIC_NATIVE_ALL) || defined(GAM4980_STATIC_NATIVE_GAME))
     /* Full-GAM packages publish a page entry even for PCs which were not in
      * the old bounded game-template table.  Ask the module switch after each
      * real guest control transfer; an absent block returns zero atomically
@@ -466,9 +512,8 @@ s6502_iram_count_patch_control:
     jrne  .Lexit_dispatch
     jp    .Lcontrol_continue
 #else
-    /* The true-device default has no pageable native modules.  Compile the
-     * bridge out of the resident overlay and spend the reclaimed IRAM on
-     * common 65C02 operations instead. */
+    /* Authored firmware uses exact bank-qualified dispatch bits above.
+     * Do not try a module at unrelated addresses on the same page. */
     jp    .Lcontrol_continue
 #endif
 
@@ -509,7 +554,8 @@ s6502_iram_count_patch_control:
     ld.w  %r12, EXIT_DEADLINE
     jp    .Lwriteback
 .Lexit_dispatch:
-#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+#if defined(GAM4980_DYNAMIC_NATIVE_ALL) || \
+    defined(GAM4980_STATIC_NATIVE_GAME)
     /* Pure native blocks live in a pageable arena in ordinary application
      * RAM.  CTX_NATIVE_ENTRY points at a 256-entry guest-page dispatch table;
      * an absent or evicted module leaves a zero entry and falls back to the
@@ -517,6 +563,111 @@ s6502_iram_count_patch_control:
      * the register-resident guest state before the call and reload it after.
      * R0-R3 are callee-saved and the first C argument is passed in R6. */
     call  .Lmaterialize_nz
+    /* Sparse exact-entry private ABI. Bank validation is one indexed halfword
+     * read, not a C gateway; only loaded callback-free leaves are published. */
+    ext   108
+    ld.w  %r13, [%r0]
+    cmp   %r13, 0
+    jreq  .Lregister_miss
+    ld.w  %r12, %r8
+    ext   255
+    and   %r12, %r12
+    sll   %r12, 4
+    add   %r13, %r12
+    ld.w  %r12, [%r13]
+    cmp   %r12, %r8
+    jrne  .Lregister_miss
+.Lregister_validate_bank:
+    ext   112
+    ld.w  %r2, [%r0]
+    ld.w  %r12, %r8
+    srl   %r12, 8
+    srl   %r12, 4
+    sll   %r12, 1
+    add   %r2, %r12
+    ld.uh %r2, [%r2]
+    ext   4
+    ld.w  %r12, [%r13]
+    cmp   %r2, %r12
+    jrne  .Lregister_miss
+    /* Pin pageable code across callbacks. At a control boundary the saved
+     * operand-fetch slot is dead; reuse it for the pin pointer. */
+    ext   12
+    ld.w  %r2, [%r13]
+    cmp   %r2, 0
+    jreq  .Lregister_pin_done
+    ld.w  %r12, [%r2]
+    add   %r12, 1
+    ld.w  [%r2], %r12
+    ld.w  %r12, 1
+    ext   4
+    ld.w  [%r2], %r12
+.Lregister_pin_done:
+    ext   8
+    ld.w  %r13, [%r13]
+    cmp   %r13, 0
+    jreq  .Lregister_unpin_miss
+    ext   CTX_SAVED_FETCH
+    ld.w  [%r0], %r2
+    call  %r13
+    ext   CTX_SAVED_FETCH
+    ld.w  %r2, [%r0]
+    cmp   %r2, 0
+    jreq  .Lregister_unpin_done
+    ld.w  %r3, [%r2]
+    sub   %r3, 1
+    ld.w  [%r2], %r3
+.Lregister_unpin_done:
+    cmp   %r12, 0
+    jreq  .Lregister_rejected
+    ext   116
+    ld.w  %r12, [%r0]
+    add   %r12, 1
+    ext   116
+    ld.w  [%r0], %r12
+    /* Resident native successor: stay in the register ABI instead of
+     * reloading the opcode table and probing the general dispatch bitmap. */
+    ext   CTX_CYCLE_BUDGET
+    ld.w  %r12, [%r0]
+    cmp   %r10, %r12
+    jruge .Lcontrol_reload
+    ext   512
+    ld.ub %r12, [%r14]
+    and   %r12, 8
+    cmp   %r12, 0
+    jrne  .Lcontrol_reload
+    ext   108
+    ld.w  %r13, [%r0]
+    cmp   %r13, 0
+    jreq  .Lcontrol_reload
+    ld.w  %r12, %r8
+    ext   255
+    and   %r12, %r12
+    sll   %r12, 4
+    add   %r13, %r12
+    ld.w  %r12, [%r13]
+    cmp   %r12, %r8
+    jrne  .Lcontrol_reload
+s6502_iram_count_patch_native_chain:
+    add   %r11, 1
+    ext   CTX_CONTROL_TRANSITIONS
+    ld.w  %r12, [%r0]
+    add   %r12, 1
+    ext   CTX_CONTROL_TRANSITIONS
+    ld.w  [%r0], %r12
+    jp    .Lregister_validate_bank
+.Lregister_rejected:
+    /* This exact native contract already declined the unchanged state.
+     * Do not retry the same function through its C wrapper and fastchain. */
+    ld.w  %r12, EXIT_SLOW
+    jp    .Lwriteback
+.Lregister_unpin_miss:
+    cmp   %r2, 0
+    jreq  .Lregister_miss
+    ld.w  %r12, [%r2]
+    sub   %r12, 1
+    ld.w  [%r2], %r12
+.Lregister_miss:
     ext   CTX_NATIVE_ENTRY
     ld.w  %r13, [%r0]
     cmp   %r13, 0
@@ -713,18 +864,16 @@ s6502_iram_count_patch_control:
     jreq  .Lsuper_add16
     jp    .Lexit_slow1
 
-/* LDA #lo; STA zp; LDA #hi; STA zp+1 (OPER1=$20 / OPER2=$23). */
+/* LDA #lo; STA zp; LDA #hi; STA zp+1.
+ *
+ * The shadow builder has already proved that both destination bytes are
+ * adjacent and do not wrap at $ff.  This is a C6502-wide compiler phrase,
+ * not only the OPER1/OPER2 ABI form, so runtime no longer rejects other
+ * zero-page words here. */
 .Lsuper_imm16:
     ld.ub %r3, [%r13]+
     add   %r13, 1
     ld.ub %r2, [%r13]+
-    ext   0x20
-    cmp   %r2, %r2
-    jreq  .Lsuper_imm16_dest_ok
-    ext   0x23
-    cmp   %r2, %r2
-    jrne  .Lexit_slow1
-.Lsuper_imm16_dest_ok:
     add   %r13, 1
     ld.ub %r4, [%r13]
     ld.w  %r13, %r14
@@ -929,7 +1078,7 @@ s6502_iram_count_patch_super_add16:
 /* LDA zero page. */
 .LopA5:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     ld.w  %r4, %r12
     add   %r10, 3
     jp    .Lset_nz_finish
@@ -937,7 +1086,7 @@ s6502_iram_count_patch_super_add16:
 /* ORA/AND zero page. */
 .Lop05:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     or    %r4, %r12
     ld.ub %r4, %r4
     ld.w  %r12, %r4
@@ -946,7 +1095,7 @@ s6502_iram_count_patch_super_add16:
 
 .Lop25:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     and   %r4, %r12
     ld.w  %r12, %r4
     add   %r10, 3
@@ -965,21 +1114,33 @@ s6502_iram_count_patch_super_add16:
     FETCH8
     ld.w  %r3, %r5
 .Lstore_zp:
+    /* Compiler temporaries $20..$ff are unaliased RAM: no page lookup,
+     * display dirty check, or fetch-pointer save/restore is necessary. */
+    ext   32
+    cmp   %r12, %r12
+    jrult .Lstore_zp_special
+    ld.w  %r13, %r14
+    add   %r13, %r12
+    ld.b  [%r13], %r3
+    add   %r10, 3
+    jp    .Lreload_dispatch_finish
+.Lstore_zp_special:
+    SAVE_FETCH
     MAP_WRITE_POINTER .Lexit_slow2
     STORE_MAPPED_VALUE
     add   %r10, 3
-    jp    .Lfinish_reload
+    jp    .Lrestore_fetch
 
 /* LDX/LDY zero page. */
 .LopA4:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     ld.w  %r6, %r12
     add   %r10, 3
     jp    .Lset_nz_finish
 .LopA6:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     ld.w  %r5, %r12
     add   %r10, 3
     jp    .Lset_nz_finish
@@ -1033,16 +1194,20 @@ s6502_iram_count_patch_super_add16:
     ld.uh %r12, %r12               /* effective */
     xor   %r13, %r12
     srl   %r13, 8
-    ld.w  %r2, 0
+    ld.w  %r3, 0
     cmp   %r13, 0
     jreq  .Llda_abs_no_cross
-    ld.w  %r2, 1
+    ld.w  %r3, 1
 .Llda_abs_no_cross:
     MAP_READ_VALUE .Lexit_slow3
     ld.w  %r4, %r12
     add   %r10, 4
-    add   %r10, %r2
-    jp    .Lset_nz_reload
+    add   %r10, %r3
+    /* The read mapper does not clobber R2: retain the host fetch pointer. */
+    ext   s6502_iram_dispatch_table@h
+    ext   s6502_iram_dispatch_table@m
+    ld.w  %r3, s6502_iram_dispatch_table@l
+    jp    .Lset_nz_finish
 
 /* ADC/SBC absolute,X share address resolution and the read page penalty.
  * Decimal arithmetic stays in the complete C engine.  R3 selects ADC/SBC
@@ -1058,6 +1223,7 @@ s6502_iram_count_patch_super_add16:
     cmp   %r12, 0
     jrne  .Lexit_slow1
     FETCH16 .Lexit_slow1
+    SAVE_FETCH
     ld.w  %r13, %r12               /* base */
     add   %r12, %r5
     ld.uh %r12, %r12               /* effective */
@@ -1072,19 +1238,20 @@ s6502_iram_count_patch_super_add16:
     add   %r10, 4
     add   %r10, %r2
     cmp   %r3, 2
-    jrne  .Lbinary_add
+    jrne  .Lbinary_add_saved
     ext   255
     xor   %r12, %r12
-    jp    .Lbinary_add
+    jp    .Lbinary_add_saved
 
 .Lop8D:
     FETCH16 .Lexit_slow1
     ld.w  %r3, %r4
 .Lstore_abs:
+    SAVE_FETCH
     MAP_WRITE_POINTER .Lexit_slow3
     STORE_MAPPED_VALUE
     add   %r10, 4
-    jp    .Lfinish_reload
+    jp    .Lrestore_fetch
 .Lop8E:
     FETCH16 .Lexit_slow1
     ld.w  %r3, %r5
@@ -1093,13 +1260,14 @@ s6502_iram_count_patch_super_add16:
 /* STA absolute,X.  The indexed store has no page-cross cycle penalty. */
 .Lop9D:
     FETCH16 .Lexit_slow1
+    SAVE_FETCH
     add   %r12, %r5
     ld.uh %r12, %r12
     ld.w  %r3, %r4
     MAP_WRITE_POINTER .Lexit_slow3
     STORE_MAPPED_VALUE
     add   %r10, 5
-    jp    .Lfinish_reload
+    jp    .Lrestore_fetch
 
 /* LDA/ADC/SBC/STA (zero page),Y share pointer validation and indexing. */
 .LopB1:
@@ -1127,6 +1295,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, 3                    /* STA */
 
 .Lindy_resolve:
+    SAVE_FETCH
     cmp   %r12, 3
     jrule .Lexit_slow2
     ext   255
@@ -1162,19 +1331,19 @@ s6502_iram_count_patch_super_add16:
     cmp   %r3, 0
     jrne  .Lindy_arithmetic
     ld.w  %r4, %r12
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 .Lindy_arithmetic:
     cmp   %r3, 2
-    jrne  .Lbinary_add
+    jrne  .Lbinary_add_saved
     ext   255
     xor   %r12, %r12
-    jp    .Lbinary_add
+    jp    .Lbinary_add_saved
 .Lindy_store:
     ld.w  %r3, %r4
     MAP_WRITE_POINTER .Lexit_slow2
     STORE_MAPPED_VALUE
     add   %r10, 6
-    jp    .Lfinish_reload
+    jp    .Lrestore_fetch
 
 /* JSR absolute, JMP absolute, RTS. */
 .Lop20:
@@ -1233,13 +1402,43 @@ s6502_iram_count_patch_super_add16:
     jp    .Lcontrol_complete
 
 /* Conditional branches share the relative branch body. */
-.LopD0:
-    call  .Lmaterialize_nz
+    /* Read lazy flags without publishing the entire status byte.  Calls and
+     * host arithmetic clobber PSR, so persistent guest flags remain in R9. */
+    .macro BRANCH_ZERO lazy_taken, real_taken
+    ld.w  %r13, %r9
+    srl   %r13, 8
+    cmp   %r13, 0
+    jreq  .Lzero_real_\@
+    cmp   %r13, 1
+    \lazy_taken .Lbranch_taken
+    jp    .Lbranch_not_taken
+.Lzero_real_\@:
     ld.w  %r13, %r9
     and   %r13, FLAG_Z
     cmp   %r13, 0
-    jreq  .Lbranch_taken
+    \real_taken .Lbranch_taken
     jp    .Lbranch_not_taken
+    .endm
+
+    .macro BRANCH_NEGATIVE taken
+    ld.w  %r13, %r9
+    srl   %r13, 8
+    cmp   %r13, 0
+    jreq  .Lnegative_real_\@
+    sub   %r13, 1
+    jp    .Lnegative_test_\@
+.Lnegative_real_\@:
+    ld.w  %r13, %r9
+.Lnegative_test_\@:
+    ext   FLAG_N
+    and   %r13, %r13
+    cmp   %r13, 0
+    \taken .Lbranch_taken
+    jp    .Lbranch_not_taken
+    .endm
+
+.LopD0:
+    BRANCH_ZERO jrne, jreq
 .Lop90:
     ld.w  %r13, %r9
     and   %r13, FLAG_C
@@ -1254,19 +1453,9 @@ s6502_iram_count_patch_super_add16:
     jreq  .Lbranch_taken
     jp    .Lbranch_not_taken
 .Lop30:
-    call  .Lmaterialize_nz
-    ld.w  %r13, %r9
-    ext   FLAG_N
-    and   %r13, %r13
-    cmp   %r13, 0
-    jrne  .Lbranch_taken
-    jp    .Lbranch_not_taken
+    BRANCH_NEGATIVE jrne
 .LopF0:
-    call  .Lmaterialize_nz
-    ld.w  %r13, %r9
-    and   %r13, FLAG_Z
-    cmp   %r13, 0
-    jrne  .Lbranch_taken
+    BRANCH_ZERO jreq, jrne
 .Lbranch_not_taken:
     ld.ub %r12, [%r2]+
     add   %r8, 1
@@ -1488,7 +1677,7 @@ s6502_iram_count_patch_super_add16:
     cmp   %r12, 0
     jrne  .Lexit_slow1
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     add   %r10, 3
     jp    .Lbinary_add
 .LopE5:
@@ -1497,13 +1686,15 @@ s6502_iram_count_patch_super_add16:
     cmp   %r12, 0
     jrne  .Lexit_slow1
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     ext   255
     xor   %r12, %r12
     add   %r10, 3
 
 /* Operand (or complemented SBC operand) is in R12. */
 .Lbinary_add:
+    SAVE_FETCH
+.Lbinary_add_saved:
     ld.w  %r2, %r12               /* original arithmetic operand */
     ld.w  %r13, %r9
     and   %r13, FLAG_C
@@ -1529,7 +1720,7 @@ s6502_iram_count_patch_super_add16:
     or    %r9, %r3
     ld.w  %r4, %r13
     ld.w  %r12, %r4
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* CMP/CPX/CPY share one unsigned subtract flag tail. */
 .LopC0:
@@ -1550,7 +1741,7 @@ s6502_iram_count_patch_super_add16:
     jp    .Lcompare_value
 .LopC5:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     add   %r10, 3
     ld.w  %r13, %r4
     jp    .Lcompare_value
@@ -1561,77 +1752,73 @@ s6502_iram_count_patch_super_add16:
     jp    .Lcompare_value
 .LopC4:
     FETCH8
-    MAP_READ_VALUE .Lexit_slow2
+    READ_ZP_VALUE .Lexit_slow2
     add   %r10, 3
     ld.w  %r13, %r6
 .Lcompare_value:
-    ld.w  %r2, %r12               /* right */
-    ld.w  %r3, %r13               /* original left */
-    sub   %r13, %r12
-    ld.ub %r13, %r13
     ext   254                      /* clear carry; N/Z tail follows */
     and   %r9, %r9
-    cmp   %r3, %r2
+    cmp   %r13, %r12
     jrult .Lcmp_no_carry
     or    %r9, FLAG_C
 .Lcmp_no_carry:
+    sub   %r13, %r12
     ld.w  %r12, %r13
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_finish
 
 /* ASL/ROL/LSR/ROR/DEC/INC read-modify-write family.  R3 packs op:cycles. */
 .Lop06:
     FETCH8
     ld.w  %r3, 5                    /* ASL, 5 cycles */
-    MAP_WRITE_POINTER .Lexit_slow2
-    jp    .Lrmw_mapped
+    jp    .Lrmw_zp_map
 .Lop0E:
     FETCH16 .Lexit_slow1
     ld.w  %r3, 6                    /* ASL, 6 cycles */
-    MAP_WRITE_POINTER .Lexit_slow3
-    jp    .Lrmw_mapped
+    jp    .Lrmw_abs_map
 .Lop2E:
     FETCH16 .Lexit_slow1
     ext   4
     ld.w  %r3, 6                    /* ROL, 6 cycles */
-    MAP_WRITE_POINTER .Lexit_slow3
-    jp    .Lrmw_mapped
+    jp    .Lrmw_abs_map
 .LopCE:
     FETCH16 .Lexit_slow1
     ext   8
     ld.w  %r3, 6                    /* DEC, 6 cycles */
-    MAP_WRITE_POINTER .Lexit_slow3
-    jp    .Lrmw_mapped
+    jp    .Lrmw_abs_map
 .Lop4E:
     FETCH16 .Lexit_slow1
     ext   12
     ld.w  %r3, 6                    /* LSR, 6 cycles */
-    MAP_WRITE_POINTER .Lexit_slow3
-    jp    .Lrmw_mapped
+    jp    .Lrmw_abs_map
 .Lop6E:
     FETCH16 .Lexit_slow1
     ext   16
     ld.w  %r3, 6                    /* ROR, 6 cycles */
-    MAP_WRITE_POINTER .Lexit_slow3
-    jp    .Lrmw_mapped
+    jp    .Lrmw_abs_map
 .LopE6:
     FETCH8
     ext   20
     ld.w  %r3, 5                    /* INC, 5 cycles */
-    MAP_WRITE_POINTER .Lexit_slow2
-    jp    .Lrmw_mapped
+    jp    .Lrmw_zp_map
 .LopEE:
     FETCH16 .Lexit_slow1
     ext   20
     ld.w  %r3, 6                    /* INC, 6 cycles */
-    MAP_WRITE_POINTER .Lexit_slow3
-    jp    .Lrmw_mapped
+    jp    .Lrmw_abs_map
 .Lop26:
     FETCH8
     ext   4
     ld.w  %r3, 5                    /* ROL, 5 cycles */
-    MAP_WRITE_POINTER .Lexit_slow2
-    jp    .Lrmw_mapped
+    jp    .Lrmw_zp_map
 
+#ifdef GAM4980_IRAM_STATIC_COMPACT
+    /* The static native bridge consumes a small fixed part of the 5.8 KiB
+     * overlay.  These uncommon indexed RMW forms remain exact through the C
+     * fallback, while linked game banks execute them natively. */
+    .set .Lop1E, .Lslow_opcode
+    .set .Lop3E, .Lslow_opcode
+    .set .LopDE, .Lslow_opcode
+#else
 .Lop1E:
     FETCH16 .Lexit_slow1
     ld.w  %r3, 6                    /* ASL abs,X, 6 + page cross */
@@ -1641,6 +1828,7 @@ s6502_iram_count_patch_super_add16:
     ext   4
     ld.w  %r3, 6                    /* ROL abs,X, 6 + page cross */
 .Lrmw_abs_x_cross:
+    SAVE_FETCH
     ld.w  %r13, %r12               /* base */
     add   %r12, %r5
     ld.uh %r12, %r12
@@ -1655,9 +1843,20 @@ s6502_iram_count_patch_super_add16:
     FETCH16 .Lexit_slow1
     ext   8
     ld.w  %r3, 7                    /* DEC abs,X, fixed 7 cycles */
+    SAVE_FETCH
     add   %r12, %r5
     ld.uh %r12, %r12
 .Lrmw_abs_x_map:
+    jp    .Lrmw_abs_map_saved
+#endif
+
+.Lrmw_zp_map:
+    SAVE_FETCH
+    MAP_WRITE_POINTER .Lexit_slow2
+    jp    .Lrmw_mapped
+.Lrmw_abs_map:
+    SAVE_FETCH
+.Lrmw_abs_map_saved:
     MAP_WRITE_POINTER .Lexit_slow3
 
 .Lrmw_mapped:
@@ -1696,7 +1895,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, %r12
     STORE_MAPPED_VALUE 1
     ld.w  %r12, %r3
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* ASL memory. */
 .Lrmw_asl:
@@ -1713,7 +1912,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, %r12
     STORE_MAPPED_VALUE 1
     ld.w  %r12, %r3
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* LSR memory. */
 .Lrmw_lsr:
@@ -1727,7 +1926,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, %r12
     STORE_MAPPED_VALUE 1
     ld.w  %r12, %r3
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* ROR memory. */
 .Lrmw_ror:
@@ -1746,7 +1945,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, %r12
     STORE_MAPPED_VALUE 1
     ld.w  %r12, %r3
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* DEC memory does not alter carry. */
 .Lrmw_dec:
@@ -1756,7 +1955,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, %r12
     STORE_MAPPED_VALUE 1
     ld.w  %r12, %r3
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* INC memory does not alter carry. */
 .Lrmw_inc:
@@ -1766,7 +1965,7 @@ s6502_iram_count_patch_super_add16:
     ld.w  %r3, %r12
     STORE_MAPPED_VALUE 1
     ld.w  %r12, %r3
-    jp    .Lset_nz_reload
+    jp    .Lset_nz_restore_fetch
 
 /* Cheap second-tier neighbours. */
 .Lop78:
@@ -1783,13 +1982,7 @@ s6502_iram_count_patch_super_add16:
     jrne  .Lbranch_taken
     jp    .Lbranch_not_taken
 .Lop10:
-    call  .Lmaterialize_nz
-    ld.w  %r13, %r9
-    ext   128
-    and   %r13, %r13
-    cmp   %r13, 0
-    jreq  .Lbranch_taken
-    jp    .Lbranch_not_taken
+    BRANCH_NEGATIVE jreq
 
 /* Every unsupported table entry lands here immediately after opcode fetch. */
 .Lslow_opcode:
@@ -1901,6 +2094,9 @@ s6502_iram_count_patch_offsets:
     .long s6502_iram_count_patch_remap - s6502_iram_exec_burst_asm
     .long s6502_iram_count_patch_reload - s6502_iram_exec_burst_asm
     .long s6502_iram_count_patch_control - s6502_iram_exec_burst_asm
+#if defined(GAM4980_DYNAMIC_NATIVE_ALL) || defined(GAM4980_STATIC_NATIVE_GAME)
+    .long s6502_iram_count_patch_native_chain - s6502_iram_exec_burst_asm
+#endif
 #ifndef GAM4980_IRAM_V2
     .long s6502_iram_count_patch_super_imm16 - s6502_iram_exec_burst_asm
     .long s6502_iram_count_patch_super_stack16 - s6502_iram_exec_burst_asm
@@ -1908,4 +2104,35 @@ s6502_iram_count_patch_offsets:
 #endif
     .size s6502_iram_count_patch_offsets, .-s6502_iram_count_patch_offsets
 
+#if defined(GAM4980_ENABLE_AOT) || defined(GAM4980_NATIVE_PROFILE_TEST)
+    /* External RAM only; selected by the sampled dispatch table. The normal
+     * IRAM call site and non-sampled private ABI path are unchanged. */
+    .section .text.gam4980_native_profile_trampoline,"ax",@progbits
+    .p2align 2
+    .globl gam4980_native_profile_trampoline
+    .type gam4980_native_profile_trampoline,@function
+gam4980_native_profile_trampoline:
+    sub %sp, 12
+    pushn %r15
+    ld.w %r6, %r0
+    ld.w %r7, %r8
+    ld.w %r8, %sp
+    add %r8, 32
+    add %r8, 32
+    call gam4980_native_profile_begin
+    popn %r15
+    ld.w %r13, %sp
+    ld.w %r13, [%r13]
+    call %r13
+    pushn %r15
+    ld.w %r6, %sp
+    add %r6, 32
+    add %r6, 32
+    ld.w %r7, %r12
+    call gam4980_native_profile_end
+    popn %r15
+    add %sp, 12
+    ret
+    .size gam4980_native_profile_trampoline, .-gam4980_native_profile_trampoline
+#endif
     .section ".note.GNU-stack","",@progbits

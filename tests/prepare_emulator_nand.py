@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 from pathlib import Path
 import shutil
@@ -45,7 +46,7 @@ def main() -> None:
         preserve_case=True,
         read_only=False,
     )
-    installed: list[tuple[str, int]] = []
+    installed: list[tuple[str, int, str]] = []
     try:
         paths = sorted(
             args.source.rglob("*"),
@@ -67,7 +68,8 @@ def main() -> None:
                     fat.remove(target)
                 with source.open("rb") as src, fat.openbin(target, "w") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
-                installed.append((target, source.stat().st_size))
+                installed.append((target, source.stat().st_size,
+                                  hashlib.sha256(source.read_bytes()).hexdigest()))
     finally:
         fat.close()
 
@@ -81,12 +83,16 @@ def main() -> None:
     )
     try:
         kernel_size = verify.getsize("/kernel.bin")
-        for target, expected_size in installed:
+        for target, expected_size, expected_hash in installed:
             actual_size = verify.getsize(target)
             if actual_size != expected_size:
                 raise RuntimeError(
                     f"size mismatch for {target}: {actual_size} != {expected_size}"
                 )
+            actual_hash = hashlib.sha256(verify.readbytes(target)).hexdigest()
+            if actual_hash != expected_hash:
+                raise RuntimeError(f"content hash mismatch for {target}")
+            print(f"verified {target}: {actual_size} bytes SHA256={actual_hash}")
     finally:
         verify.close()
 

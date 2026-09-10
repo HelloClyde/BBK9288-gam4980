@@ -32,7 +32,12 @@ def capture(command: list[str]) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdk", type=Path, required=True)
+    parser.add_argument('--compiled-registers', action='store_true')
+    parser.add_argument('--atomic-contracts', action='store_true')
+    parser.add_argument('--profile-private', action='store_true')
     parser.add_argument("--toolchain", type=Path, required=True)
+    parser.add_argument("--engine-source", type=Path,
+                        default=ROOT / "src" / "s6502_iram_asm.S")
     parser.add_argument(
         "--output",
         type=Path,
@@ -67,6 +72,7 @@ def main() -> None:
         "-Wextra",
         "-Werror",
         "-Wno-unused-function",
+        "-Wno-nonportable-include-path",
         "-Wno-pointer-to-int-cast",
         "-Wno-int-to-pointer-cast",
         "-DDL_DOWN",
@@ -83,9 +89,44 @@ def main() -> None:
     sources = [
         ROOT / "src" / "gam4980_9288_start.c",
         ROOT / "src" / "gam4980_9288_runtime.c",
-        ROOT / "src" / "s6502_iram_asm.S",
+        args.engine_source.resolve(),
         ROOT / "tests" / "9288_iram_super_equivalence.c",
     ]
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import native_register_abi
+    from build_firmware_native import specialize_source
+    register_source = BUILD / 'register_leaves.c'
+    if not args.compiled_registers:
+        register_source.write_text('\n'.join(native_register_abi.source('eq_' + hex(pc)[2:], pc, atomic=args.atomic_contracts)
+            for pc in sorted(native_register_abi.ENTRIES)), encoding='utf-8')
+        sources += [register_source]
+    original = (ROOT / 'src' / 'firmware_native_runtime.c').read_text(encoding='utf-8')
+    for pc in sorted(native_register_abi.ENTRIES):
+        from native_register_codegen import bridge_source
+        adapter = BUILD / ('bridge_' + hex(pc)[2:] + '.S')
+        adapter.write_text(bridge_source('bridge_'+hex(pc)[2:], None, 0,
+            external_target='eq_'+hex(pc)[2:]+'_register',
+            record_metrics=not args.compiled_registers), encoding='utf-8')
+        sources.append(adapter)
+        reference, symbol = specialize_source(original, 'runtime', pc)
+        if args.atomic_contracts:
+            import native_atomic_contracts
+            reference = native_atomic_contracts.lower(reference, 'runtime', pc)
+        reference_path = BUILD / (symbol + '.c')
+        reference_path.write_text(reference, encoding='utf-8')
+        sources.append(reference_path)
+        if args.compiled_registers:
+            from native_register_codegen import lower
+            generated = lower(reference, symbol).replace(symbol + '_register', 'eq_' + hex(pc)[2:] + '_register')
+            generated_path = BUILD / ('compiled_' + hex(pc)[2:] + '.c')
+            generated_path.write_text(generated, encoding='utf-8')
+            sources.append(generated_path)
+    flags.append('-DGAM4980_DYNAMIC_NATIVE_ALL')
+    if args.profile_private:
+        flags.append('-DGAM4980_NATIVE_PROFILE_TEST')
+    if args.atomic_contracts:
+        # Old instruction-cost expressions are intentionally dead after lowering.
+        flags.append('-Wno-unused-but-set-variable')
     objects: list[Path] = []
     for source in sources:
         output = BUILD / f"{source.stem}.o"

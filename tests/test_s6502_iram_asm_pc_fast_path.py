@@ -141,11 +141,13 @@ class IramAsmPcFastPathTest(unittest.TestCase):
             (".Lop30:", ".LopF0:"),
             (".LopF0:", ".Lbranch_not_taken:"),
             (".Lop10:", ".Lslow_opcode:"),
-            (".Lop08:", ".Lop68:"),
         ):
-            self.assertIn("call  .Lmaterialize_nz", between(
-                self.source, start, end
-            ))
+            branch = between(self.source, start, end)
+            self.assertIn("BRANCH_", branch)
+            self.assertNotIn("call  .Lmaterialize_nz", branch)
+        self.assertIn("call  .Lmaterialize_nz", between(
+            self.source, ".Lop08:", ".Lop68:"
+        ))
         writeback = between(self.source, ".Lwriteback:", ".Lreturn:")
         self.assertIn("call  .Lmaterialize_nz", writeback)
         self.assertIn("ld.w  [%r0], %r11", writeback)

@@ -178,9 +178,14 @@ def emit(
         ("FAR_CALL", 11,
          "a2 00 86 26 a2 00 86 27 20 f6 d2",
          "ff 00 ff ff ff 00 ff ff ff ff ff"),
+        # The compiler uses the same four-instruction phrase for every
+        # 16-bit immediate store, not only for the ABI's OPER1 temporary.
+        # Both destination bytes are relocatable here; the runtime matcher
+        # additionally requires the second byte to be dst+1 (without a
+        # zero-page wrap) before publishing the superinstruction.
         ("LOAD_OPER1_IMM16", 8,
-         "a9 00 85 20 a9 00 85 21",
-         "ff 00 ff ff ff 00 ff ff"),
+         "a9 00 85 00 a9 00 85 00",
+         "ff 00 ff 00 ff 00 ff 00"),
         ("LOAD_OPER2_IMM16", 8,
          "a9 00 85 23 a9 00 85 24",
          "ff 00 ff ff ff 00 ff ff"),
@@ -212,6 +217,42 @@ def emit(
         ("STORE_OPER1_INDY16", 11,
          "a0 00 a5 20 91 00 c8 a5 21 91 00",
          "ff 00 ff ff ff 00 ff ff ff ff 00"),
+        ("ADD16_IMM_GENERIC", 13,
+         "18 a5 00 69 00 85 00 a5 00 69 00 85 00",
+         "ff ff 00 ff 00 ff 00 ff 00 ff 00 ff 00"),
+        ("SUB16_IMM_GENERIC", 13,
+         "38 a5 00 e9 00 85 00 a5 00 e9 00 85 00",
+         "ff ff 00 ff 00 ff 00 ff 00 ff 00 ff 00"),
+        ("ADD16_PRESERVE_GENERIC", 16,
+         "08 78 18 a5 00 69 00 85 00 a5 00 69 00 85 00 28",
+         "ff ff ff ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff"),
+        ("SUB16_PRESERVE_GENERIC", 16,
+         "08 78 38 a5 00 e9 00 85 00 a5 00 e9 00 85 00 28",
+         "ff ff ff ff 00 ff 00 ff 00 ff 00 ff 00 ff 00 ff"),
+        ("ADD16_REGS_GENERIC", 13,
+         "18 a5 00 65 00 85 00 a5 00 65 00 85 00",
+         "ff ff 00 ff 00 ff 00 ff 00 ff 00 ff 00"),
+        ("SUB16_REGS_GENERIC", 13,
+         "38 a5 00 e5 00 85 00 a5 00 e5 00 85 00",
+         "ff ff 00 ff 00 ff 00 ff 00 ff 00 ff 00"),
+        ("STORE16_IMM_GENERIC", 8,
+         "a9 00 85 00 a9 00 85 00",
+         "ff 00 ff 00 ff 00 ff 00"),
+        ("COPY16_GENERIC", 8,
+         "a5 00 85 00 a5 00 85 00",
+         "ff 00 ff 00 ff 00 ff 00"),
+        ("LOAD16_INDIRECT_GENERIC", 11,
+         "a0 00 b1 00 85 00 c8 b1 00 85 00",
+         "ff 00 ff 00 ff 00 ff ff 00 ff 00"),
+        ("STORE16_INDIRECT_GENERIC", 11,
+         "a0 00 a5 00 91 00 c8 a5 00 91 00",
+         "ff 00 ff 00 ff 00 ff ff 00 ff 00"),
+        ("LOAD_STACK8_GENERIC", 4,
+         "a0 00 b1 28",
+         "ff 00 ff ff"),
+        ("STORE_STACK8_GENERIC", 4,
+         "a0 00 91 28",
+         "ff 00 ff ff"),
     ]
     far_call_count = listing_text.lower().count(".bf_call")
     c_start_count = listing_text.lower().count(".c_start")
@@ -319,9 +360,19 @@ def emit(
         "#define C6502_TEMPLATE_SPEC_COUNT "
         "((uint32_t)(sizeof(c6502_template_specs) / sizeof(c6502_template_specs[0])))",
         "",
-        "#endif",
-        "",
     ]
+    if len(templates) > 32:
+        raise ValueError('template first-byte index needs more than 32 bits')
+    out.append('static const uint32_t c6502_template_first_index[256] = {')
+    for opcode in range(256):
+        bits = 0
+        for index, (_, _, byte_text, mask_text) in enumerate(templates):
+            first = int(byte_text.split()[0], 16)
+            mask = int(mask_text.split()[0], 16)
+            if opcode & mask == first & mask:
+                bits |= 1 << index
+        out.append(f'    0x{bits:08x}u,')
+    out += ['};', '', '#endif', '']
     return "\n".join(out)
 
 

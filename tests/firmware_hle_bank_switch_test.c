@@ -10,6 +10,24 @@
 #define GAM4980_FIRMWARE_HLE_MASK 0x80u
 #include "../src/gam4980_core.c"
 
+typedef struct {
+    uint32_t pc,ac,ix,iy,sp,status,cycle_budget,cycles;
+    uintptr_t ram,read8,write8,graphics;
+} host_fw_context;
+#ifdef FW_NATIVE_BANK_TEST_SERVICES
+typedef struct {uint32_t version;uintptr_t bank_map4,bank_descriptor_safe,bank_metrics;} host_bank_services;
+static host_bank_services test_bank_services={5,(uintptr_t)native_bank_map4,(uintptr_t)native_bank_descriptor_safe,(uintptr_t)native_bank_metrics};
+#define firmware_native_graphics_services_t host_bank_services
+#endif
+#define FIRMWARE_NATIVE_HOST_TEST
+#define s6502_iram_asm_context_t host_fw_context
+#include "../src/firmware_native_bank.c"
+#ifdef FW_NATIVE_BANK_TEST_SERVICES
+#undef firmware_native_graphics_services_t
+#endif
+#undef s6502_iram_asm_context_t
+#undef FIRMWARE_NATIVE_HOST_TEST
+
 #define TEST_CASES 10000u
 
 static uint32_t random_state = 0xf52a9288u;
@@ -89,6 +107,21 @@ static int compare_hle(
     memcpy(sys.ram, initial_ram, GAM4980_RAM_SIZE);
     restore_banks(initial_banks, initial_selected);
     sys.cpu = initial_cpu;
+    {
+        host_fw_context c={0};
+        c.pc=initial_cpu.pc;c.ac=initial_cpu.ac;c.ix=initial_cpu.ix;c.iy=initial_cpu.iy;
+        c.sp=initial_cpu.sp;c.status=initial_cpu.status;c.cycle_budget=cycles+2u;
+        c.ram=(uintptr_t)sys.ram;c.read8=(uintptr_t)mem_read;c.write8=(uintptr_t)mem_write;
+        if(firmware_native_bank(&c)!=cycles || c.pc!=reference_cpu.pc ||
+           c.ac!=reference_cpu.ac || c.ix!=reference_cpu.ix || c.iy!=reference_cpu.iy ||
+           c.sp!=reference_cpu.sp || c.status!=reference_cpu.status ||
+           memcmp(sys.ram,reference_ram,GAM4980_RAM_SIZE) ||
+           memcmp(sys.bk_tab,reference_banks,sizeof(reference_banks)) ||
+           sys.bk_sel!=reference_selected){
+            fprintf(stderr,"authored bank mismatch pc=%04x\n",entry_pc);return 0;
+        }
+        memcpy(sys.ram,initial_ram,GAM4980_RAM_SIZE);restore_banks(initial_banks,initial_selected);
+    }
     gam4980_set_firmware_hle_enabled(1);
     hits_before = s6502_firmware_hle_hits;
     hle_executed = s6502_exec(&sys.cpu, cycles);

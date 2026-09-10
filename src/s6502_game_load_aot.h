@@ -1,5 +1,13 @@
 /* Load-time game AOT templates.  Included inside s6502_exec(). */
 
+/* Caller-side DAAA/DACA folding is kept as an opt-in experiment.  Although
+ * its complete-frame state agrees with the reference core, the physical
+ * IRAM-ASM boundary still exposes a difference during boot.  Normal builds
+ * therefore retain the verified firmware AOT path for these two calls. */
+#ifndef GAM4980_EXPERIMENTAL_C6502_CALLER_LIFTS
+#define GAM4980_EXPERIMENTAL_C6502_CALLER_LIFTS 0
+#endif
+
 #define S6502_GAME_AOT_JMP(target) do {                                     \
     pc = (uint16_t)(target); CYCLES(3);                                     \
     if ((executed >= cycles) || sys_halt_p()) goto _aot_return;             \
@@ -35,7 +43,21 @@
     goto _next;                                                             \
 } while (0)
 
+/* A compiler-runtime call that has been lifted at its caller still owns an
+ * observable 6502 control boundary after the emulated RTS.  Unlike an
+ * ordinary straight-line semantic phrase, stop here when the current slice
+ * has expired so an IRQ is never delayed past the original return point. */
+#define S6502_GAME_AOT_CALL_RETURN_NEXT(byte_count) do {                    \
+    pc = (uint16_t)(pc + (byte_count));                                     \
+    if ((executed >= cycles) || sys_halt_p()) goto _aot_return;             \
+    S6502_GAME_AOT_DISPATCH();                                              \
+    goto _next;                                                             \
+} while (0)
+
   _game_aot_dispatch:
+#ifdef GAM4980_HOST_PROFILE_H
+    host_profile_phase(HP_SEMANTIC);
+#endif
     switch (game_aot_entry->pattern) {
     case 0u: goto _game_aot_0;
     case 1u: goto _game_aot_1;
@@ -57,6 +79,12 @@
     case 17u: goto _game_aot_sub16_oper1_oper2;
     case 18u: goto _game_aot_load_oper1_indy16;
     case 19u: goto _game_aot_store_oper1_indy16;
+    case 20u: case 21u: case 22u: case 23u: case 24u: case 25u:
+      goto _game_aot_generic_word_immediate;
+    case 26u: case 27u: goto _game_aot_generic_copy_word;
+    case 28u: case 29u: goto _game_aot_generic_indirect_word;
+    case 30u: case 31u: goto _game_aot_generic_stack_byte;
+    case S6502_GAME_AOT_TRACE_PATTERN: goto _game_aot_linear_trace;
     default: goto _next;
     }
 
@@ -307,6 +335,121 @@
         (uint16_t)(game_aot_code[9] | (game_aot_code[10] << 8))
     );
 
+  _game_aot_generic_word_immediate:
+    {
+      uint8_t word_preserve = game_aot_entry->semantic >=
+          C6502_TEMPLATE_ADD16_PRESERVE_GENERIC &&
+          game_aot_entry->semantic <= C6502_TEMPLATE_SUB16_PRESERVE_GENERIC;
+      uint8_t word_register = game_aot_entry->semantic ==
+          C6502_TEMPLATE_ADD16_REGS_GENERIC || game_aot_entry->semantic ==
+          C6502_TEMPLATE_SUB16_REGS_GENERIC;
+      uint8_t word_base = word_preserve ? 2u : 0u;
+      uint8_t word_subtract = game_aot_code[word_base] == 0x38u;
+      uint8_t word_src = game_aot_code[word_base + 2u];
+      uint8_t word_dst = game_aot_code[word_base + 6u];
+      uint16_t word_left, word_right, word_result;
+      uint32_t word_wide;
+
+      /* Decimal mode must execute the original byte arithmetic. No state
+       * or diagnostic hit is committed until this guard succeeds. */
+      if (DECIMAL_p) goto _next;
+      word_left = (uint16_t)(S6502_FAST_STACK_RAM[word_src] |
+          ((uint16_t)S6502_FAST_STACK_RAM[word_src + 1u] << 8));
+      if (word_register) {
+        uint8_t right = game_aot_code[4];
+        word_right = (uint16_t)(S6502_FAST_STACK_RAM[right] |
+            ((uint16_t)S6502_FAST_STACK_RAM[right + 1u] << 8));
+      } else {
+        word_right = (uint16_t)(game_aot_code[word_base + 4u] |
+            ((uint16_t)game_aot_code[word_base + 10u] << 8));
+      }
+      word_wide = word_subtract ? (uint32_t)word_left - word_right
+          : (uint32_t)word_left + word_right;
+      word_result = (uint16_t)word_wide;
+      if (word_preserve) {
+        PUSH(status | FLAG_B | FLAG_U);
+      }
+      S6502_FAST_STACK_RAM[word_dst] = (uint8_t)word_result;
+      S6502_FAST_STACK_RAM[word_dst + 1u] = (uint8_t)(word_result >> 8);
+      ac = (uint8_t)(word_result >> 8);
+      if (word_preserve) {
+        status = (uint8_t)(POP() | FLAG_B | FLAG_U);
+      } else {
+        uint16_t word_overflow = word_subtract
+            ? (uint16_t)((word_left ^ word_right) & (word_left ^ word_result))
+            : (uint16_t)(~(word_left ^ word_right) & (word_left ^ word_result));
+        status = (uint8_t)((status & ~(FLAG_N | FLAG_Z | FLAG_C | FLAG_V)) |
+            (ac & FLAG_N) | (!ac ? FLAG_Z : 0u) |
+            ((word_subtract ? word_left >= word_right : word_wide > 0xffffu)
+                ? FLAG_C : 0u) |
+            ((word_overflow & 0x8000u) ? FLAG_V : 0u));
+      }
+      S6502_GAME_AOT_SEMANTIC_HIT(game_aot_entry->semantic);
+      S6502_GAME_AOT_HIT(word_preserve ? 10u : 7u);
+      CYCLES(word_preserve ? 27u : (word_register ? 20u : 18u));
+      S6502_GAME_AOT_NEXT(word_preserve ? 16u : 13u);
+    }
+
+  _game_aot_generic_copy_word:
+    {
+      uint8_t dst = game_aot_code[3];
+      int immediate = game_aot_entry->semantic == C6502_TEMPLATE_STORE16_IMM_GENERIC;
+      /* Keep reads interleaved with stores: COPY16 may overlap by one byte. */
+      S6502_FAST_STACK_RAM[dst] = immediate ? game_aot_code[1] :
+          S6502_FAST_STACK_RAM[game_aot_code[1]];
+      ac = immediate ? game_aot_code[5] : S6502_FAST_STACK_RAM[game_aot_code[5]];
+      S6502_FAST_STACK_RAM[dst + 1u] = ac;
+      S6502_AOT_SET_NZ_MASK(ac, 0x82u);
+      S6502_GAME_AOT_SEMANTIC_HIT(game_aot_entry->semantic);
+      S6502_GAME_AOT_HIT(4u);
+      CYCLES(immediate ? 10u : 12u);
+      S6502_GAME_AOT_NEXT(8u);
+    }
+
+  _game_aot_generic_indirect_word:
+    {
+      int store_word = game_aot_entry->semantic == C6502_TEMPLATE_STORE16_INDIRECT_GENERIC;
+      iy = game_aot_code[1];
+      if (store_word) {
+        ac = S6502_FAST_STACK_RAM[game_aot_code[3]];
+        WRITE8((uint16_t)(S6502_AOT_ZP16(game_aot_code[5]) + iy), ac);
+        iy = (uint8_t)(iy + 1u);
+        /* Re-read pointer and source after the write, including aliasing or
+         * mapping changes. WRITE8 retains dirty-page and I/O side effects. */
+        ac = S6502_FAST_STACK_RAM[game_aot_code[8]];
+        WRITE8((uint16_t)(S6502_AOT_ZP16(game_aot_code[10]) + iy), ac);
+        CYCLES(22u);
+      } else {
+        S6502_AOT_LDA_INDY(S6502_AOT_ZP16(game_aot_code[3]), 0x00u);
+        S6502_FAST_STACK_RAM[game_aot_code[5]] = ac;
+        iy = (uint8_t)(iy + 1u);
+        S6502_AOT_LDA_INDY(S6502_AOT_ZP16(game_aot_code[8]), 0x00u);
+        S6502_FAST_STACK_RAM[game_aot_code[10]] = ac;
+        CYCLES(10u);
+      }
+      S6502_AOT_SET_NZ_MASK(ac, 0x82u);
+      S6502_GAME_AOT_SEMANTIC_HIT(game_aot_entry->semantic);
+      S6502_GAME_AOT_HIT(6u);
+      S6502_GAME_AOT_NEXT(11u);
+    }
+
+  _game_aot_generic_stack_byte:
+    iy = game_aot_code[1];
+    if (game_aot_entry->semantic == C6502_TEMPLATE_LOAD_STACK8_GENERIC) {
+      S6502_AOT_LDA_INDY(S6502_AOT_ZP16(0x28u), 0x82u);
+      CYCLES(2u);
+    } else {
+      S6502_AOT_SET_NZ_MASK(iy, 0x82u);
+      S6502_AOT_STA_INDY(S6502_AOT_ZP16(0x28u));
+      CYCLES(2u);
+    }
+    S6502_GAME_AOT_SEMANTIC_HIT(game_aot_entry->semantic);
+    S6502_GAME_AOT_HIT(2u);
+    /* This tiny phrase must not introduce a new dispatcher/control boundary
+     * at its fallthrough; resume the same straight-line interpreter slice. */
+    pc = (uint16_t)(pc + 4u);
+    goto _next;
+
   _game_aot_load_oper1_imm16:
     S6502_GAME_AOT_SEMANTIC_HIT(C6502_TEMPLATE_LOAD_OPER1_IMM16);
     S6502_GAME_AOT_HIT(4u);
@@ -375,6 +518,45 @@
 
   _game_aot_store_char_arg_imm:
     S6502_GAME_AOT_SEMANTIC_HIT(C6502_TEMPLATE_STORE_CHAR_ARG_IMM);
+    /* C6502 emits LDA #imm / JSR $DAAA for an 8-bit argument.  $DAAA is
+     * compiler ABI transport, not application logic: it decrements the
+     * software stack pointer at $28, stores A, and returns with X=A/Y=0.
+     *
+     * Fold the complete call only when it fits before the next scheduler
+     * boundary.  The three hardware-stack bytes are retained because some
+     * programs inspect stale stack storage even after SP has recovered. */
+    if (GAM4980_EXPERIMENTAL_C6502_CALLER_LIFTS &&
+        executed < cycles && !DECIMAL_p &&
+        (uint16_t)(game_aot_code[3] |
+            ((uint16_t)game_aot_code[4] << 8)) == C6502_RT_STORE_CHAR_FUNCT_ARG &&
+        53u <= cycles - executed) {
+      uint8_t aot_call_sp = sp;
+      uint16_t aot_return = (uint16_t)(pc + 4u);
+      uint16_t aot_software_sp;
+
+      S6502_AOT_LDA(game_aot_code[1], 2, 0x82u);
+      S6502_FAST_STACK_RAM[0x100u | aot_call_sp] =
+          (uint8_t)(aot_return >> 8);
+      S6502_FAST_STACK_RAM[0x100u | (uint8_t)(aot_call_sp - 1u)] =
+          (uint8_t)aot_return;
+      S6502_FAST_STACK_RAM[0x100u | (uint8_t)(aot_call_sp - 2u)] =
+          (uint8_t)(status | FLAG_B | FLAG_U);
+      aot_software_sp = (uint16_t)(
+          S6502_FAST_STACK_RAM[0x28u] |
+          ((uint16_t)S6502_FAST_STACK_RAM[0x29u] << 8)
+      );
+      aot_software_sp = (uint16_t)(aot_software_sp - 1u);
+      S6502_FAST_STACK_RAM[0x28u] = (uint8_t)aot_software_sp;
+      S6502_FAST_STACK_RAM[0x29u] = (uint8_t)(aot_software_sp >> 8);
+      WRITE8(aot_software_sp, ac);
+      ix = ac;
+      iy = 0u;
+      status = (uint8_t)(status | FLAG_B | FLAG_U);
+      CYCLES(51u);
+      ++s6502_game_aot_runtime_lift_hits;
+      S6502_GAME_AOT_HIT(17u);
+      S6502_GAME_AOT_CALL_RETURN_NEXT(5u);
+    }
     S6502_GAME_AOT_HIT(2u);
     S6502_AOT_LDA(game_aot_code[1], 2, 0x82u);
     S6502_AOT_JSR(
@@ -384,6 +566,43 @@
 
   _game_aot_store_int_arg_oper1:
     S6502_GAME_AOT_SEMANTIC_HIT(C6502_TEMPLATE_STORE_INT_ARG_OPER1);
+    /* JSR $DACA pushes the 16-bit OPER1 value on the C6502 software stack.
+     * Preserve the real instruction order for the rare case where the
+     * destination aliases $20/$21: the second source byte is read only after
+     * the first byte has been written. */
+    if (GAM4980_EXPERIMENTAL_C6502_CALLER_LIFTS &&
+        executed < cycles && !DECIMAL_p &&
+        (uint16_t)(game_aot_code[1] |
+            ((uint16_t)game_aot_code[2] << 8)) == C6502_RT_STORE_INT_FUNCT_ARG &&
+        61u <= cycles - executed) {
+      uint8_t aot_call_sp = sp;
+      uint16_t aot_return = (uint16_t)(pc + 2u);
+      uint16_t aot_software_sp = (uint16_t)(
+          S6502_FAST_STACK_RAM[0x28u] |
+          ((uint16_t)S6502_FAST_STACK_RAM[0x29u] << 8)
+      );
+
+      S6502_FAST_STACK_RAM[0x100u | aot_call_sp] =
+          (uint8_t)(aot_return >> 8);
+      S6502_FAST_STACK_RAM[0x100u | (uint8_t)(aot_call_sp - 1u)] =
+          (uint8_t)aot_return;
+      S6502_FAST_STACK_RAM[0x100u | (uint8_t)(aot_call_sp - 2u)] =
+          (uint8_t)(status | FLAG_B | FLAG_U);
+      aot_software_sp = (uint16_t)(aot_software_sp - 2u);
+      S6502_FAST_STACK_RAM[0x28u] = (uint8_t)aot_software_sp;
+      S6502_FAST_STACK_RAM[0x29u] = (uint8_t)(aot_software_sp >> 8);
+      iy = 0u;
+      ac = S6502_FAST_STACK_RAM[0x20u];
+      WRITE8(aot_software_sp, ac);
+      iy = 1u;
+      ac = S6502_FAST_STACK_RAM[0x21u];
+      WRITE8((uint16_t)(aot_software_sp + 1u), ac);
+      status = (uint8_t)(status | FLAG_B | FLAG_U);
+      CYCLES(61u);
+      ++s6502_game_aot_runtime_lift_hits;
+      S6502_GAME_AOT_HIT(18u);
+      S6502_GAME_AOT_CALL_RETURN_NEXT(3u);
+    }
     S6502_GAME_AOT_HIT(1u);
     S6502_AOT_JSR(
         (uint16_t)(pc + 2u),
@@ -454,5 +673,194 @@
     S6502_AOT_STA_INDY(S6502_AOT_ZP16(game_aot_code[10]));
     S6502_GAME_AOT_NEXT(11u);
 
+  _game_aot_linear_trace:
+    {
+      uint8_t trace_offset = 0u;
+      uint8_t trace_instruction = 0u;
+
+      S6502_GAME_AOT_HIT(game_aot_entry->memory_class);
+      if (s6502_game_aot_metrics_enabled) {
+        ++s6502_game_aot_trace_hits;
+        s6502_game_aot_trace_instruction_hits +=
+            game_aot_entry->memory_class;
+      }
+      while (trace_instruction < game_aot_entry->memory_class) {
+        uint8_t trace_opcode = game_aot_code[trace_offset];
+        uint8_t trace_operand = trace_offset + 1u < game_aot_entry->size
+            ? game_aot_code[trace_offset + 1u] : 0u;
+        uint16_t trace_base;
+        uint16_t trace_address;
+
+        switch (trace_opcode) {
+        case 0x08u: S6502_AOT_PHP(); trace_offset += 1u; break;
+        case 0x0au: S6502_AOT_ASL_A(0x83u); trace_offset += 1u; break;
+        case 0x18u: S6502_AOT_CLC(0x01u); trace_offset += 1u; break;
+        case 0x28u: S6502_AOT_PLP(); trace_offset += 1u; break;
+        case 0x2au: S6502_AOT_ROL_A(0x83u); trace_offset += 1u; break;
+        case 0x38u: S6502_AOT_SEC(0x01u); trace_offset += 1u; break;
+        case 0x48u: S6502_AOT_PHA(); trace_offset += 1u; break;
+        case 0x4au: S6502_AOT_LSR_A(0x83u); trace_offset += 1u; break;
+        case 0x58u:
+          status = (uint8_t)(status & ~FLAG_I); CYCLES(2);
+          trace_offset += 1u; break;
+        case 0x68u: S6502_AOT_PLA(0x82u); trace_offset += 1u; break;
+        case 0x6au: S6502_AOT_ROR_A(0x83u); trace_offset += 1u; break;
+        case 0x78u:
+          status = (uint8_t)(status | FLAG_I); CYCLES(2);
+          trace_offset += 1u; break;
+        case 0x88u: S6502_AOT_DEY(0x82u); trace_offset += 1u; break;
+        case 0x8au: S6502_AOT_TXA(0x82u); trace_offset += 1u; break;
+        case 0x98u: S6502_AOT_TYA(0x82u); trace_offset += 1u; break;
+        case 0x9au: S6502_AOT_TXS(); trace_offset += 1u; break;
+        case 0xa8u: S6502_AOT_TAY(0x82u); trace_offset += 1u; break;
+        case 0xaau: S6502_AOT_TAX(0x82u); trace_offset += 1u; break;
+        case 0xb8u:
+          status = (uint8_t)(status & ~FLAG_V); CYCLES(2);
+          trace_offset += 1u; break;
+        case 0xbau: S6502_AOT_TSX(0x82u); trace_offset += 1u; break;
+        case 0xc8u: S6502_AOT_INY(0x82u); trace_offset += 1u; break;
+        case 0xcau: S6502_AOT_DEX(0x82u); trace_offset += 1u; break;
+        case 0xd8u:
+          status = (uint8_t)(status & ~FLAG_D); CYCLES(2);
+          trace_offset += 1u; break;
+        case 0xe8u: S6502_AOT_INX(0x82u); trace_offset += 1u; break;
+        case 0xeau: S6502_AOT_NOP(); trace_offset += 1u; break;
+        case 0xf8u:
+          status = (uint8_t)(status | FLAG_D); CYCLES(2);
+          trace_offset += 1u; break;
+
+        case 0x09u: S6502_AOT_ORA(trace_operand, 2, 0x82u); trace_offset += 2u; break;
+        case 0x29u: S6502_AOT_AND(trace_operand, 2, 0x82u); trace_offset += 2u; break;
+        case 0x49u: S6502_AOT_EOR(trace_operand, 2, 0x82u); trace_offset += 2u; break;
+        case 0x69u: S6502_AOT_ADC(trace_operand, 2, 0xc3u); trace_offset += 2u; break;
+        case 0xa0u: S6502_AOT_LDY(trace_operand, 2, 0x82u); trace_offset += 2u; break;
+        case 0xa2u: S6502_AOT_LDX(trace_operand, 2, 0x82u); trace_offset += 2u; break;
+        case 0xa9u: S6502_AOT_LDA(trace_operand, 2, 0x82u); trace_offset += 2u; break;
+        case 0xc0u: S6502_AOT_COMPARE(iy, trace_operand, 2, 0x83u); trace_offset += 2u; break;
+        case 0xc9u: S6502_AOT_COMPARE(ac, trace_operand, 2, 0x83u); trace_offset += 2u; break;
+        case 0xe0u: S6502_AOT_COMPARE(ix, trace_operand, 2, 0x83u); trace_offset += 2u; break;
+        case 0xe9u: S6502_AOT_SBC(trace_operand, 2, 0xc3u); trace_offset += 2u; break;
+
+        case 0x05u: S6502_AOT_ORA(READ8(trace_operand), 3, 0x82u); trace_offset += 2u; break;
+        case 0x25u: S6502_AOT_AND(READ8(trace_operand), 3, 0x82u); trace_offset += 2u; break;
+        case 0x45u: S6502_AOT_EOR(READ8(trace_operand), 3, 0x82u); trace_offset += 2u; break;
+        case 0x65u: S6502_AOT_ADC(READ8(trace_operand), 3, 0xc3u); trace_offset += 2u; break;
+        case 0x84u: S6502_AOT_STY(trace_operand, 3); trace_offset += 2u; break;
+        case 0x85u: S6502_AOT_STA(trace_operand, 3); trace_offset += 2u; break;
+        case 0x86u: S6502_AOT_STX(trace_operand, 3); trace_offset += 2u; break;
+        case 0xa4u: S6502_AOT_LDY(READ8(trace_operand), 3, 0x82u); trace_offset += 2u; break;
+        case 0xa5u: S6502_AOT_LDA(READ8(trace_operand), 3, 0x82u); trace_offset += 2u; break;
+        case 0xa6u: S6502_AOT_LDX(READ8(trace_operand), 3, 0x82u); trace_offset += 2u; break;
+        case 0xc4u: S6502_AOT_COMPARE(iy, READ8(trace_operand), 3, 0x83u); trace_offset += 2u; break;
+        case 0xc5u: S6502_AOT_COMPARE(ac, READ8(trace_operand), 3, 0x83u); trace_offset += 2u; break;
+        case 0xe4u: S6502_AOT_COMPARE(ix, READ8(trace_operand), 3, 0x83u); trace_offset += 2u; break;
+        case 0xe5u: S6502_AOT_SBC(READ8(trace_operand), 3, 0xc3u); trace_offset += 2u; break;
+
+        case 0x06u: S6502_AOT_ASL_ZP(trace_operand, 0x83u); trace_offset += 2u; break;
+        case 0x26u: S6502_AOT_ROL_ZP(trace_operand, 0x83u); trace_offset += 2u; break;
+        case 0x46u: S6502_AOT_LSR_ZP(trace_operand, 0x83u); trace_offset += 2u; break;
+        case 0x66u: S6502_AOT_ROR_ZP(trace_operand, 0x83u); trace_offset += 2u; break;
+        case 0xc6u: S6502_AOT_DEC(trace_operand, 5, 0x82u); trace_offset += 2u; break;
+        case 0xe6u: S6502_AOT_INC(trace_operand, 5, 0x82u); trace_offset += 2u; break;
+
+        case 0x15u: case 0x35u: case 0x55u: case 0x75u:
+        case 0xb4u: case 0xb5u: case 0xd5u: case 0xf5u:
+          trace_address = (uint8_t)(trace_operand + ix);
+          dt = READ8(trace_address);
+          if (trace_opcode == 0x15u) S6502_AOT_ORA(dt, 4, 0x82u);
+          else if (trace_opcode == 0x35u) S6502_AOT_AND(dt, 4, 0x82u);
+          else if (trace_opcode == 0x55u) S6502_AOT_EOR(dt, 4, 0x82u);
+          else if (trace_opcode == 0x75u) S6502_AOT_ADC(dt, 4, 0xc3u);
+          else if (trace_opcode == 0xb4u) S6502_AOT_LDY(dt, 4, 0x82u);
+          else if (trace_opcode == 0xb5u) S6502_AOT_LDA(dt, 4, 0x82u);
+          else if (trace_opcode == 0xd5u) S6502_AOT_COMPARE(ac, dt, 4, 0x83u);
+          else S6502_AOT_SBC(dt, 4, 0xc3u);
+          trace_offset += 2u;
+          break;
+        case 0xb6u:
+          trace_address = (uint8_t)(trace_operand + iy);
+          S6502_AOT_LDX(READ8(trace_address), 4, 0x82u);
+          trace_offset += 2u;
+          break;
+
+        case 0x0du: case 0x2du: case 0x4du: case 0x6du:
+        case 0x8cu: case 0x8du: case 0x8eu: case 0xacu:
+        case 0xadu: case 0xaeu: case 0xccu: case 0xcdu:
+        case 0xecu: case 0xedu:
+          trace_address = (uint16_t)(trace_operand |
+              ((uint16_t)game_aot_code[trace_offset + 2u] << 8));
+          if (trace_opcode == 0x0du) S6502_AOT_ORA(READ8(trace_address), 4, 0x82u);
+          else if (trace_opcode == 0x2du) S6502_AOT_AND(READ8(trace_address), 4, 0x82u);
+          else if (trace_opcode == 0x4du) S6502_AOT_EOR(READ8(trace_address), 4, 0x82u);
+          else if (trace_opcode == 0x6du) S6502_AOT_ADC(READ8(trace_address), 4, 0xc3u);
+          else if (trace_opcode == 0x8cu) S6502_AOT_STY(trace_address, 4);
+          else if (trace_opcode == 0x8du) S6502_AOT_STA(trace_address, 4);
+          else if (trace_opcode == 0x8eu) S6502_AOT_STX(trace_address, 4);
+          else if (trace_opcode == 0xacu) S6502_AOT_LDY(READ8(trace_address), 4, 0x82u);
+          else if (trace_opcode == 0xadu) S6502_AOT_LDA(READ8(trace_address), 4, 0x82u);
+          else if (trace_opcode == 0xaeu) S6502_AOT_LDX(READ8(trace_address), 4, 0x82u);
+          else if (trace_opcode == 0xccu) S6502_AOT_COMPARE(iy, READ8(trace_address), 4, 0x83u);
+          else if (trace_opcode == 0xcdu) S6502_AOT_COMPARE(ac, READ8(trace_address), 4, 0x83u);
+          else if (trace_opcode == 0xecu) S6502_AOT_COMPARE(ix, READ8(trace_address), 4, 0x83u);
+          else S6502_AOT_SBC(READ8(trace_address), 4, 0xc3u);
+          trace_offset += 3u;
+          break;
+
+        case 0x19u: case 0x1du: case 0x39u: case 0x3du:
+        case 0x59u: case 0x5du: case 0x79u: case 0x7du:
+        case 0xb9u: case 0xbcu: case 0xbdu: case 0xbeu:
+        case 0xd9u: case 0xddu: case 0xf9u: case 0xfdu:
+          trace_base = (uint16_t)(trace_operand |
+              ((uint16_t)game_aot_code[trace_offset + 2u] << 8));
+          trace_address = (uint16_t)(trace_base +
+              ((trace_opcode == 0x19u || trace_opcode == 0x39u ||
+                trace_opcode == 0x59u || trace_opcode == 0x79u ||
+                trace_opcode == 0xb9u || trace_opcode == 0xbeu ||
+                trace_opcode == 0xd9u || trace_opcode == 0xf9u)
+                  ? iy : ix));
+          CYCLES((!!(0xff00u & (trace_base ^ trace_address))));
+          dt = READ8(trace_address);
+          if (trace_opcode == 0x19u || trace_opcode == 0x1du) S6502_AOT_ORA(dt, 4, 0x82u);
+          else if (trace_opcode == 0x39u || trace_opcode == 0x3du) S6502_AOT_AND(dt, 4, 0x82u);
+          else if (trace_opcode == 0x59u || trace_opcode == 0x5du) S6502_AOT_EOR(dt, 4, 0x82u);
+          else if (trace_opcode == 0x79u || trace_opcode == 0x7du) S6502_AOT_ADC(dt, 4, 0xc3u);
+          else if (trace_opcode == 0xb9u || trace_opcode == 0xbdu) S6502_AOT_LDA(dt, 4, 0x82u);
+          else if (trace_opcode == 0xbcu) S6502_AOT_LDY(dt, 4, 0x82u);
+          else if (trace_opcode == 0xbeu) S6502_AOT_LDX(dt, 4, 0x82u);
+          else if (trace_opcode == 0xd9u || trace_opcode == 0xddu) S6502_AOT_COMPARE(ac, dt, 4, 0x83u);
+          else S6502_AOT_SBC(dt, 4, 0xc3u);
+          trace_offset += 3u;
+          break;
+
+        case 0x11u: case 0x31u: case 0x51u: case 0x71u:
+        case 0xb1u: case 0xd1u: case 0xf1u:
+          trace_base = (uint16_t)(READ8(trace_operand) |
+              ((uint16_t)READ8((uint8_t)(trace_operand + 1u)) << 8));
+          trace_address = (uint16_t)(trace_base + iy);
+          CYCLES((!!(0xff00u & (trace_base ^ trace_address))));
+          dt = READ8(trace_address);
+          if (trace_opcode == 0x11u) S6502_AOT_ORA(dt, 5, 0x82u);
+          else if (trace_opcode == 0x31u) S6502_AOT_AND(dt, 5, 0x82u);
+          else if (trace_opcode == 0x51u) S6502_AOT_EOR(dt, 5, 0x82u);
+          else if (trace_opcode == 0x71u) S6502_AOT_ADC(dt, 5, 0xc3u);
+          else if (trace_opcode == 0xb1u) S6502_AOT_LDA(dt, 5, 0x82u);
+          else if (trace_opcode == 0xd1u) S6502_AOT_COMPARE(ac, dt, 5, 0x83u);
+          else S6502_AOT_SBC(dt, 5, 0xc3u);
+          trace_offset += 2u;
+          break;
+        default:
+          /* The load-time decoder and this executor intentionally share the
+           * same closed opcode set.  If a corrupted descriptor ever reaches
+           * here, commit the already completed prefix and resume exactly at
+           * the first unknown instruction rather than replaying side effects. */
+          pc = (uint16_t)(pc + trace_offset);
+          goto _next;
+        }
+        ++trace_instruction;
+      }
+      S6502_GAME_AOT_NEXT(game_aot_entry->size);
+    }
+
 #undef S6502_GAME_AOT_JMP
+#undef S6502_GAME_AOT_CALL_RETURN_NEXT
 #undef S6502_GAME_AOT_NEXT

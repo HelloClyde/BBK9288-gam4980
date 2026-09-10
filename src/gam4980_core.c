@@ -1,8 +1,21 @@
 #include "gam4980_core.h"
+#include "gam4980_host_profile.h"
 #include "gam4980_native_module.h"
+#include "s6502_firmware_native_registry.h"
+#include "firmware_native_graphics_abi.h"
+#include "firmware_native_graphics_io.h"
+#include "firmware_native_compare_math.h"
+#include "firmware_native_arithmetic.h"
+#include "firmware_native_multiply_math.h"
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+#include "s6502_native_preload.h"
+#endif
 
 #ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
 #include "s6502_iram_exec_abi.h"
+#ifdef GAM4980_STATIC_NATIVE_GAME
+#include "gam4980_static_native_generated.h"
+#endif
 #if defined(GAM4980_TARGET_9288) && defined(GAM4980_ENABLE_BARE_SESSION)
 #include "gam4980_9288_bare.h"
 #endif
@@ -26,6 +39,174 @@ static void *core_load_progress_context;
 static gam4980_runtime_poll_fn core_runtime_poll_callback;
 static void *core_runtime_poll_context;
 static u32 core_runtime_poll_max_guest_cycles;
+static firmware_native_graphics_services_t native_graphics_services;
+static uint32_t native_graphics_io_metrics[4];
+static uint32_t native_public_metrics[8];
+static uint32_t native_bank_metrics[12];
+static uint32_t hle_counter_chain_hits, hle_bitmap_packed_groups, hle_counter_folded_rounds;
+u32 gam4980_hle_fusion_metric(u32 id) { return id == 0u ? hle_counter_chain_hits : id == 1u ? hle_bitmap_packed_groups : id == 2u ? hle_counter_folded_rounds : 0u; }
+static const uint8_t *s6502_game_hle_table_pointer(uint16_t address);
+static int s6502_game_hle_row_direct_destination(uint32_t first, uint32_t last);
+#ifdef GAM4980_HLE_FUSION_TEST
+static int s6502_counter_chain_enabled = 1;
+#else
+#define s6502_counter_chain_enabled 1
+#endif
+static uint32_t native_bank_map4(uint32_t bank);
+static inline __attribute__((always_inline)) void
+s6502_game_hle_record_compare_state_fields(
+    uint8_t index_offset, uint8_t data_pointer_offset,
+    uint8_t candidate_offset, uint8_t reference_pointer_offset,
+    uint8_t *object_pointer, uint16_t data, uint16_t reference,
+    uint8_t subtract, uint8_t reference_index,
+    uint8_t candidate_value, uint8_t reference_value,
+    uint8_t *ac_value, uint8_t *iy_value, uint8_t *status_value
+);
+static uint32_t native_bank_descriptor_safe(uint32_t address);
+u32 gam4980_native_bank_metric(u32 index) { return index < 12u ? native_bank_metrics[index] : 0u; }
+static uint8_t native_resource_read(uint32_t address);
+static uint8_t native_graphics_synced_frame[1920];
+static uint32_t native_graphics_synced_rows[3];
+static uint32_t native_picture_state, native_picture_pending;
+static uint8_t native_picture_frame[1920];
+static void native_picture_complete(uint32_t ram_address)
+{
+    const uint8_t *ram=(const uint8_t *)(unsigned long)ram_address;
+    uint32_t y,x;
+    for(y=0;y<96u;++y) for(x=0;x<20u;++x)
+        native_picture_frame[y*20u+x]=ram[fw_gfx_lcd_address(x,y)];
+    native_picture_pending=1u;
+}
+const u8 *gam4980_take_completed_picture(void)
+{
+    if(!native_picture_pending)return 0;
+    native_picture_pending=0u;
+    return native_picture_frame;
+}
+int gam4980_picture_active(void) { return (native_picture_state&1u)!=0u; }
+/* [graphics,text][attempts,accepted,host_ticks,max_host_ticks,zero_returns].
+ * Function timing includes memory callbacks and immediate LCD stores. It is
+ * nested inside bare_core_ticks, never an extra additive session phase. */
+static uint32_t native_graphics_host_profile[2][5];
+
+void gam4980_native_graphics_set_display(u32 framebuffer, u32 lut, u32 clock)
+{
+    native_graphics_services.version = FW_GRAPHICS_SERVICE_VERSION;
+    native_graphics_services.framebuffer = framebuffer;
+    native_graphics_services.expand_lut = lut;
+    native_graphics_services.clock = clock;
+    native_graphics_services.synced_frame =
+        (uint32_t)(unsigned long)native_graphics_synced_frame;
+    native_graphics_services.synced_rows =
+        (uint32_t)(unsigned long)native_graphics_synced_rows;
+    native_graphics_services.picture_state=(uint32_t)(unsigned long)&native_picture_state;
+    native_graphics_services.picture_complete=(uint32_t)(unsigned long)native_picture_complete;
+    native_graphics_services.read_physical=(uint32_t)(unsigned long)native_resource_read;
+    native_graphics_services.public_metrics=(uint32_t)(unsigned long)native_public_metrics;
+    native_graphics_services.bank_map4=(uint32_t)(unsigned long)native_bank_map4;
+    native_graphics_services.bank_descriptor_safe=(uint32_t)(unsigned long)native_bank_descriptor_safe;
+    native_graphics_services.bank_metrics=clock ? (uint32_t)(unsigned long)native_bank_metrics : 0u;
+    native_picture_state=native_picture_pending=0u;
+    native_graphics_synced_rows[0] = 0u;
+    native_graphics_synced_rows[1] = 0u;
+    native_graphics_synced_rows[2] = 0u;
+}
+
+int gam4980_native_graphics_row_synced(u32 y, const u8 *row)
+{
+    u32 x;
+    if (y >= 96u || !row ||
+        !(native_graphics_synced_rows[y >> 5] & (1u << (y & 31u))))
+        return 0;
+    for (x = 0u; x < 20u; ++x)
+        if ((native_graphics_synced_frame[y * 20u + x] ^ row[x]) &
+            (x == 19u ? 0xfeu : 0xffu)) return 0;
+    return 1;
+}
+
+void gam4980_native_graphics_invalidate_sync(void)
+{
+    native_graphics_synced_rows[0]=0u;
+    native_graphics_synced_rows[1]=0u;
+    native_graphics_synced_rows[2]=0u;
+}
+
+void gam4980_native_graphics_row_presented(u32 y, const u8 *row)
+{
+    u32 x;
+    if (y >= 96u || !row) return;
+    for (x = 0u; x < 20u; ++x)
+        native_graphics_synced_frame[y * 20u + x] = row[x];
+    native_graphics_synced_rows[y >> 5] |= 1u << (y & 31u);
+}
+
+void gam4980_native_graphics_reset_metrics(void)
+{
+    hle_counter_chain_hits = hle_bitmap_packed_groups = 0u;
+    hle_counter_folded_rounds = 0u;
+    { u32 i;for(i=0;i<8;++i)native_public_metrics[i]=0; }
+    { u32 i;for(i=0;i<12;++i)native_bank_metrics[i]=0; }
+    uint32_t index;
+    for (index = 0u; index < 4u; ++index)
+        native_graphics_io_metrics[index] = 0u;
+    for (index = 0u; index < 10u; ++index)
+        native_graphics_host_profile[index / 5u][index % 5u] = 0u;
+    for (index = 0u; index < HP_COUNT; ++index) {
+        host_profile.ticks[index] = 0u;
+        host_profile.calls[index] = 0u;
+    }
+    host_profile.current = host_profile.reads = host_profile.samples = 0u;
+    host_function_owner = HP_FUNCTION_COUNT;
+    host_hle_owner = HP_HLE_LOOKUP;
+    for (index = 0u; index < HP_HLE_PATH_COUNT * 5u; ++index)
+        host_hle_profile[index / 5u][index % 5u] = 0u;
+    for (index = 0u; index < HP_FUNCTION_COUNT; ++index) {
+        host_private_function_attempts[index] = 0u;
+        host_private_function_accepted[index] = 0u;
+    }
+    for (index = 0u; index < HP_FUNCTION_COUNT * 4u; ++index)
+        host_function_profile[index / 4u][index % 4u] = 0u;
+}
+
+u32 gam4980_hle_function_profile(u32 index, u32 metric)
+{
+    return index < HP_HLE_PATH_COUNT && metric < 5u ? host_hle_profile[index][metric] : 0u;
+}
+
+u32 gam4980_native_function_profile(u32 index, u32 metric)
+{
+    if (index >= HP_FUNCTION_COUNT) return 0u;
+    if (metric == 4u) return host_private_function_attempts[index];
+    if (metric == 5u) return host_private_function_accepted[index];
+    return metric < 4u ? host_function_profile[index][metric] : 0u;
+}
+
+u32 gam4980_host_profile_metric(u32 phase, u32 calls)
+{
+    if (phase == HP_COUNT) return calls ? host_profile.reads : host_profile.samples;
+    return phase < HP_COUNT ? (calls ? host_profile.calls[phase] : host_profile.ticks[phase]) : 0u;
+}
+
+u32 gam4980_native_graphics_metric(u32 index)
+{
+    return index < 4u ? native_graphics_io_metrics[index] : 0u;
+}
+
+u32 gam4980_native_public_metric(u32 index)
+{
+    return index<8u?native_public_metrics[index]:0u;
+}
+
+u32 gam4980_native_graphics_profile(u32 text, u32 metric)
+{
+    return text < 2u && metric < 5u ? native_graphics_host_profile[text][metric] : 0u;
+}
+
+static void native_graphics_poll(void)
+{
+    if (core_runtime_poll_callback)
+        core_runtime_poll_callback(core_runtime_poll_context);
+}
 
 static void *gam4980_memset(void *destination, int value, u32 size)
 {
@@ -160,6 +341,12 @@ static int native_module_game_write_overlaps(uint32_t offset, uint32_t size);
 static uint32_t native_module_fault_entry(
     s6502_iram_asm_context_t *context
 );
+static uint32_t native_module_firmware_entry(s6502_iram_asm_context_t *context);
+#ifdef GAM4980_STATIC_NATIVE_GAME
+static void s6502_static_native_bind_game(
+    const uint8_t *game, uint32_t size
+);
+#endif
 #endif
 static uint8_t mem_read(uint16_t addr);
 static uint8_t mem_readx(uint16_t addr);
@@ -167,6 +354,8 @@ static uint16_t mem_read16(uint16_t addr);
 static uint16_t mem_readx16(uint16_t addr);
 static uint16_t mem_read16_wrapped(uint16_t addr);
 static void mem_write(uint16_t addr, uint8_t val);
+static void ram_write(uint16_t addr, uint8_t val);
+static void ram_vwrite(uint16_t addr, uint8_t val);
 #if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
 static uint8_t native_module_callback_depth;
 static uint32_t native_module_mapping_epoch;
@@ -176,6 +365,7 @@ static void native_module_mem_write(uint16_t addr, uint8_t val)
     mem_write(addr, val);
     --native_module_callback_depth;
 }
+static uint32_t native_graphics_write8_resolved(uint16_t addr, uint8_t val);
 #endif
 #ifndef GAM4980_CACHE_STORAGE
 #if defined(GAM4980_TARGET_9288)
@@ -209,6 +399,10 @@ static int s6502_performance_debug;
 #define S6502_GAME_AOT_CFG_LIMIT 0x80000u
 #define S6502_GAME_AOT_CFG_BYTES (S6502_GAME_AOT_CFG_LIMIT / 8u)
 #define S6502_GAME_AOT_CFG_QUEUE_SIZE 4096u
+#define S6502_GAME_AOT_TRACE_PATTERN 32u
+#define S6502_GAME_AOT_TRACE_MIN_INSTRUCTIONS 8u
+#define S6502_GAME_AOT_TRACE_MAX_INSTRUCTIONS 32u
+#define S6502_GAME_AOT_TRACE_MAX_BYTES 128u
 typedef struct s6502_game_aot_entry {
     uint32_t physical_pc;
     uint32_t linked_physical_pc;
@@ -231,12 +425,33 @@ static s6502_game_aot_entry_t
     GAM4980_CACHE_STORAGE;
 static uint16_t s6502_game_aot_hash[S6502_GAME_AOT_HASH_SIZE]
     GAM4980_CACHE_STORAGE;
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+/* CFG reachability is needed only while a GAM is indexed.  The resident
+ * dispatch byte table is rebuilt at the end of that same load and is then
+ * needed only while the game runs.  Overlay the two disjoint lifetimes: a
+ * separate 64 KiB allocation makes otherwise valid KF2 images too large for
+ * the 9288 desktop loader. */
+typedef union s6502_game_aot_dispatch_scratch {
+    uint8_t cfg_bits[S6502_GAME_AOT_CFG_BYTES];
+    uint8_t iram_dispatch[0x10000u];
+} s6502_game_aot_dispatch_scratch_t;
+static s6502_game_aot_dispatch_scratch_t
+    s6502_game_aot_dispatch_scratch GAM4980_CACHE_STORAGE;
+#define s6502_game_aot_cfg_bits \
+    s6502_game_aot_dispatch_scratch.cfg_bits
+#define s6502_iram_dispatch_bits \
+    s6502_game_aot_dispatch_scratch.iram_dispatch
+#else
 static uint8_t s6502_game_aot_cfg_bits[S6502_GAME_AOT_CFG_BYTES]
     GAM4980_CACHE_STORAGE;
+#endif
 static s6502_game_aot_cfg_item_t
     s6502_game_aot_cfg_queue[S6502_GAME_AOT_CFG_QUEUE_SIZE]
     GAM4980_CACHE_STORAGE;
 static uint16_t s6502_game_aot_entry_count;
+static uint16_t s6502_game_aot_trace_entry_count;
+static uint32_t s6502_game_aot_trace_hits;
+static uint32_t s6502_game_aot_trace_instruction_hits;
 static uint16_t s6502_game_aot_bank_mask;
 static uint16_t *s6502_game_aot_banks;
 static uint32_t s6502_game_aot_physical_end;
@@ -246,6 +461,7 @@ static uint16_t s6502_game_aot_linked_call_count;
 static uint32_t s6502_game_aot_direct_link_hits;
 static uint16_t s6502_game_aot_linear_link_count;
 static uint32_t s6502_game_aot_linear_link_hits;
+static uint32_t s6502_game_aot_runtime_lift_hits;
 #ifdef GAM4980_AOT_DIAGNOSTICS
 static uint32_t s6502_game_aot_direct_link_stage_hits[5];
 #define S6502_GAME_AOT_DIRECT_LINK_STAGE(stage) \
@@ -462,7 +678,10 @@ static __attribute__((noinline)) void s6502_game_aot_hit(
         game_aot_physical_pc =                                              \
             ((uint32_t)s6502_game_aot_banks[pc >> 12] << 12) |             \
             (pc & 0x0fffu);                                                 \
+        host_profile_phase(HP_HLE);                                       \
+        host_hle_select(HP_HLE_LOOKUP);                                   \
         S6502_GAME_HLE_DISPATCH();                                          \
+        host_profile_phase(HP_CORE);                                      \
         if (!s6502_game_aot_requested)                                     \
             break;                                                         \
         game_aot_hash_slot = (uint16_t)(                                   \
@@ -545,12 +764,20 @@ typedef struct gam4980_native_runtime_module {
     uint32_t last_load_batch;
     uint32_t evicted_batch;
     uint32_t cooldown_until_batch;
+    uint8_t *code;
+    uint32_t code_allocation_size;
+    uint32_t active_calls;
+    uint32_t register_referenced; /* private entry writes active-counter + 4 */
+    uint16_t function_page_next;
     uint8_t allocation_first;
     uint8_t allocation_count;
     uint8_t loaded;
     uint8_t static_valid;
     uint8_t thrash_score;
 } gam4980_native_runtime_module_t;
+_Static_assert(offsetof(gam4980_native_runtime_module_t, register_referenced) ==
+    offsetof(gam4980_native_runtime_module_t, active_calls) + 4,
+    "private entry residency reference offset");
 typedef struct gam4980_native_transition {
     uint32_t from_key;
     uint32_t to_key;
@@ -567,6 +794,15 @@ typedef struct gam4980_native_transition {
 #define GAM4980_NATIVE_MAX_ALLOC_UNITS 64u
 static u8 *native_code_arena;
 static u32 native_code_arena_size;
+static u8 *(*native_heap_alloc)(void *context, u32 size);
+static int (*native_heap_free)(void *context, u8 *allocation);
+static void *native_heap_context;
+static u8 *native_module_manifest;
+static u32 native_module_manifest_size;
+static u32 native_module_manifest_owned;
+static u32 native_code_arena_owned;
+static u32 native_module_function_package;
+static u32 native_module_resident_code_bytes;
 static gam4980_native_read_fn native_module_reader;
 static void *native_module_reader_context;
 static u32 native_module_file_size;
@@ -576,6 +812,16 @@ static gam4980_native_module_record_t *native_module_records;
 static gam4980_native_match_record_t *native_module_matches;
 static gam4980_native_reloc_record_t *native_module_relocs;
 static gam4980_native_link_record_t *native_module_links;
+#define NATIVE_FIRMWARE_FORMAT(v) ((v) == GAM4980_NATIVE_FIRMWARE_FORMAT_VERSION || \
+                                 (v) == GAM4980_NATIVE_COMPACT_FORMAT_VERSION)
+static const gam4980_native_match_record_t *native_match_at(uint32_t index)
+{
+    if (native_module_header->format_version == GAM4980_NATIVE_COMPACT_FORMAT_VERSION) {
+        const uint32_t *refs = (const uint32_t *)(const void *)native_module_matches;
+        return (const gam4980_native_match_record_t *)(const void *)&native_module_relocs[refs[index]];
+    }
+    return &native_module_matches[index];
+}
 static gam4980_native_runtime_module_t
     native_module_runtime[GAM4980_NATIVE_MAX_MODULES];
 static u8 *native_module_code_base;
@@ -583,15 +829,77 @@ static uint8_t
     native_module_unit_owner[GAM4980_NATIVE_MAX_ALLOC_UNITS];
 static uint32_t native_module_alloc_unit_count;
 static uint32_t native_module_page_entries[256] GAM4980_CACHE_STORAGE;
+static uint32_t native_register_entries[256][4];
+#if defined(__s1c33__)
+extern void gam4980_native_profile_trampoline(void);
+static uint32_t native_profile_register_entries[256][4];
+static void native_profile_publish(u32 pc)
+{
+    u32 *source = native_register_entries[pc & 255u];
+    u32 *target = native_profile_register_entries[pc & 255u];
+    target[0] = source[0]; target[1] = source[1]; target[3] = source[3];
+    target[2] = source[2] ? (u32)(unsigned long)gam4980_native_profile_trampoline : 0u;
+}
+/* Called only through the sampled shadow dispatch table. The assembly shim
+ * keeps its nesting token on the host stack, not in global singleton state. */
+void gam4980_native_profile_begin(s6502_iram_asm_context_t *context, u32 pc, u32 *frame)
+{
+    u32 *slot = native_register_entries[pc & 255u];
+    gam4980_native_runtime_module_t *runtime = (gam4980_native_runtime_module_t *)
+        ((uint8_t *)(unsigned long)slot[3] - offsetof(gam4980_native_runtime_module_t, active_calls));
+    u32 index = (u32)(runtime - native_module_runtime);
+    const gam4980_native_module_record_t *module = &native_module_records[index];
+    u32 phase = (module->flags & GAM4980_NATIVE_MODULE_GRAPHICS)
+        ? ((module->flags & GAM4980_NATIVE_MODULE_TEXT) ? HP_TEXT : HP_GRAPHICS) : HP_NATIVE;
+    (void)context;
+    frame[0] = slot[2];
+    host_private_profile_begin(index, native_match_at(module->match_first)->physical_pc, phase, frame);
+}
+void gam4980_native_profile_end(u32 *frame, u32 accepted)
+{
+    host_private_profile_end(frame, accepted);
+}
+#else
+static void native_profile_publish(u32 pc) { (void)pc; }
+#endif
+/* Exact entry cache. Slot collisions and bank changes are misses, never
+ * permission to call a guard span or another bank's function. */
+static uint32_t native_function_entry_cache[256][2];
+static uint32_t native_register_calls;
+u32 gam4980_native_register_calls(void) { return native_register_calls; }
+u32 gam4980_native_register_functions(void)
+{
+    u32 i, count=0;
+    if (!native_module_header || !native_module_records) return 0;
+    for(i=0;i<native_module_header->module_count;++i)
+        if(native_module_records[i].flags & GAM4980_NATIVE_MODULE_REGISTER) ++count;
+    return count;
+}
+/* FUNCTION dispatch examines only the exact entries in the mapped guest
+ * page, not the complete NAT catalogue on every runtime-library call. */
+static uint16_t native_function_page_head[256] GAM4980_CACHE_STORAGE;
+static uint16_t native_module_last_bank[16];
+static uint16_t native_module_last_bank_valid;
+static uint32_t native_function_union_active;
+static uint32_t native_module_full_rebuild_count;
+static uint32_t native_module_bank_refresh_count;
+static uint32_t native_module_bank_nochange_count;
+static uint32_t native_module_function_bank_fastpath_count;
+static uint32_t native_module_rebuild_module_visit_count;
 static uint8_t native_module_page_conflicts[256] GAM4980_CACHE_STORAGE;
 static uint32_t native_module_clock;
 static uint32_t native_module_status_value;
 static uint32_t native_module_preloaded_count;
 static uint32_t native_module_load_count;
+static volatile uint32_t native_module_firmware_route_mask;
 static uint32_t native_module_eviction_count;
 static uint32_t native_module_bytes_loaded_count;
 static uint32_t native_module_fallback_count;
 static uint32_t native_module_game_bound;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+static uint32_t s6502_static_native_bound;
+static uint32_t s6502_static_native_invalidations;
+#endif
 static uint32_t native_module_batch_clock;
 static uint32_t native_module_fault_budget;
 static uint32_t native_module_fault_budget_active;
@@ -603,53 +911,22 @@ static uint32_t native_module_next_cooldown_batch;
 static gam4980_native_transition_t
     native_module_transitions[GAM4980_NATIVE_TRANSITION_CAPACITY];
 #endif
-#ifdef GAM4980_DYNAMIC_NATIVE_ALL
-/* All ordinary guarded E.BIN blocks are supplied by GAM4980.NAT.  Keep only
- * the HLE boundary switch in the executable; a rejected HLE falls through to
- * the complete interpreter, while every other guarded PC is handled by the
- * current disk module before C is entered.  Import the generated dispatch
+#if defined(GAM4980_DYNAMIC_NATIVE_ALL) || !GAM4980_ENABLE_LEGACY_INSTRUCTION_AOT
+/* Keep only HLE hooks when legacy instruction AOT is disabled, or when the
+ * blocks are supplied by GAM4980.NAT. Rejected hooks fall through to the
+ * interpreter. Import the generated dispatch
  * section first because it also owns the instruction-semantics macros reused
  * by the game-load AOT templates, then replace only its firmware switch. */
 #define S6502_AOT_DEFINE_DISPATCH
 #include "s6502_aot_ebin_generated.h"
 #undef S6502_AOT_DEFINE_DISPATCH
 #undef S6502_AOT_DISPATCH
-#define S6502_AOT_DISPATCH() do {                                      \
-    switch (pc) {                                                       \
-    case 0x5351u: S6502_AOT_ENTRY_5351_HOOK(); break;                  \
-    case 0x5801u: S6502_AOT_ENTRY_5801_HOOK(); break;                  \
-    case 0x5c5du: S6502_AOT_ENTRY_5C5D_HOOK(); break;                  \
-    case 0x5cb3u: S6502_AOT_ENTRY_5CB3_HOOK(); break;                  \
-    case 0x5ce5u: S6502_AOT_ENTRY_5CE5_HOOK(); break;                  \
-    case 0x608au: S6502_AOT_ENTRY_608A_HOOK(); break;                  \
-    case 0x650fu: S6502_AOT_ENTRY_650F_HOOK(); break;                  \
-    case 0x682du: S6502_AOT_ENTRY_682D_HOOK(); break;                  \
-    case 0x690fu: S6502_AOT_ENTRY_690F_HOOK(); break;                  \
-    case 0x6988u: S6502_AOT_ENTRY_6988_HOOK(); break;                  \
-    case 0x6a75u: S6502_AOT_ENTRY_6A75_HOOK(); break;                  \
-    case 0x6aa7u: S6502_AOT_ENTRY_6AA7_HOOK(); break;                  \
-    case 0x6ae0u: S6502_AOT_ENTRY_6AE0_HOOK(); break;                  \
-    case 0x6b1au: S6502_AOT_ENTRY_6B1A_HOOK(); break;                  \
-    case 0x6ba4u: S6502_AOT_ENTRY_6BA4_HOOK(); break;                  \
-    case 0x7937u: S6502_AOT_ENTRY_7937_HOOK(); break;                  \
-    case 0x8039u: S6502_AOT_ENTRY_8039_HOOK(); break;                  \
-    case 0x859eu: S6502_AOT_ENTRY_859E_HOOK(); break;                  \
-    case 0x876bu: S6502_AOT_ENTRY_876B_HOOK(); break;                  \
-    case 0xd1a2u: S6502_AOT_ENTRY_D1A2_HOOK(); break;                  \
-    case 0xd2cau: S6502_AOT_ENTRY_D2CA_HOOK(); break;                  \
-    case 0xd340u: S6502_AOT_ENTRY_D340_HOOK(); break;                  \
-    case 0xd349u: S6502_AOT_ENTRY_D349_HOOK(); break;                  \
-    case 0xd352u: S6502_AOT_ENTRY_D352_HOOK(); break;                  \
-    case 0xd35du: S6502_AOT_ENTRY_D35D_HOOK(); break;                  \
-    case 0xd35fu: S6502_AOT_ENTRY_D35F_HOOK(); break;                  \
-    case 0xd362u: S6502_AOT_ENTRY_D362_HOOK(); break;                  \
-    case 0xd572u: S6502_AOT_ENTRY_D572_HOOK(); break;                  \
-    case 0xd596u: S6502_AOT_ENTRY_D596_HOOK(); break;                  \
-    case 0xf52au: S6502_AOT_ENTRY_F52A_HOOK(); break;                  \
-    case 0xf549u: S6502_AOT_ENTRY_F549_HOOK(); break;                  \
-    case 0xf55bu: S6502_AOT_ENTRY_F55B_HOOK(); break;                  \
-    default: break;                                                     \
-    }                                                                   \
+#define S6502_NATIVE_CASE(physical, virtual_pc, hook) case virtual_pc: host_profile_phase(HP_HLE); host_hle_select(HP_HLE_LOOKUP); hook(); break;
+#define S6502_AOT_DISPATCH() do { \
+    switch (pc) { \
+        S6502_FIRMWARE_NATIVE_ENTRIES(S6502_NATIVE_CASE) \
+        default: break; \
+    } \
 } while (0)
 #define S6502_FIRMWARE_AOT_EXTERNAL
 #else
@@ -735,6 +1012,10 @@ static uint8_t s6502_firmware_hle_wide_glyph_validation;
 static uint8_t s6502_firmware_hle_multiply_validation;
 static uint8_t s6502_firmware_hle_compare_validation;
 static uint8_t s6502_firmware_hle_bank_switch_validation;
+static uint8_t s6502_firmware_hle_bank_query_validation;
+static uint8_t s6502_firmware_hle_bank_range_validation;
+static uint8_t s6502_firmware_hle_bank_get_validation;
+static uint32_t s6502_bank_query_hits, s6502_bank_query_cycles;
 static uint8_t s6502_firmware_hle_c_runtime_validation;
 static uint8_t s6502_firmware_hle_compare_long_validation;
 static uint8_t s6502_firmware_hle_indirect_call_validation;
@@ -887,6 +1168,9 @@ static __attribute__((noinline)) int s6502_firmware_hle_multiply_match(void);
 static __attribute__((noinline)) int s6502_firmware_hle_compare_match(void);
 static __attribute__((noinline)) int
 s6502_firmware_hle_bank_switch_match(void);
+static int s6502_firmware_hle_bank_query_match(void);
+static uint16_t s6502_firmware_hle_bank_range_cycles(uint16_t pc, uint8_t ac, uint8_t ix);
+static uint16_t s6502_firmware_hle_bank_get_cycles(void);
 static __attribute__((noinline)) int s6502_firmware_hle_c_runtime_match(void);
 static __attribute__((noinline)) int s6502_firmware_hle_compare_long_match(void);
 static __attribute__((noinline)) int s6502_firmware_hle_indirect_call_match(void);
@@ -897,6 +1181,8 @@ s6502_firmware_hle_compare_cycles(void);
 static __attribute__((noinline)) void s6502_firmware_hle_compare16(
     uint32_t sp, uint32_t status, s6502_hle_compare_result_t *result
 );
+/* Shared by the ordinary glyph HLE and the optional whole-region helpers. */
+static uint8_t *s6502_stack_ram;
 #ifdef GAM4980_ENABLE_AGGRESSIVE_REGION_HLE
 typedef uint32_t (*s6502_hle_shift_row_cycles_fn)(const uint8_t *ram);
 typedef int (*s6502_hle_shift_prefix_fn)(
@@ -923,7 +1209,6 @@ static S6502_IRAM_SHIFT_REGION_FUNCTION int s6502_firmware_hle_shift_region(
     s6502_hle_shift_row_cycles_fn row_cycles_function,
     s6502_hle_shift_prefix_fn prefix_function
 );
-static uint8_t *s6502_stack_ram;
 static inline __attribute__((always_inline)) uint16_t
 s6502_firmware_hle_zp16(const uint8_t *ram, uint32_t low);
 static inline __attribute__((always_inline)) uint32_t
@@ -1993,6 +2278,7 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_wide_glyph_row(
     defined(GAM4980_RUNTIME_PERFORMANCE_LOG) || \
     defined(GAM4980_ENABLE_FIRMWARE_HLE)
 #define S6502_HLE_ATTEMPT(id) do {                                         \
+    host_hle_event((id), 0u);                                              \
     if (s6502_performance_debug)                                           \
         ++s6502_firmware_hle_attempts[(id)];                               \
 } while (0)
@@ -2001,14 +2287,17 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_wide_glyph_row(
         s6502_firmware_hle_attempts[(id)] += (count);                      \
 } while (0)
 #define S6502_HLE_CONDITION_REJECT(id) do {                                \
+    host_hle_event((id), 2u);                                              \
     if (s6502_performance_debug)                                           \
         ++s6502_firmware_hle_condition_rejects[(id)];                      \
 } while (0)
 #define S6502_HLE_BUDGET_REJECT(id) do {                                   \
+    host_hle_event((id), 3u);                                              \
     if (s6502_performance_debug)                                           \
         ++s6502_firmware_hle_budget_rejects[(id)];                         \
 } while (0)
 #define S6502_HLE_RECORD(id, cycles) do {                                  \
+    host_hle_event((id), 1u);                                              \
     if (s6502_performance_debug) {                                         \
         ++s6502_firmware_hle_hits;                                         \
         s6502_firmware_hle_guest_cycles += (cycles);                       \
@@ -2017,6 +2306,7 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_wide_glyph_row(
     }                                                                      \
 } while (0)
 #define S6502_HLE_RECORD_BATCH(id, hits, cycles) do {                       \
+    host_hle_event((id), 1u);                                              \
     if (s6502_performance_debug) {                                         \
         s6502_firmware_hle_hits += (hits);                                 \
         s6502_firmware_hle_guest_cycles += (cycles);                       \
@@ -2362,6 +2652,7 @@ s6502_firmware_hle_glyph_row_cycles(uint32_t source_index, int wide)
         S6502_HLE_CONDITION_REJECT(S6502_HLE_ID_BYTE_FILL);                \
     }                                                                       \
 } while (0)
+#ifdef GAM4980_ENABLE_AGGRESSIVE_REGION_HLE
 #define S6502_HLE_DISPATCH_876B() do {                                      \
     S6502_HLE_ATTEMPT(S6502_HLE_ID_GRAPHICS_ADDRESS);                      \
     if ((GAM4980_FIRMWARE_HLE_MASK & S6502_HLE_GRAPHICS_ADDRESS) &&        \
@@ -2405,6 +2696,13 @@ s6502_firmware_hle_glyph_row_cycles(uint32_t source_index, int wide)
 #define S6502_HLE_DISPATCH_5801()                                          \
     S6502_HLE_PART_PICTURE_ROW_DISPATCH(                                   \
         _hle_ebin_part_picture_row_left)
+#else
+#define S6502_HLE_DISPATCH_876B() ((void)0)
+#define S6502_HLE_DISPATCH_8039() ((void)0)
+#define S6502_HLE_DISPATCH_859E() ((void)0)
+#define S6502_HLE_DISPATCH_5351() ((void)0)
+#define S6502_HLE_DISPATCH_5801() ((void)0)
+#endif
 #define S6502_HLE_DISPATCH_D1A2() do {                                      \
     S6502_HLE_ATTEMPT(S6502_HLE_ID_MULTIPLY16);                            \
     if ((GAM4980_FIRMWARE_HLE_MASK & S6502_HLE_MULTIPLY16) &&               \
@@ -2484,8 +2782,7 @@ s6502_firmware_hle_glyph_row_cycles(uint32_t source_index, int wide)
     uint16_t hle_right = READ16W(0x0023u);                                 \
     uint16_t hle_index;                                                     \
     uint16_t hle_nonzero = 0u;                                             \
-    uint16_t hle_difference;                                               \
-    uint8_t hle_carry = 1u;                                                \
+    uint32_t hle_a = 0u, hle_b = 0u;                                      \
     S6502_HLE_ATTEMPT(S6502_HLE_ID_COMPARE_LONG);                          \
     if ((GAM4980_FIRMWARE_HLE_MASK & S6502_HLE_C_RUNTIME) &&                \
         s6502_firmware_hle_enabled && !DECIMAL_p &&                         \
@@ -2500,18 +2797,15 @@ s6502_firmware_hle_glyph_row_cycles(uint32_t source_index, int wide)
             s6502_firmware_hle_compare_long_match())) {                    \
         et = 0u;                                                           \
         for (hle_index = 0u; hle_index < 4u; ++hle_index) {                \
-            hle_difference = (uint16_t)(                                   \
-                READ8((uint16_t)(hle_left + hle_index)) +                  \
-                (uint8_t)~READ8((uint16_t)(hle_right + hle_index)) +       \
-                hle_carry);                                                \
-            hle_carry = hle_difference > 0xffu;                            \
-            hle_nonzero += (uint8_t)hle_difference != 0u;                  \
+            hle_a |= (uint32_t)READ8((uint16_t)(hle_left + hle_index)) << (8u * hle_index); \
+            hle_b |= (uint32_t)READ8((uint16_t)(hle_right + hle_index)) << (8u * hle_index); \
             if (hle_index) {                                               \
                 et = (uint16_t)(et +                                       \
                     (((hle_left & 0xffu) + hle_index) > 0xffu) +           \
                     (((hle_right & 0xffu) + hle_index) > 0xffu));          \
             }                                                              \
         }                                                                  \
+        hle_nonzero = fw_compare_count(hle_a - hle_b, 4u);                  \
         et = (uint16_t)(et + (hle_nonzero ? 92u : 91u) +                  \
             8u * hle_nonzero);                                             \
         if ((uint32_t)et <= cycles - executed)                             \
@@ -2520,6 +2814,39 @@ s6502_firmware_hle_glyph_row_cycles(uint32_t source_index, int wide)
     } else {                                                               \
         S6502_HLE_CONDITION_REJECT(S6502_HLE_ID_COMPARE_LONG);             \
     }                                                                      \
+} while (0)
+#define S6502_HLE_BANK_GET_DISPATCH() do {                                \
+    if ((GAM4980_FIRMWARE_HLE_MASK & S6502_HLE_BANK_SWITCH) &&            \
+        s6502_firmware_hle_enabled &&                                  \
+        s6502_firmware_hle_banks[15] == 0x0eaau) {                      \
+        et = s6502_firmware_hle_bank_get_cycles();                      \
+        if (et && (uint32_t)et <= cycles - executed)                    \
+            goto _hle_ebin_bank_get;                                   \
+    }                                                                 \
+} while (0)
+
+#define S6502_HLE_BANK_RANGE_DISPATCH() do {                              \
+    if ((GAM4980_FIRMWARE_HLE_MASK & S6502_HLE_BANK_SWITCH) &&             \
+        s6502_firmware_hle_enabled && !DECIMAL_p &&                      \
+        s6502_firmware_hle_banks[15] == 0x0eaau) {                       \
+        et = s6502_firmware_hle_bank_range_cycles(pc, ac, ix);            \
+        if (et && (uint32_t)et <= cycles - executed)                     \
+            goto _hle_ebin_bank_range;                                 \
+    }                                                                  \
+} while (0)
+#define S6502_HLE_BANK_QUERY_DISPATCH() do {                              \
+    if ((GAM4980_FIRMWARE_HLE_MASK & S6502_HLE_BANK_SWITCH) &&             \
+        s6502_firmware_hle_enabled && !DECIMAL_p &&                      \
+        s6502_firmware_hle_banks[15] == 0x0eaau &&                       \
+        (pc == 0xf4a5u || (pc == 0xf4adu && ac == 5u) ||                \
+         (pc == 0xf4afu && READ8(0x000cu) == 5u)) &&                    \
+        s6502_firmware_hle_bank_query_match()) {                         \
+        et = (uint16_t)(108u +                                         \
+            (((s6502_firmware_hle_banks[5] >> 8) < READ8(0x03d5u)) ? 2u : 0u) - \
+            (pc == 0xf4a5u ? 0u : pc == 0xf4adu ? 17u : 20u));         \
+        if ((uint32_t)et <= cycles - executed)                          \
+            goto _hle_ebin_bank_query;                                 \
+    }                                                                  \
 } while (0)
 #define S6502_HLE_BANK_SWITCH_DISPATCH(cycle_count, target) do {            \
     S6502_HLE_ATTEMPT(S6502_HLE_ID_BANK_SWITCH);                           \
@@ -3251,11 +3578,44 @@ static __attribute__((noinline)) int s6502_hle_try_direct_shift_blit(
 #define S6502_AOT_ENTRY_D362_HOOK() ((void)0)
 #define S6502_AOT_ENTRY_D572_HOOK() ((void)0)
 #define S6502_AOT_ENTRY_F52A_HOOK() ((void)0)
+#define S6502_HLE_BANK_QUERY_DISPATCH() ((void)0)
+#define S6502_HLE_BANK_RANGE_DISPATCH() ((void)0)
+#define S6502_HLE_BANK_GET_DISPATCH() ((void)0)
 #define S6502_AOT_ENTRY_F549_HOOK() ((void)0)
 #define S6502_AOT_ENTRY_F55B_HOOK() ((void)0)
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
 #define S6502_GAME_HLE_DISPATCH() ((void)0)
 #endif
+#endif
+#ifdef GAM4980_NATIVE_GRAPHICS_ONLY
+/* These computational entries live only in the dynamically loaded NAT.
+ * A missing/rejected function falls back to the 6502 instruction engine. */
+#undef S6502_HLE_DISPATCH_682D
+#define S6502_HLE_DISPATCH_682D() ((void)0)
+#undef S6502_HLE_DISPATCH_690F
+#define S6502_HLE_DISPATCH_690F() ((void)0)
+#undef S6502_HLE_DISPATCH_6988
+#define S6502_HLE_DISPATCH_6988() ((void)0)
+#undef S6502_HLE_DISPATCH_6B1A
+#define S6502_HLE_DISPATCH_6B1A() ((void)0)
+#undef S6502_HLE_DISPATCH_6BA4
+#define S6502_HLE_DISPATCH_6BA4() ((void)0)
+#undef S6502_HLE_DISPATCH_5C5D
+#define S6502_HLE_DISPATCH_5C5D() ((void)0)
+#undef S6502_HLE_DISPATCH_876B
+#define S6502_HLE_DISPATCH_876B() ((void)0)
+#undef S6502_HLE_DISPATCH_8039
+#define S6502_HLE_DISPATCH_8039() ((void)0)
+#undef S6502_HLE_DISPATCH_859E
+#define S6502_HLE_DISPATCH_859E() ((void)0)
+#undef S6502_HLE_DISPATCH_5351
+#define S6502_HLE_DISPATCH_5351() ((void)0)
+#undef S6502_HLE_DISPATCH_5801
+#define S6502_HLE_DISPATCH_5801() ((void)0)
+#undef S6502_HLE_DISPATCH_650F
+#define S6502_HLE_DISPATCH_650F() ((void)0)
+#undef S6502_HLE_DISPATCH_608A
+#define S6502_HLE_DISPATCH_608A() ((void)0)
 #endif
 #ifdef GAM4980_ENABLE_PROFILING
 static void profile_instruction(uint16_t virtual_pc, uint8_t opcode);
@@ -3293,7 +3653,6 @@ static uint32_t s6502_iram_exec_burst_call(
 #define READX16(addr)     mem_readx16(addr)
 #define READ16W(addr)     mem_read16_wrapped(addr)
 #define WRITE8(addr, val) mem_write(addr, val)
-static uint8_t *s6502_stack_ram;
 static uint8_t *s6502_page3;
 #define S6502_FAST_STACK_RAM s6502_stack_ram
 #if defined(GAM4980_ENABLE_AOT) && \
@@ -3539,6 +3898,9 @@ static uint8_t s6502_native_fastchain_active;
 #undef S6502_HLE_DISPATCH_F549
 #undef S6502_HLE_DISPATCH_F55B
 #undef S6502_HLE_BANK_SWITCH_DISPATCH
+#undef S6502_HLE_BANK_QUERY_DISPATCH
+#undef S6502_HLE_BANK_RANGE_DISPATCH
+#undef S6502_HLE_BANK_GET_DISPATCH
 #undef S6502_HLE_COMPARE_SUFFIX_COMMON
 #undef S6502_HLE_HELPER_6646_CYCLES
 #undef S6502_HLE_ATTEMPT
@@ -3688,8 +4050,10 @@ static int s6502_iram_exec_residency_valid;
 /* One byte per virtual PC makes the control-transfer test a single indexed
  * load in the resident S1C33 loop.  The previous packed bitmap saved 56 KiB
  * but paid shifts and masks at every taken branch, JSR, JMP and RTS. */
+#ifndef GAM4980_ENABLE_GAME_LOAD_AOT
 static uint8_t s6502_iram_dispatch_bits[0x10000u]
     GAM4980_CACHE_STORAGE;
+#endif
 static uint16_t s6502_iram_dispatch_bank[16] GAM4980_CACHE_STORAGE;
 #ifdef GAM4980_ENABLE_AOT
 #define S6502_IRAM_FIRMWARE_BANK_FIRST 0x0ea0u
@@ -3706,6 +4070,8 @@ static int s6502_iram_keep_firmware_aot(
     const s6502_aot_block_t *block
 )
 {
+    if (!GAM4980_ENABLE_LEGACY_INSTRUCTION_AOT)
+        return 0;
     return block->instruction_count >=
         S6502_IRAM_FIRMWARE_AOT_MIN_INSTRUCTIONS;
 }
@@ -3721,23 +4087,129 @@ typedef struct s6502_iram_firmware_hle_entry {
  * virtual-PC-only hooks caused thousands of rejected exits in game code. */
 static const s6502_iram_firmware_hle_entry_t
     s6502_iram_firmware_hle_entries[] = {
-        {0xeb8351u, 0x5351u}, {0xeb8801u, 0x5801u},
-        {0xeb8c5du, 0x5c5du}, {0xeb8cb3u, 0x5cb3u},
-        {0xeb8ce5u, 0x5ce5u}, {0xeb508au, 0x608au},
-        {0xeb550fu, 0x650fu}, {0xeb582du, 0x682du},
-        {0xeb590fu, 0x690fu}, {0xeb5988u, 0x6988u},
-        {0xeb5a75u, 0x6a75u}, {0xeb5aa7u, 0x6aa7u},
-        {0xeb5ae0u, 0x6ae0u}, {0xeb5b1au, 0x6b1au},
-        {0xeb5ba4u, 0x6ba4u}, {0xebe937u, 0x7937u},
-        {0xeb7039u, 0x8039u}, {0xeb759eu, 0x859eu},
-        {0xeb776bu, 0x876bu}, {0xea81a2u, 0xd1a2u},
-        {0xea82cau, 0xd2cau}, {0xea8340u, 0xd340u},
-        {0xea8349u, 0xd349u}, {0xea8352u, 0xd352u},
-        {0xea835du, 0xd35du}, {0xea835fu, 0xd35fu},
-        {0xea8362u, 0xd362u}, {0xea8572u, 0xd572u},
-        {0xea8596u, 0xd596u}, {0xeaa52au, 0xf52au},
-        {0xeaa549u, 0xf549u}, {0xeaa55bu, 0xf55bu}
+#define S6502_NATIVE_ADDRESS(physical, virtual_pc, hook) {physical, virtual_pc},
+        S6502_FIRMWARE_NATIVE_ENTRIES(S6502_NATIVE_ADDRESS)
+#undef S6502_NATIVE_ADDRESS
+#ifdef GAM4980_AUTHORED_FIRMWARE
+        {0xeaa5bdu, 0xf5bdu},
+        {0xeaa68au, 0xf68au},
+        {0xea8184u, 0xd184u},
+        {0xea86afu, 0xd6afu},
+        {0xea8cefu, 0xdcefu},
+        {0xea8cf4u, 0xdcf4u},
+        {0xea8c7bu, 0xdc7bu},
+        {0xea8c80u, 0xdc80u},
+        {0xea8d1fu, 0xdd1fu},
+        {0xea8d38u, 0xdd38u},
+        {0xea8d58u, 0xdd58u},
+        {0xea8d75u, 0xdd75u},
+        {0xea8000u, 0xd000u},
+        {0xea8032u, 0xd032u},
+        {0xea83efu, 0xd3efu},
+        {0xea839bu, 0xd39bu},
+        {0xea85c6u, 0xd5c6u},
+        {0xea85dcu, 0xd5dcu},
+        {0xea865bu, 0xd65bu},
+        {0xea8201u, 0xd201u},
+        {0xea80a8u, 0xd0a8u},
+        {0xea8c83u, 0xdc83u},
+        {0xea8cc8u, 0xdcc8u},
+        {0xea8435u, 0xd435u},
+        {0xea8604u, 0xd604u},
+        {0xea86f5u, 0xd6f5u},
+        {0xea8752u, 0xd752u},
+        {0xea9039u, 0xe039u},
+        {0xea951cu, 0xe51cu},
+        {0xea8d8fu, 0xdd8fu},
+        {0xea9282u, 0xe282u},
+        {0xea9524u, 0xe524u},
+        {0xea931du, 0xe31du},
+        {0xea9528u, 0xe528u},
+        {0xea93b7u, 0xe3b7u},
+        {0xea952cu, 0xe52cu},
+        {0xea9100u, 0xe100u},
+        {0xea9520u, 0xe520u},
+        {0xea8e29u, 0xde29u},
+        {0xea9517u, 0xe517u},
+        {0xea9530u, 0xe530u},
+        {0xea831au, 0xd31au},
+        {0xea84e1u, 0xd4e1u}, {0xea8557u, 0xd557u},
+        {0xea8835u, 0xd835u}, {0xea888au, 0xd88au},
+        {0xea8d4fu, 0xdd4fu}, {0xea8d8cu, 0xdd8cu},
+        {0xea8498u, 0xd498u}, {0xea84c0u, 0xd4c0u},
+        {0xea8506u, 0xd506u}, {0xea8534u, 0xd534u},
+        {0xea8d19u, 0xdd19u}, {0xea8d32u, 0xdd32u},
+        {0xea8d52u, 0xdd52u}, {0xea8d6fu, 0xdd6fu},
+        {0xea881du, 0xd81du}, {0xea8825u, 0xd825u},
+        {0xea886cu, 0xd86cu}, {0xea8878u, 0xd878u},
+        {0xea82f6u, 0xd2f6u}, {0xea8313u, 0xd313u},
+        {0xea8b5cu, 0xdb5cu},
+        {0xeb13ddu, 0x63ddu},
+        {0xeb0fc4u, 0x5fc4u},
+        {0xeb104fu, 0x604fu},
+        {0xea8cf7u, 0xdcf7u},
+        {0xea8cabu, 0xdcabu},
+        {0xea8cb1u, 0xdcb1u},
+        {0xea8780u, 0xd780u},
+        {0xea87b4u, 0xd7b4u},
+        {0xea87f1u, 0xd7f1u},
+        {0xea849eu, 0xd49eu},
+        {0xea84a9u, 0xd4a9u},
+        {0xea84c6u, 0xd4c6u},
+        {0xea8519u, 0xd519u},
+        {0xea853au, 0xd53au},
+        {0xea850cu, 0xd50cu},
+        {0xea885fu, 0xd85fu},
+        {0xea885au, 0xd85au},
+        {0xea88a5u, 0xd8a5u},
+        {0xea88aeu, 0xd8aeu},
+        {0xea8586u, 0xd586u},
+        {0xea85a6u, 0xd5a6u},
+        {0xea85b6u, 0xd5b6u},
+        {0xea87a6u, 0xd7a6u},
+        {0xea87e1u, 0xd7e1u},
+        {0xea829du, 0xd29du},
+        {0xea88bdu, 0xd8bdu},
+        {0xea8b2fu, 0xdb2fu},
+        {0xea8db8u, 0xddb8u},
+        {0xea8a09u, 0xda09u},
+        {0xea88e9u, 0xd8e9u},
+        {0xea8be1u, 0xdbe1u},
+        {0xea8da7u, 0xdda7u},
+        {0xea8de4u, 0xdde4u},
+        {0xea8deeu, 0xddeeu},
+        {0xea8e02u, 0xde02u},
+        {0xea8aaau, 0xdaaau},
+        {0xea8ac1u, 0xdac1u},
+        {0xea8ac4u, 0xdac4u},
+        {0xea8ac7u, 0xdac7u},
+        {0xea8acau, 0xdacau},
+        {0xea8ae6u, 0xdae6u},
+        {0xea8afcu, 0xdafcu},
+        {0xea8b19u, 0xdb19u},
+        {0xea8a1au, 0xda1au},
+        {0xea8a3du, 0xda3du},
+        {0xea8c0eu, 0xdc0eu},
+        {0xea890bu, 0xd90bu},
+        {0xea893fu, 0xd93fu},
+        {0xea89dfu, 0xd9dfu},
+        {0xea89f3u, 0xd9f3u},
+        {0xea8bf2u, 0xdbf2u},
+#endif
     };
+/* Bank changes are common in C6502 calls. Index immutable firmware entries
+ * once during dispatch preparation instead of scanning every hook twice on
+ * each remap. The final bucket preserves future out-of-range entries; it is
+ * empty for the current firmware. Each link is an entry index plus one. */
+#define S6502_IRAM_HLE_BANK_FIRST 0x0ea0u
+#define S6502_IRAM_HLE_BANK_COUNT 0x0040u
+#define S6502_IRAM_FIRMWARE_HLE_ENTRY_COUNT \
+    (sizeof(s6502_iram_firmware_hle_entries) / \
+        sizeof(s6502_iram_firmware_hle_entries[0]))
+static uint16_t s6502_iram_firmware_hle_head[
+    S6502_IRAM_HLE_BANK_COUNT + 1u] GAM4980_CACHE_STORAGE;
+static uint16_t s6502_iram_firmware_hle_next[
+    S6502_IRAM_FIRMWARE_HLE_ENTRY_COUNT] GAM4980_CACHE_STORAGE;
 #endif
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
 #define S6502_IRAM_GAME_BANK_FIRST 0x0200u
@@ -3761,6 +4233,13 @@ static int s6502_iram_keep_game_aot(
 {
     if (entry->semantic == C6502_TEMPLATE_FAR_CALL)
         return 1;
+    if (entry->semantic >= C6502_TEMPLATE_ADD16_IMM_GENERIC &&
+        entry->semantic <= C6502_TEMPLATE_STORE_STACK8_GENERIC)
+        return 1;
+    if (entry->pattern == S6502_GAME_AOT_TRACE_PATTERN)
+        return entry->memory_class >=
+                S6502_GAME_AOT_TRACE_MIN_INSTRUCTIONS &&
+            entry->cycle_cost >= S6502_IRAM_GAME_AOT_MIN_CYCLES;
 #ifdef GAM4980_IRAM_EXEC_ASM
     /* These compiler phrases are executed from private shadow decode pages
      * by the resident engine.  Publishing their C AOT entries would force a
@@ -4800,7 +5279,11 @@ static uint32_t s6502_iram_native_chain_call(
     state.sp = *sp;
     state.status = *status;
     s6502_native_fastchain_active = 1u;
-    executed = s6502_exec(&state, cycle_budget);
+    {
+        u32 previous = host_profile_enter(HP_FASTCHAIN);
+        executed = s6502_exec(&state, cycle_budget);
+        host_profile_leave(previous);
+    }
     s6502_native_fastchain_active = 0u;
     if (s6502_iram_diagnostics_enabled)
         ++s6502_iram_fastchain_calls;
@@ -4852,6 +5335,35 @@ static uint32_t s6502_iram_exec_burst_call(
     context.instructions = 0u;
     context.control_transitions = 0u;
     context.exit_reason = S6502_IRAM_EXIT_SLOW;
+    /* Stable for this burst invocation: bank changes update table contents,
+     * not the table objects. Keep live code-page/native-module selection in
+     * the reentry loop below, but do not republish immutable ABI services. */
+    context.pages = (uint32_t)(unsigned long)sys.mem_r;
+    context.page_kind = (uint32_t)(unsigned long)s6502_iram_page_kind;
+    context.ram = (uint32_t)(unsigned long)sys.ram;
+    context.dirty = (uint32_t)(unsigned long)&lcd_dirty;
+    context.dispatch_bits = (uint32_t)(unsigned long)s6502_iram_dispatch_bits;
+    context.super_hits = s6502_iram_diagnostics_enabled
+        ? (uint32_t)(unsigned long)g_gam4980_iram_super_hits : 0u;
+    context.read8 = (uint32_t)(unsigned long)mem_read;
+    context.write8 = (uint32_t)(unsigned long)native_module_mem_write;
+    context.native_epoch = (uint32_t)(unsigned long)&native_module_mapping_epoch;
+    native_graphics_services.page3 = (uint32_t)(unsigned long)s6502_page3;
+    native_graphics_services.banks = (uint32_t)(unsigned long)sys.bk_tab;
+    native_graphics_services.write8_resolved = (uint32_t)(unsigned long)native_graphics_write8_resolved;
+    native_graphics_services.poll = (uint32_t)(unsigned long)native_graphics_poll;
+    native_graphics_services.metrics = s6502_native_shared_metrics.diagnostics_enabled
+        ? (uint32_t)(unsigned long)native_graphics_io_metrics : 0u;
+    context.graphics = (uint32_t)(unsigned long)&native_graphics_services;
+#ifdef GAM4980_RUNTIME_PERFORMANCE_LOG
+    context.lcd_write_calls = s6502_iram_diagnostics_enabled
+        ? (uint32_t)(unsigned long)&performance_lcd_write_calls : 0u;
+    context.lcd_changed_writes = s6502_iram_diagnostics_enabled
+        ? (uint32_t)(unsigned long)&performance_lcd_changed_writes : 0u;
+#else
+    context.lcd_write_calls = 0u;
+    context.lcd_changed_writes = 0u;
+#endif
 #if defined(GAM4980_ENABLE_AOT)
     native_module_begin_burst();
 #endif
@@ -4870,39 +5382,27 @@ static uint32_t s6502_iram_exec_burst_call(
 #else
         function = (T_IramExecFunction)(void *)s6502_iram_exec_entry;
 #endif
-        /* A native HLE/AOT call may switch banks or temporarily use the SDK
-         * ROM gateway.  Republish every host pointer before each IRAM entry;
-         * no mapping-change flag can then become a missed correctness edge. */
+        /* Native calls can change mapping contents and shadow/native mode. */
         context.cycle_budget = cycle_budget - total_executed;
-        context.pages = (uint32_t)(unsigned long)sys.mem_r;
-        context.page_kind = (uint32_t)(unsigned long)s6502_iram_page_kind;
-        context.ram = (uint32_t)(unsigned long)sys.ram;
-        context.dirty = (uint32_t)(unsigned long)&lcd_dirty;
-        context.dispatch_bits =
-            (uint32_t)(unsigned long)s6502_iram_dispatch_bits;
+        context.register_entries = (uint32_t)(unsigned long)native_register_entries;
+#if defined(__s1c33__)
+        if (host_profile.current && host_profile.clock)
+            context.register_entries = (uint32_t)(unsigned long)native_profile_register_entries;
+#endif
+        context.register_banks = (uint32_t)(unsigned long)sys.bk_tab;
+        context.register_calls = 0u;
         /* After adaptive shadow disable, fetch directly through the live page
          * table.  Bank switches can then leave shadow refresh as an O(1) no-op
          * without ever exposing an old source pointer. */
         context.code_pages = (uint32_t)(unsigned long)(
             s6502_iram_shadow_enabled ? s6502_iram_code_pages : sys.mem_r
         );
-        context.super_hits = s6502_iram_diagnostics_enabled
-            ? (uint32_t)(unsigned long)g_gam4980_iram_super_hits : 0u;
-        context.read8 = (uint32_t)(unsigned long)mem_read;
-        context.write8 = (uint32_t)(unsigned long)native_module_mem_write;
-        context.native_epoch =
-            (uint32_t)(unsigned long)&native_module_mapping_epoch;
-#ifdef GAM4980_RUNTIME_PERFORMANCE_LOG
-        context.lcd_write_calls = s6502_iram_diagnostics_enabled
-            ? (uint32_t)(unsigned long)&performance_lcd_write_calls : 0u;
-        context.lcd_changed_writes = s6502_iram_diagnostics_enabled
-            ? (uint32_t)(unsigned long)&performance_lcd_changed_writes : 0u;
-#else
-        context.lcd_write_calls = 0u;
-        context.lcd_changed_writes = 0u;
-#endif
 #if defined(GAM4980_ENABLE_AOT)
-        if (native_module_status_value == 1u) {
+        if (native_module_status_value == 1u
+#ifdef GAM4980_STATIC_NATIVE_GAME
+            || s6502_static_native_bound
+#endif
+        ) {
             context.native_shared_entry =
                 (uint32_t)(unsigned long)native_module_page_entries;
             context.native_shared_metrics =
@@ -4915,8 +5415,13 @@ static uint32_t s6502_iram_exec_burst_call(
         context.native_shared_entry = 0u;
         context.native_shared_metrics = 0u;
 #endif
+        {
+            u32 previous = host_profile_enter(HP_IRAM);
         cycles = function(&context);
+            host_profile_leave(previous);
+        }
         executed = cycles & S6502_IRAM_RESULT_CYCLES_MASK;
+        native_register_calls += context.register_calls;
         if (s6502_iram_diagnostics_enabled) {
             ++s6502_iram_exec_calls;
             s6502_iram_record_burst(context.instructions);
@@ -5031,7 +5536,8 @@ static uint32_t s6502_iram_exec_burst_call(
     native_module_end_burst();
 #endif
     return total_executed |
-        (force_exit ? S6502_IRAM_RESULT_FORCE_EXIT : 0u);
+        (force_exit ? S6502_IRAM_RESULT_FORCE_EXIT :
+         context.exit_reason == S6502_IRAM_EXIT_SLOW ? 0x40000000u : 0u);
 #else
     typedef uint32_t (*T_IramExecFunction)(
         s6502_iram_exec_state_t *, uint32_t, uint8_t *const *,
@@ -5155,7 +5661,8 @@ static uint32_t s6502_iram_exec_burst_call(
     *sp = state.sp;
     *status = state.status;
     return total_executed |
-        (force_exit ? S6502_IRAM_RESULT_FORCE_EXIT : 0u);
+        (force_exit ? S6502_IRAM_RESULT_FORCE_EXIT :
+         state.exit_reason == S6502_IRAM_EXIT_SLOW ? 0x40000000u : 0u);
 #endif /* GAM4980_IRAM_EXEC_ASM */
 }
 
@@ -5237,15 +5744,17 @@ static uint8_t s6502_iram_shadow_template_at(
         return GAM4980_IRAM_SUPER_ADD16_OPER1_OPER2;
     }
     if (remaining >= 8u && code[0] == 0xa9u && code[2] == 0x85u &&
-        code[4] == 0xa9u && code[6] == 0x85u) {
-        if (code[3] == 0x20u && code[7] == 0x21u) {
-            *size = 8u;
-            return GAM4980_IRAM_SUPER_LOAD_OPER1_IMM16;
-        }
+        code[4] == 0xa9u && code[6] == 0x85u && code[3] != 0xffu &&
+        code[7] == (uint8_t)(code[3] + 1u)) {
+        /* The C6502 code generator uses this phrase for every adjacent
+         * 16-bit immediate store.  OPER2 retains its own metric bucket;
+         * arbitrary destinations share the historical OPER1 bucket. */
         if (code[3] == 0x23u && code[7] == 0x24u) {
             *size = 8u;
             return GAM4980_IRAM_SUPER_LOAD_OPER2_IMM16;
         }
+        *size = 8u;
+        return GAM4980_IRAM_SUPER_LOAD_OPER1_IMM16;
     }
 #else
     (void)code;
@@ -5603,16 +6112,20 @@ static void s6502_iram_apply_firmware_hle_bank(
     uint32_t virtual_bank, uint16_t physical_bank, int set_bits
 )
 {
-    uint32_t index;
+    uint32_t bank_index =
+        (uint32_t)physical_bank - S6502_IRAM_HLE_BANK_FIRST;
+    uint16_t link;
 
     if (set_bits && !s6502_firmware_hle_enabled)
         return;
-    for (index = 0u;
-         index < sizeof(s6502_iram_firmware_hle_entries) /
-             sizeof(s6502_iram_firmware_hle_entries[0]);
-         ++index) {
+    if (bank_index >= S6502_IRAM_HLE_BANK_COUNT)
+        bank_index = S6502_IRAM_HLE_BANK_COUNT;
+    link = s6502_iram_firmware_hle_head[bank_index];
+    while (link) {
+        uint32_t index = (uint32_t)link - 1u;
         const s6502_iram_firmware_hle_entry_t *entry =
             &s6502_iram_firmware_hle_entries[index];
+        link = s6502_iram_firmware_hle_next[index];
         if ((entry->virtual_pc >> 12) != virtual_bank ||
             (entry->physical_pc >> 12) != physical_bank)
             continue;
@@ -5725,6 +6238,21 @@ static void s6502_iram_prepare_dispatch_bits(void)
     s6502_iram_dispatch_firmware_hle_entries = 0u;
     s6502_iram_dispatch_game_hle_entries = 0u;
     s6502_iram_dispatch_game_aot_entries = 0u;
+
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    gam4980_memset(s6502_iram_firmware_hle_head, 0,
+        sizeof(s6502_iram_firmware_hle_head));
+    for (index = 0u; index < S6502_IRAM_FIRMWARE_HLE_ENTRY_COUNT; ++index) {
+        uint32_t bank_index =
+            (s6502_iram_firmware_hle_entries[index].physical_pc >> 12) -
+            S6502_IRAM_HLE_BANK_FIRST;
+        if (bank_index >= S6502_IRAM_HLE_BANK_COUNT)
+            bank_index = S6502_IRAM_HLE_BANK_COUNT;
+        s6502_iram_firmware_hle_next[index] =
+            s6502_iram_firmware_hle_head[bank_index];
+        s6502_iram_firmware_hle_head[bank_index] = (uint16_t)(index + 1u);
+    }
+#endif
 
     /* Do not publish firmware AOT by virtual PC alone.  The game and firmware
      * share the $5000-$8fff windows, so the old fixed bitmap produced false
@@ -5852,6 +6380,7 @@ void gam4980_set_iram_exec_enabled(int enabled)
         return;
     }
     s6502_iram_exec_calls = 0u;
+    native_register_calls = 0u;
     s6502_iram_exec_instructions = 0u;
     s6502_iram_exec_cycles = 0u;
     s6502_iram_exec_zero_fallbacks = 0u;
@@ -6203,6 +6732,10 @@ u32 gam4980_debug_read8(u32 address)
 {
     return mem_readx((uint16_t)address);
 }
+u32 gam4980_debug_bank(u32 slot)
+{
+    return slot < 16u ? sys.bk_tab[slot] : 0u;
+}
 #endif
 
 #undef S6502_IRAM_EXEC_ATTRIBUTE
@@ -6283,6 +6816,20 @@ static uint32_t rom_cache_clock;
 static uint8_t rom_bank_region[ROM_CACHE_LINES];
 static uint8_t rom_bank_valid[ROM_CACHE_LINES];
 static uint8_t rom_slot_line[16];
+/* Physical ROM identity, not a guest bank-window address: each 2 MiB ROM
+ * has 512 independently cacheable 4 KiB pages.  Only mapped cache lines are
+ * indexed; the extra one-page direct cache keeps its existing policy. */
+#define ROM_CACHE_INDEX_REGIONS 2u
+#define ROM_CACHE_INDEX_PAGES (GAM4980_ROM_SIZE / ROM_BANK_SIZE)
+typedef char rom_cache_index_layout_check[
+    GAM4980_ROM_REGION_8 == 0 && GAM4980_ROM_REGION_E == 1 &&
+    ROM_BANK_SIZE == 0x1000u && ROM_CACHE_LINES < 0xffu ? 1 : -1
+];
+static uint8_t rom_page_line_index
+    [ROM_CACHE_INDEX_REGIONS][ROM_CACHE_INDEX_PAGES] GAM4980_CACHE_STORAGE;
+static uint32_t rom_cache_index_lookup_count;
+static uint32_t rom_cache_index_hit_count;
+static uint32_t rom_cache_index_miss_count;
 static uint32_t rom_direct_page;
 static uint8_t rom_direct_region;
 static uint8_t rom_direct_valid;
@@ -6305,6 +6852,47 @@ volatile uint32_t g_gam4980_rom_trace_index;
 volatile uint32_t g_gam4980_rom_trace[256];
 #endif
 
+static inline int rom_cache_index_key_valid(uint8_t region, uint32_t page)
+{
+    return region < ROM_CACHE_INDEX_REGIONS && page < GAM4980_ROM_SIZE &&
+        (page & (ROM_BANK_SIZE - 1u)) == 0u;
+}
+
+static inline uint8_t rom_cache_index_find(uint8_t region, uint32_t page)
+{
+    uint8_t line;
+
+    if (!rom_cache_index_key_valid(region, page))
+        return 0xffu;
+    ++rom_cache_index_lookup_count;
+    line = rom_page_line_index[region][page >> 12];
+    /* Verify only the indexed line.  A stale/corrupt slot is a safe cache
+     * miss, never permission to return another physical ROM page. */
+    if (line < ROM_CACHE_LINES && rom_bank_valid[line] &&
+        rom_bank_region[line] == region && rom_bank_page[line] == page) {
+        ++rom_cache_index_hit_count;
+        return line;
+    }
+    if (line != 0xffu)
+        rom_page_line_index[region][page >> 12] = 0xffu;
+    ++rom_cache_index_miss_count;
+    return 0xffu;
+}
+
+static void rom_cache_index_forget(uint8_t line)
+{
+    uint8_t region;
+    uint32_t page;
+
+    if (line >= ROM_CACHE_LINES || !rom_bank_valid[line])
+        return;
+    region = rom_bank_region[line];
+    page = rom_bank_page[line];
+    if (rom_cache_index_key_valid(region, page) &&
+        rom_page_line_index[region][page >> 12] == line)
+        rom_page_line_index[region][page >> 12] = 0xffu;
+}
+
 static int rom_read_range(
     uint8_t region, uint32_t offset, uint8_t *out, uint32_t size
 )
@@ -6316,7 +6904,8 @@ static int rom_read_range(
     int read_ok;
 #endif
 
-    if ((!out && size) || offset > GAM4980_ROM_SIZE ||
+    if (region >= ROM_CACHE_INDEX_REGIONS || (!out && size) ||
+        offset > GAM4980_ROM_SIZE ||
         size > GAM4980_ROM_SIZE - offset)
         return 0;
     if (resident) {
@@ -6335,7 +6924,11 @@ static int rom_read_range(
         s6502_iram_exec_residency_valid;
     if (reinstall_exec_range)
         gam4980_invalidate_iram_exec_residency();
-    read_ok = sys.rom_read(sys.rom_context, region, offset, out, size);
+    {
+        u32 previous = host_profile_enter(HP_IO);
+        read_ok = sys.rom_read(sys.rom_context, region, offset, out, size);
+        host_profile_leave(previous);
+    }
     if (reinstall_exec_range && !s6502_iram_install_exec_range())
         s6502_iram_exec_enabled = 0;
     return read_ok;
@@ -6349,6 +6942,9 @@ static void rom_cache_reset(void)
     rom_cache_clock = 0u;
     gam4980_memset(rom_bank_valid, 0, sizeof(rom_bank_valid));
     gam4980_memset(rom_slot_line, 0xff, sizeof(rom_slot_line));
+    /* .scratch is not startup-zeroed.  Reset explicitly on every cache reset,
+     * including a failed warm batch, before any page can be looked up. */
+    gam4980_memset(rom_page_line_index, 0xff, sizeof(rom_page_line_index));
     rom_direct_valid = 0u;
     rom_direct_line = 0xffu;
 }
@@ -6356,6 +6952,9 @@ static void rom_cache_reset(void)
 static void rom_miss_trace_reset(void)
 {
     rom_cache_runtime_miss_count = 0u;
+    rom_cache_index_lookup_count = 0u;
+    rom_cache_index_hit_count = 0u;
+    rom_cache_index_miss_count = 0u;
     rom_miss_trace_count = 0u;
     rom_miss_trace_dropped_count = 0u;
 }
@@ -6413,6 +7012,28 @@ uint32_t gam4980_rom_cache_warm_pages(void)
 uint32_t gam4980_rom_cache_runtime_misses(void)
 {
     return rom_cache_runtime_miss_count;
+}
+
+uint32_t gam4980_rom_cache_index_bytes(void)
+{
+    return sizeof(rom_page_line_index);
+}
+
+uint32_t gam4980_rom_cache_index_lookups(void)
+{
+    /* Resident ROM and the unchanged last-direct-page fast path do not need
+     * an index probe and are intentionally excluded from these counters. */
+    return rom_cache_index_lookup_count;
+}
+
+uint32_t gam4980_rom_cache_index_hits(void)
+{
+    return rom_cache_index_hit_count;
+}
+
+uint32_t gam4980_rom_cache_index_misses(void)
+{
+    return rom_cache_index_miss_count;
 }
 
 uint32_t gam4980_rom_miss_trace_count(void)
@@ -6507,6 +7128,8 @@ int gam4980_warm_bare_rom_cache(void)
                 ((uint32_t)range->first_page + page_index) * ROM_BANK_SIZE;
             rom_bank_stamp[line] = ++rom_cache_clock;
             rom_bank_valid[line] = 1u;
+            rom_page_line_index[range->region]
+                [(uint32_t)range->first_page + page_index] = (uint8_t)line;
         }
         next_line += page_count;
         rom_cache_warm_page_count += page_count;
@@ -6543,13 +7166,13 @@ static uint8_t *rom_cached_bank(
     uint8_t selected = 0xffu;
     uint8_t line;
 
-    for (line = 0; line < ROM_CACHE_LINES; ++line) {
-        if (rom_bank_valid[line] && rom_bank_region[line] == region &&
-            rom_bank_page[line] == page) {
-            rom_slot_line[slot] = line;
-            rom_bank_stamp[line] = ++rom_cache_clock;
-            return rom_bank_cache[line];
-        }
+    if (slot >= 16u || !rom_cache_index_key_valid(region, page))
+        return 0;
+    line = rom_cache_index_find(region, page);
+    if (line != 0xffu) {
+        rom_slot_line[slot] = line;
+        rom_bank_stamp[line] = ++rom_cache_clock;
+        return rom_bank_cache[line];
     }
     ++rom_cache_runtime_miss_count;
 
@@ -6590,6 +7213,9 @@ static uint8_t *rom_cached_bank(
         rom_direct_valid = 0u;
         rom_direct_line = 0xffu;
     }
+    /* Remove the old key before an SDK callback can partially overwrite this
+     * line.  Failed reads leave neither the old nor the new page published. */
+    rom_cache_index_forget(selected);
     rom_bank_valid[selected] = 0;
     if (!rom_read_range(
             region, page, rom_bank_cache[selected], ROM_BANK_SIZE
@@ -6599,6 +7225,7 @@ static uint8_t *rom_cached_bank(
     rom_bank_page[selected] = page;
     rom_bank_stamp[selected] = ++rom_cache_clock;
     rom_bank_valid[selected] = 1;
+    rom_page_line_index[region][page >> 12] = selected;
     rom_slot_line[slot] = selected;
     return rom_bank_cache[selected];
 }
@@ -6609,7 +7236,7 @@ static uint8_t rom_read_byte(uint8_t region, uint32_t offset)
         region == GAM4980_ROM_REGION_8 ? sys.rom_8 : sys.rom_e;
     uint32_t page;
 
-    if (offset >= GAM4980_ROM_SIZE)
+    if (region >= ROM_CACHE_INDEX_REGIONS || offset >= GAM4980_ROM_SIZE)
         return 0;
     if (resident)
         return resident[offset];
@@ -6639,18 +7266,16 @@ static uint8_t rom_read_byte(uint8_t region, uint32_t offset)
          * banks.  Alias a prewarmed line instead of opening the filesystem
          * again; keep the line number so an eventual LRU eviction can safely
          * invalidate this one-entry direct cache. */
-        for (line = 0u; line < ROM_CACHE_LINES; ++line) {
-            if (rom_bank_valid[line] && rom_bank_region[line] == region &&
-                rom_bank_page[line] == page) {
-                rom_bank_stamp[line] = ++rom_cache_clock;
-                rom_direct_region = region;
-                rom_direct_page = page;
-                rom_direct_line = line;
-                rom_direct_valid = 1u;
-                return rom_bank_cache[line][
-                    offset & (ROM_BANK_SIZE - 1u)
-                ];
-            }
+        line = rom_cache_index_find(region, page);
+        if (line != 0xffu) {
+            rom_bank_stamp[line] = ++rom_cache_clock;
+            rom_direct_region = region;
+            rom_direct_page = page;
+            rom_direct_line = line;
+            rom_direct_valid = 1u;
+            return rom_bank_cache[line][
+                offset & (ROM_BANK_SIZE - 1u)
+            ];
         }
         ++rom_cache_runtime_miss_count;
         rom_miss_trace_record(
@@ -6676,6 +7301,15 @@ static const uint16_t lcd_theme_colors[GAM4980_LCD_THEME_COUNT][2] = {
     { 0x3edd, 0x09a8 },
     { 0xf72c, 0x2920 },
 };
+static uint8_t native_resource_read(uint32_t address)
+{
+    if(address>=0x800000u && address<0xa00000u)
+        return rom_read_byte(GAM4980_ROM_REGION_8,address-0x800000u);
+    if(address>=0xe00000u && address<0x1000000u)
+        return rom_read_byte(GAM4980_ROM_REGION_E,address-0xe00000u);
+    return 0;
+}
+
 static uint16_t lcd_bg = 0xd6da;
 static uint16_t lcd_fg = 0x0000;
 
@@ -6829,14 +7463,14 @@ s6502_firmware_hle_shift_row_cycles(const uint8_t *ram)
     cycles = 23u + s6502_firmware_hle_shift_first_cost(shift) +
         (width > 1u ? 39u : 38u);
     remaining = width - 1u;
-    while (remaining) {
-        uint32_t after = remaining - 1u;
-
-        cycles += s6502_firmware_hle_shift_cost(shift) +
-            s6502_firmware_hle_shift_destination_cost(destination) +
-            (after ? 39u : 37u);
-        destination = (uint16_t)(destination + 1u);
-        remaining = after;
+    if (remaining) {
+        uint32_t end = (uint32_t)destination + remaining;
+        uint32_t first_special = destination > 0x400u ? destination : 0x400u;
+        uint32_t last_special = end < 0x500u ? end : 0x500u;
+        cycles += remaining * (s6502_firmware_hle_shift_cost(shift) + 70u) - 2u;
+        if (last_special > first_special) cycles += 10u * (last_special - first_special);
+        if (destination <= 0x400u && end > 0x400u) cycles += 34u;
+        destination = (uint16_t)end;
     }
 
     if ((ram[0x2083u] & 7u) >= (column & 7u)) {
@@ -7693,39 +8327,11 @@ static __attribute__((noinline)) void s6502_firmware_hle_compare16(
     uint8_t high = s6502_stack_ram[0x21u];
     uint8_t other_low = s6502_stack_ram[0x23u];
     uint8_t other_high = s6502_stack_ram[0x24u];
-    uint16_t difference;
-    uint8_t low_result;
-    uint8_t high_result;
-    uint8_t carry;
-    uint8_t index = 0u;
-    uint8_t final_status;
+    uint16_t left = (uint16_t)(low | ((uint16_t)high << 8));
+    uint16_t right = (uint16_t)(other_low | ((uint16_t)other_high << 8));
+    uint8_t index = (uint8_t)fw_compare_count((uint16_t)(left - right), 2u);
+    uint8_t final_status = fw_compare_status(left, right, 2u, status);
     uint8_t stack_pointer = (uint8_t)sp;
-
-    difference = (uint16_t)(
-        (uint16_t)low + (uint8_t)~other_low + 1u
-    );
-    low_result = (uint8_t)difference;
-    carry = difference > 0xffu;
-    if (low_result)
-        ++index;
-
-    difference = (uint16_t)(
-        (uint16_t)high + (uint8_t)~other_high + carry
-    );
-    high_result = (uint8_t)difference;
-    if (high_result)
-        ++index;
-
-    final_status = (uint8_t)(status & ~(0xc3u));
-    if (difference > 0xffu)
-        final_status |= 0x01u;
-    if (!index)
-        final_status |= 0x02u;
-    if (((high ^ difference) &
-         ((uint8_t)~other_high ^ difference) & 0x80u) != 0u)
-        final_status |= 0x40u;
-    final_status |= high_result & 0x80u;
-    final_status |= 0x30u;
 
     /* PHP/PLA/PHA/PLP leaves the edited status byte at the current stack
      * slot.  RTS then consumes the caller's two-byte return address. */
@@ -7820,6 +8426,81 @@ static __attribute__((noinline)) int s6502_firmware_hle_multiply_match(void)
     }
     s6502_firmware_hle_multiply_validation = 1u;
     return 1;
+}
+
+static uint16_t s6502_firmware_hle_bank_get_cycles(void)
+{
+    uint32_t fnv = 2166136261u, sdbm = 0u;
+    uint16_t address, pointer, destination;
+    if (PA(0xf457u) != 0xeaa457u) return 0;
+    if (!s6502_firmware_hle_bank_get_validation) {
+        for (address = 0xf457u; address < 0xf475u; ++address) {
+            uint8_t byte = mem_readx(address);
+            fnv = (fnv ^ byte) * 16777619u;
+            sdbm = byte + sdbm * 65599u;
+        }
+        s6502_firmware_hle_bank_get_validation =
+            fnv == 0xffba6d56u && sdbm == 0x11402b71u ? 1u : 2u;
+    }
+    if (s6502_firmware_hle_bank_get_validation != 1u) return 0;
+    pointer = mem_read16(0x28u);
+    /* Do not pre-read arguments that the stack or temporary stores alias. */
+    if (pointer < 0x400u || pointer > 0x4ffeu) return 0;
+    if (pointer >= 0x1000u &&
+        (PA(pointer) < 0x400u || PA(pointer + 1u) < 0x400u)) return 0;
+    destination = mem_read16(pointer);
+    /* An output to bank/I/O registers could change subsequent code fetches. */
+    if (destination < 0x400u || destination > 0x4ffeu) return 0;
+    return (uint16_t)(67u + ((pointer & 255u) == 255u));
+}
+
+static uint16_t s6502_firmware_hle_bank_range_cycles(uint16_t pc, uint8_t ac, uint8_t ix)
+{
+    uint32_t fnv=2166136261u, sdbm=0u;
+    uint16_t a, pointer, extra=0;
+    unsigned selected, count;
+    if (PA(0xf475u)!=0xeaa475u) return 0;
+    if (!s6502_firmware_hle_bank_range_validation) {
+        for(a=0xf475u;a<0xf4a5u;++a) {
+            uint8_t byte=mem_readx(a);
+            fnv=(fnv^byte)*16777619u; sdbm=byte+sdbm*65599u;
+        }
+        s6502_firmware_hle_bank_range_validation =
+            fnv==0x9691d48bu && sdbm==0x7f9be21cu ? 1u:2u;
+    }
+    if(s6502_firmware_hle_bank_range_validation!=1u) return 0;
+    if(pc==0xf475u) {
+        selected=ac & 15u;
+        pointer=(uint16_t)(mem_read(0x28u)|((uint16_t)mem_read(0x29u)<<8));
+        /* Arguments must not be changed by prologue stack writes or the
+         * remapped windows. The firmware/code window F must remain mapped. */
+        if(pointer<0x200u || pointer>0x4ffdu) return 0;
+        if(pointer>=0x1000u &&
+           (PA(pointer)<0x400u || PA(pointer+2u)<0x400u)) return 0;
+        count=mem_read(pointer);
+        if(!count) return 0;
+        --count;
+        extra=(uint16_t)(42u+((pointer&255u)==255u)+((pointer&255u)>=254u));
+    } else { selected=sys.bk_sel; count=ix; }
+    if(selected<5u || selected>14u || count>14u-selected) return 0;
+    return (uint16_t)(extra+36u*count+19u);
+}
+
+static int s6502_firmware_hle_bank_query_match(void)
+{
+    uint32_t fnv = 2166136261u, sdbm = 0u;
+    uint16_t address;
+    if (PA(0xf4a5u) != 0xeaa4a5u) return 0;
+    if (s6502_firmware_hle_bank_query_validation)
+        return s6502_firmware_hle_bank_query_validation == 1u;
+    for (address = 0xf4a5u; address < 0xf4f4u; ++address) {
+        uint8_t byte = mem_readx(address);
+        fnv = (fnv ^ byte) * 16777619u;
+        sdbm = byte + sdbm * 65599u;
+    }
+    s6502_firmware_hle_bank_query_validation =
+        fnv == 0x3ae34dc8u && sdbm == 0x2300c3e1u ? 1u : 2u;
+    return s6502_firmware_hle_bank_query_validation == 1u;
 }
 
 static __attribute__((noinline)) int
@@ -8107,6 +8788,13 @@ s6502_firmware_hle_glyph_bits(uint32_t value, uint32_t shift)
            ((uint32_t)left_mask << 16) | ((uint32_t)right_mask << 24);
 }
 
+#define FW_CURSOR_NAME s6502_text_cursor
+#define FW_CURSOR_CONTEXT void *
+#define FW_CURSOR_READ(a) mem_read(a)
+#define FW_CURSOR_WRITE(a,v) mem_write((a),(v))
+#define FW_CURSOR_CAN_FOLD (sys.mem_iw[0x20] == ram_write)
+#include "firmware_native_text_cursor.h"
+
 S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_glyph_row(
     uint32_t ix, uint32_t sp, uint32_t status,
     s6502_hle_glyph_result_t *result)
@@ -8121,9 +8809,7 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_glyph_row(
     uint32_t value;
     uint32_t bits;
     uint32_t column;
-    uint32_t row;
     uint32_t return_address;
-    uint32_t carry;
 
     /*
      * Keep the complete HLE row outside s6502_exec().  The S1C33 backend can
@@ -8208,67 +8894,7 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_glyph_row(
     ram[0x100u | ((stack_pointer - 1u) & 0xffu)] =
         (uint8_t)return_address;
 
-    row = (uint32_t)mem_read(0x2082u) & 0xffu;
-    if (row < 0x40u) {
-        destination = (uint32_t)ram[0x3au] | ((uint32_t)ram[0x3bu] << 8);
-        destination = (destination - 0x20u) & 0xffffu;
-        ram[0x3au] = (uint8_t)destination;
-        ram[0x3bu] = (uint8_t)(destination >> 8);
-
-        destination = (uint32_t)ram[0x38u] | ((uint32_t)ram[0x39u] << 8);
-        carry = destination >= 0x20u;
-        destination = (destination - 0x20u) & 0xffffu;
-        ram[0x38u] = (uint8_t)destination;
-        ram[0x39u] = (uint8_t)(destination >> 8);
-        value = destination >> 8;
-        status_value = (status_value & ~1u) | carry;
-    } else if (row == 0x40u) {
-        destination = (uint32_t)ram[0x3au] | ((uint32_t)ram[0x3bu] << 8);
-        carry = destination >= 0x20u;
-        destination = (destination - 0x20u) & 0xffffu;
-        ram[0x3au] = (uint8_t)destination;
-        ram[0x3bu] = (uint8_t)(destination >> 8);
-        ram[0x38u] = 0xf3u;
-        ram[0x39u] = 0x0fu;
-        value = 0x0fu;
-        status_value = (status_value & ~1u) | carry;
-    } else if (row == 0x41u) {
-        ram[0x38u] = 0x33u;
-        ram[0x39u] = 0x0cu;
-        ram[0x3au] = 0x40u;
-        ram[0x3bu] = 0x0cu;
-        value = (uint32_t)mem_read(0x2081u) & 0xffu;
-        status_value &= ~1u;
-        if (value >= 8u) {
-            column = (value - 8u) & 0xffu;
-            mem_write(0x20b7u, (uint8_t)column);
-            while (column >= 8u) {
-                column = (column - 8u) & 0xffu;
-                mem_write(0x20b7u, (uint8_t)column);
-                destination = (uint32_t)ram[0x3au] |
-                              ((uint32_t)ram[0x3bu] << 8);
-                destination = (destination + 1u) & 0xffffu;
-                ram[0x3au] = (uint8_t)destination;
-                ram[0x3bu] = (uint8_t)(destination >> 8);
-            }
-            value = (column - 8u) & 0xffu;
-        }
-    } else {
-        destination = (uint32_t)ram[0x3au] | ((uint32_t)ram[0x3bu] << 8);
-        destination = (destination + 0x20u) & 0xffffu;
-        ram[0x3au] = (uint8_t)destination;
-        ram[0x3bu] = (uint8_t)(destination >> 8);
-
-        destination = (uint32_t)ram[0x38u] | ((uint32_t)ram[0x39u] << 8);
-        carry = destination > 0xffdfu;
-        destination = (destination + 0x20u) & 0xffffu;
-        ram[0x38u] = (uint8_t)destination;
-        ram[0x39u] = (uint8_t)(destination >> 8);
-        value = destination >> 8;
-        status_value = (status_value & ~1u) | carry;
-    }
-
-    mem_write(0x2082u, (uint8_t)((row + 1u) & 0xffu));
+    s6502_text_cursor(0, ram, status_value, &value, &status_value);
     source_index = (source_index + 1u) & 0xffu;
     status_value = (status_value & ~0x82u) | (source_index & 0x80u) |
                    (source_index ? 0u : 0x02u);
@@ -8299,9 +8925,7 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_wide_glyph_row(
     uint32_t right_mask;
     uint32_t shift;
     uint32_t column;
-    uint32_t row;
     uint32_t return_address;
-    uint32_t carry;
 
     source = (uint32_t)ram[0x2fu] | ((uint32_t)ram[0x30u] << 8);
     b3 = (uint32_t)mem_read(
@@ -8437,67 +9061,7 @@ S6502_HLE_GLYPH_ROW_ATTRIBUTE void s6502_firmware_hle_wide_glyph_row(
 
     /* Inline the shared $6646 address-update helper exactly as the regular
      * glyph-row HLE does. */
-    row = (uint32_t)mem_read(0x2082u) & 0xffu;
-    if (row < 0x40u) {
-        destination = (uint32_t)ram[0x3au] | ((uint32_t)ram[0x3bu] << 8);
-        destination = (destination - 0x20u) & 0xffffu;
-        ram[0x3au] = (uint8_t)destination;
-        ram[0x3bu] = (uint8_t)(destination >> 8);
-
-        destination = (uint32_t)ram[0x38u] | ((uint32_t)ram[0x39u] << 8);
-        carry = destination >= 0x20u;
-        destination = (destination - 0x20u) & 0xffffu;
-        ram[0x38u] = (uint8_t)destination;
-        ram[0x39u] = (uint8_t)(destination >> 8);
-        value = destination >> 8;
-        status_value = (status_value & ~1u) | carry;
-    } else if (row == 0x40u) {
-        destination = (uint32_t)ram[0x3au] | ((uint32_t)ram[0x3bu] << 8);
-        carry = destination >= 0x20u;
-        destination = (destination - 0x20u) & 0xffffu;
-        ram[0x3au] = (uint8_t)destination;
-        ram[0x3bu] = (uint8_t)(destination >> 8);
-        ram[0x38u] = 0xf3u;
-        ram[0x39u] = 0x0fu;
-        value = 0x0fu;
-        status_value = (status_value & ~1u) | carry;
-    } else if (row == 0x41u) {
-        ram[0x38u] = 0x33u;
-        ram[0x39u] = 0x0cu;
-        ram[0x3au] = 0x40u;
-        ram[0x3bu] = 0x0cu;
-        value = (uint32_t)mem_read(0x2081u) & 0xffu;
-        status_value &= ~1u;
-        if (value >= 8u) {
-            column = (value - 8u) & 0xffu;
-            mem_write(0x20b7u, (uint8_t)column);
-            while (column >= 8u) {
-                column = (column - 8u) & 0xffu;
-                mem_write(0x20b7u, (uint8_t)column);
-                destination = (uint32_t)ram[0x3au] |
-                              ((uint32_t)ram[0x3bu] << 8);
-                destination = (destination + 1u) & 0xffffu;
-                ram[0x3au] = (uint8_t)destination;
-                ram[0x3bu] = (uint8_t)(destination >> 8);
-            }
-            value = (column - 8u) & 0xffu;
-        }
-    } else {
-        destination = (uint32_t)ram[0x3au] | ((uint32_t)ram[0x3bu] << 8);
-        destination = (destination + 0x20u) & 0xffffu;
-        ram[0x3au] = (uint8_t)destination;
-        ram[0x3bu] = (uint8_t)(destination >> 8);
-
-        destination = (uint32_t)ram[0x38u] | ((uint32_t)ram[0x39u] << 8);
-        carry = destination > 0xffdfu;
-        destination = (destination + 0x20u) & 0xffffu;
-        ram[0x38u] = (uint8_t)destination;
-        ram[0x39u] = (uint8_t)(destination >> 8);
-        value = destination >> 8;
-        status_value = (status_value & ~1u) | carry;
-    }
-
-    mem_write(0x2082u, (uint8_t)((row + 1u) & 0xffu));
+    s6502_text_cursor(0, ram, status_value, &value, &status_value);
     source_index = (source_index + 2u) & 0xffu;
     status_value = (status_value & ~0x82u) | (source_index & 0x80u) |
                    (source_index ? 0u : 0x02u);
@@ -8809,6 +9373,24 @@ u32 gam4980_resource_span_cache_misses(void)
 u32 gam4980_firmware_hle_path_count(void)
 {
     return S6502_HLE_DIAGNOSTIC_COUNT;
+}
+
+u32 gam4980_bank_query_hits(void)
+{
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    return s6502_bank_query_hits;
+#else
+    return 0;
+#endif
+}
+
+u32 gam4980_bank_query_cycles(void)
+{
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+    return s6502_bank_query_cycles;
+#else
+    return 0;
+#endif
 }
 
 u16 gam4980_firmware_hle_path_pc(u32 path_id)
@@ -10034,18 +10616,27 @@ static uint16_t s6502_game_hle_compare_cycles_for(
     uint8_t low, uint8_t high, uint8_t other_low, uint8_t other_high
 )
 {
-    uint16_t difference = (uint16_t)(
-        (uint16_t)low + (uint8_t)~other_low + 1u
-    );
-    uint8_t low_result = (uint8_t)difference;
-    uint8_t carry = difference > 0xffu;
-    uint8_t high_result = (uint8_t)(
-        (uint16_t)high + (uint8_t)~other_high + carry
-    );
+    unsigned count = fw_compare_count((uint16_t)(
+        (low | ((uint16_t)high << 8)) -
+        (other_low | ((uint16_t)other_high << 8))), 2u);
+    return (uint16_t)(count ? 50u + count * 8u : 49u);
+}
 
-    if (low_result)
-        return high_result ? 66u : 58u;
-    return high_result ? 58u : 49u;
+static const uint8_t *s6502_game_hle_table_pointer(uint16_t address)
+{
+    if (address < 0x100u || address > 0xfff8u || !sys.mem_r[address >> 8]) return 0;
+    if ((address & 255u) > 248u &&
+        sys.mem_r[(address >> 8) + 1u] != sys.mem_r[address >> 8] + 256u) return 0;
+    return sys.mem_r[address >> 8] + (address & 255u);
+}
+static int s6502_game_hle_row_direct_destination(uint32_t first, uint32_t last)
+{
+    uint32_t page;
+    if (first < 0x400u || last >= GAM4980_RAM_SIZE || last < first ||
+        (first <= 0x20ffu && last >= 0x2000u)) return 0;
+    for (page = first >> 8; page <= (last >> 8); ++page)
+        if (sys.mem_r[page] != sys.ram + (page << 8)) return 0;
+    return 1;
 }
 
 static __attribute__((noinline)) uint16_t s6502_game_hle_counter_cycles(
@@ -10504,41 +11095,6 @@ s6502_game_hle_status_nz(uint8_t status, uint8_t value)
     );
 }
 
-static inline __attribute__((always_inline)) uint8_t
-s6502_game_hle_adc8(uint8_t *status, uint8_t left, uint8_t right)
-{
-    uint16_t sum = (uint16_t)(
-        (uint16_t)left + right + ((*status & 0x01u) ? 1u : 0u)
-    );
-    uint8_t result = (uint8_t)sum;
-    uint8_t next = (uint8_t)(*status & (uint8_t)~0xc3u);
-
-    if (sum > 0xffu)
-        next |= 0x01u;
-    if ((left ^ result) & (right ^ result) & 0x80u)
-        next |= 0x40u;
-    *status = s6502_game_hle_status_nz(next, result);
-    return result;
-}
-
-static inline __attribute__((always_inline)) uint8_t
-s6502_game_hle_sbc8(uint8_t *status, uint8_t left, uint8_t right)
-{
-    uint8_t complemented = (uint8_t)~right;
-    uint16_t sum = (uint16_t)(
-        (uint16_t)left + complemented +
-        ((*status & 0x01u) ? 1u : 0u)
-    );
-    uint8_t result = (uint8_t)sum;
-    uint8_t next = (uint8_t)(*status & (uint8_t)~0xc3u);
-
-    if (sum > 0xffu)
-        next |= 0x01u;
-    if ((left ^ result) & (complemented ^ result) & 0x80u)
-        next |= 0x40u;
-    *status = s6502_game_hle_status_nz(next, result);
-    return result;
-}
 
 static __attribute__((noinline)) int s6502_game_hle_callback_scan_region(
     const s6502_game_hle_callback_scan_t *match, uint32_t initial_pc,
@@ -10579,19 +11135,11 @@ static __attribute__((noinline)) int s6502_game_hle_callback_scan_region(
             if (iteration_cycles > cycle_budget - cycles)
                 break;
             cycles += iteration_cycles;
+            mem_write(counter_pointer, next_counter);
             iy = 0u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = counter;
-            status = s6502_game_hle_status_nz(status, ac);
-            status &= (uint8_t)~0x01u;
-            ac = s6502_game_hle_adc8(&status, ac, 1u);
-            mem_write(counter_pointer, ac);
-            iy = 0u;
-            status = s6502_game_hle_status_nz(status, iy);
             ac = mem_read(counter_pointer);
-            status = s6502_game_hle_status_nz(status, ac);
-            status |= 0x01u;
-            ac = s6502_game_hle_sbc8(&status, ac, match->limit);
+            status = fw_sub8_status(ac, match->limit, status);
+            ac = (uint8_t)(ac - match->limit);
             pc = continues ? match->virtual_pc : match->exit_pc;
             if (!continues)
                 break;
@@ -10599,8 +11147,6 @@ static __attribute__((noinline)) int s6502_game_hle_callback_scan_region(
         }
 
         if (pc == match->virtual_pc) {
-            s6502_hle_compare_result_t compare_result;
-            uint8_t carry;
             uint8_t value = mem_read(counter_pointer);
             uint16_t table_address = (uint16_t)(
                 match->table_base + ((uint16_t)value << 1)
@@ -10620,83 +11166,16 @@ static __attribute__((noinline)) int s6502_game_hle_callback_scan_region(
                 break;
             cycles += iteration_cycles;
 
-            /* LDY #0 / LDA (counter),Y / STA $20 / LDA #0 / STA $21. */
-            iy = 0u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = value;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x20u] = ac;
-            ac = 0u;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x21u] = ac;
-
-            /* ASL $20 / ROL $21. */
-            value = ram[0x20u];
-            carry = (uint8_t)(value >> 7);
-            value = (uint8_t)(value << 1);
-            ram[0x20u] = value;
-            status = (uint8_t)(
-                (status & (uint8_t)~0x01u) | carry
-            );
-            status = s6502_game_hle_status_nz(status, value);
-            value = ram[0x21u];
-            {
-                uint8_t next_carry = (uint8_t)(value >> 7);
-                value = (uint8_t)((value << 1) | carry);
-                carry = next_carry;
-            }
-            ram[0x21u] = value;
-            status = (uint8_t)(
-                (status & (uint8_t)~0x01u) | carry
-            );
-            status = s6502_game_hle_status_nz(status, value);
-
-            status &= (uint8_t)~0x01u;
-            ac = ram[0x20u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_adc8(
-                &status, ac, (uint8_t)match->table_base
-            );
-            ram[0x20u] = ac;
-            ac = ram[0x21u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_adc8(
-                &status, ac, (uint8_t)(match->table_base >> 8)
-            );
-            ram[0x21u] = ac;
-
-            iy = 0u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = low;
-            status = s6502_game_hle_status_nz(status, ac);
-            ix = ac;
-            status = s6502_game_hle_status_nz(status, ix);
-            iy = 1u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = high;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x21u] = ac;
-            ram[0x20u] = ix;
-            ac = 0u;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x23u] = ac;
-            ac = 0u;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x24u] = ac;
-
+            /* Native table lookup and null test. No simulated ASL/ROL,
+             * pointer-add sequence or nested compare call is needed. */
+            ram[0x20u] = low; ram[0x21u] = high;
+            ram[0x23u] = ram[0x24u] = 0u;
+            status = fw_compare_status((uint16_t)(low | ((uint16_t)high << 8)), 0u, 2u, status);
+            ix = (uint8_t)(!!low + !!high); iy = 1u; ac = status;
             return_address = (uint16_t)(match->virtual_pc + 0x31u);
-            ram[0x100u | stack_pointer] =
-                (uint8_t)(return_address >> 8);
-            stack_pointer = (uint8_t)(stack_pointer - 1u);
-            ram[0x100u | stack_pointer] = (uint8_t)return_address;
-            stack_pointer = (uint8_t)(stack_pointer - 1u);
-            s6502_firmware_hle_compare16(
-                stack_pointer, status, &compare_result
-            );
-            ac = compare_result.ac;
-            ix = compare_result.ix;
-            stack_pointer = compare_result.sp;
-            status = compare_result.status;
+            ram[0x100u | stack_pointer] = (uint8_t)(return_address >> 8);
+            ram[0x100u | (uint8_t)(stack_pointer - 1u)] = (uint8_t)return_address;
+            ram[0x100u | (uint8_t)(stack_pointer - 2u)] = status;
             pc = (low | high) ? match->nonzero_pc : match->increment_pc;
             if (low | high)
                 break;
@@ -10839,48 +11318,20 @@ static __attribute__((noinline)) int s6502_game_hle_scan_region(
         ram[match->temporary_pointer_zp] = (uint8_t)address;
         ram[(uint8_t)(match->temporary_pointer_zp + 1u)] =
             (uint8_t)(address >> 8);
-        iy = 0u;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = value;
-        status = s6502_game_hle_status_nz(status, ac);
-        status |= 0x01u;
-        ac = s6502_game_hle_sbc8(&status, ac, 1u);
         if (value == 1u) {
+            iy = 0u; ac = 0u;
+            status = fw_sub8_status(value, 1u, status);
             return_pc = match->special_pc;
             break;
         }
-
-        /* The secondary block recomputes the same address.  For non-zero
-         * entries it decrements the byte; zero entries only take the shared
-         * increment tail. */
-        if (value) {
-            iy = 0u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = value;
-            status = s6502_game_hle_status_nz(status, ac);
-            status |= 0x01u;
-            ac = s6502_game_hle_sbc8(&status, ac, 1u);
-            *array_pointer = ac;
-        }
-
-        iy = match->index_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->index_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        status &= (uint8_t)~0x01u;
-        ac = s6502_game_hle_adc8(&status, ac, 1u);
-        object_pointer[match->index_offset] = ac;
-
-        iy = match->index_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->index_offset];
-        status = s6502_game_hle_status_nz(status, ac);
+        if (value) *array_pointer = (uint8_t)(value - 1u);
+        next_index = (uint8_t)(object_pointer[match->index_offset] + 1u);
+        object_pointer[match->index_offset] = next_index;
+        /* Read the limit after the store: preserve an index/limit alias. */
+        limit = object_pointer[match->limit_offset];
         iy = match->limit_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        status |= 0x01u;
-        ac = s6502_game_hle_sbc8(
-            &status, ac, object_pointer[match->limit_offset]
-        );
+        status = fw_sub8_status(next_index, limit, status);
+        ac = (uint8_t)(next_index - limit);
         if ((status & 0x02u) || !(status & 0x01u)) {
             return_pc = match->virtual_pc;
         } else {
@@ -11075,79 +11526,12 @@ static __attribute__((noinline)) int s6502_game_hle_record_scan_region(
         cycles += iteration_cycles;
         ++iterations;
 
-        /* First comparison: data[index - 2] against reference[0]. */
-        iy = match->index_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->index_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x23u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[(uint8_t)(match->index_offset + 1u)];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x24u] = ac;
-        iy = match->data_pointer_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->data_pointer_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x20u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[(uint8_t)(match->data_pointer_offset + 1u)];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x21u] = ac;
-        status &= (uint8_t)~0x01u;
-        ac = ram[0x20u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_adc8(&status, ac, ram[0x23u]);
-        ram[0x20u] = ac;
-        ac = ram[0x21u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_adc8(&status, ac, ram[0x24u]);
-        ram[0x21u] = ac;
-        ac = 2u;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x23u] = ac;
-        ac = 0u;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x24u] = ac;
-        status |= 0x01u;
-        ac = ram[0x20u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
-        ram[0x20u] = ac;
-        ac = ram[0x21u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_sbc8(&status, ac, ram[0x24u]);
-        ram[0x21u] = ac;
-        iy = 0u;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = candidate0;
-        status = s6502_game_hle_status_nz(status, ac);
-        iy = match->candidate_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        object_pointer[match->candidate_offset] = ac;
-        iy = match->reference_pointer_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = (uint8_t)reference;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x26u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = (uint8_t)(reference >> 8);
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x27u] = ac;
-        iy = 0u;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = reference0;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x23u] = ac;
-        iy = match->candidate_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->candidate_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        status |= 0x01u;
-        ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
+        s6502_game_hle_record_compare_state_fields(
+            match->index_offset, match->data_pointer_offset,
+            match->candidate_offset, match->reference_pointer_offset,
+            object_pointer, data, reference, 2u, 0u,
+            candidate0, reference0, &ac, &iy, &status
+        );
         if (candidate0 != reference0) {
             return_pc = match->exit_pc;
             break;
@@ -11157,139 +11541,20 @@ static __attribute__((noinline)) int s6502_game_hle_record_scan_region(
             break;
         }
 
-        /* Second comparison: data[index] against reference[2]. */
-        iy = match->index_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->index_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x23u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[(uint8_t)(match->index_offset + 1u)];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x24u] = ac;
-        iy = match->data_pointer_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->data_pointer_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x20u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[(uint8_t)(match->data_pointer_offset + 1u)];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x21u] = ac;
-        status &= (uint8_t)~0x01u;
-        ac = ram[0x20u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_adc8(&status, ac, ram[0x23u]);
-        ram[0x20u] = ac;
-        ac = ram[0x21u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_adc8(&status, ac, ram[0x24u]);
-        ram[0x21u] = ac;
-        iy = 0u;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = candidate2;
-        status = s6502_game_hle_status_nz(status, ac);
-        iy = match->candidate_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        object_pointer[match->candidate_offset] = ac;
-        iy = match->reference_pointer_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = (uint8_t)reference;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x26u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = (uint8_t)(reference >> 8);
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x27u] = ac;
-        iy = 2u;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = reference2;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x23u] = ac;
-        iy = match->candidate_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->candidate_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        status |= 0x01u;
-        ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
+        s6502_game_hle_record_compare_state_fields(
+            match->index_offset, match->data_pointer_offset,
+            match->candidate_offset, match->reference_pointer_offset,
+            object_pointer, data, reference, 0u, 2u,
+            candidate2, reference2, &ac, &iy, &status
+        );
 
         if (second_matches) {
-            /* Third comparison: data[index - 1] against reference[1]. */
-            iy = match->index_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[match->index_offset];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x23u] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[(uint8_t)(match->index_offset + 1u)];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x24u] = ac;
-            iy = match->data_pointer_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[match->data_pointer_offset];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x20u] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[(uint8_t)(match->data_pointer_offset + 1u)];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x21u] = ac;
-            status &= (uint8_t)~0x01u;
-            ac = ram[0x20u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_adc8(&status, ac, ram[0x23u]);
-            ram[0x20u] = ac;
-            ac = ram[0x21u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_adc8(&status, ac, ram[0x24u]);
-            ram[0x21u] = ac;
-            ac = 1u;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x23u] = ac;
-            ac = 0u;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x24u] = ac;
-            status |= 0x01u;
-            ac = ram[0x20u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
-            ram[0x20u] = ac;
-            ac = ram[0x21u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_sbc8(&status, ac, ram[0x24u]);
-            ram[0x21u] = ac;
-            iy = 0u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = candidate1;
-            status = s6502_game_hle_status_nz(status, ac);
-            iy = match->candidate_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            object_pointer[match->candidate_offset] = ac;
-            iy = match->reference_pointer_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = (uint8_t)reference;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x26u] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = (uint8_t)(reference >> 8);
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x27u] = ac;
-            iy = 1u;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = reference1;
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x23u] = ac;
-            iy = match->candidate_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[match->candidate_offset];
-            status = s6502_game_hle_status_nz(status, ac);
-            status |= 0x01u;
-            ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
+            s6502_game_hle_record_compare_state_fields(
+                match->index_offset, match->data_pointer_offset,
+                match->candidate_offset, match->reference_pointer_offset,
+                object_pointer, data, reference, 1u, 1u,
+                candidate1, reference1, &ac, &iy, &status
+            );
             if (third_matches) {
                 iy = match->found_offset;
                 status = s6502_game_hle_status_nz(status, iy);
@@ -11301,36 +11566,19 @@ static __attribute__((noinline)) int s6502_game_hle_record_scan_region(
             }
         }
 
-        /* Failed second/third comparison: advance the record index by 3. */
-        iy = match->index_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[match->index_offset];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x20u] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = object_pointer[(uint8_t)(match->index_offset + 1u)];
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x21u] = ac;
-        ac = ram[0x20u];
-        status = s6502_game_hle_status_nz(status, ac);
-        status &= (uint8_t)~0x01u;
-        ac = s6502_game_hle_adc8(&status, ac, 3u);
-        ram[0x20u] = ac;
-        ac = ram[0x21u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_adc8(&status, ac, 0u);
-        ram[0x21u] = ac;
-        iy = match->index_offset;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = ram[0x20u];
-        status = s6502_game_hle_status_nz(status, ac);
-        object_pointer[match->index_offset] = ac;
-        ++iy;
-        status = s6502_game_hle_status_nz(status, iy);
-        ac = ram[0x21u];
-        status = s6502_game_hle_status_nz(status, ac);
-        object_pointer[(uint8_t)(match->index_offset + 1u)] = ac;
+        /* Native 16-bit record stride, with one boundary-state commit. */
+        {
+            uint16_t old_index = (uint16_t)(object_pointer[match->index_offset] |
+                ((uint16_t)object_pointer[(uint8_t)(match->index_offset + 1u)] << 8));
+            uint16_t next_index = (uint16_t)(old_index + 3u);
+            status = fw_add16_status(old_index, 3u, status);
+            ram[0x20u] = (uint8_t)next_index;
+            ram[0x21u] = (uint8_t)(next_index >> 8);
+            object_pointer[match->index_offset] = (uint8_t)next_index;
+            object_pointer[(uint8_t)(match->index_offset + 1u)] = (uint8_t)(next_index >> 8);
+            iy = (uint8_t)(match->index_offset + 1u);
+            ac = (uint8_t)(next_index >> 8);
+        }
         return_pc = match->virtual_pc;
         if (sys_halt_p())
             break;
@@ -11358,95 +11606,27 @@ s6502_game_hle_record_compare_state_fields(
 )
 {
     uint8_t *ram = s6502_stack_ram;
-    uint8_t ac = *ac_value;
-    uint8_t iy = *iy_value;
-    uint8_t status = *status_value;
-
-    iy = index_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[index_offset];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x23u] = ac;
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[(uint8_t)(index_offset + 1u)];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x24u] = ac;
-
-    iy = data_pointer_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[data_pointer_offset];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x20u] = ac;
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[(uint8_t)(data_pointer_offset + 1u)];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x21u] = ac;
-
-    status &= (uint8_t)~0x01u;
-    ac = ram[0x20u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x23u]);
-    ram[0x20u] = ac;
-    ac = ram[0x21u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x24u]);
-    ram[0x21u] = ac;
-
-    if (subtract) {
-        ac = subtract;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x23u] = ac;
-        ac = 0u;
-        status = s6502_game_hle_status_nz(status, ac);
-        ram[0x24u] = ac;
-        status |= 0x01u;
-        ac = ram[0x20u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
-        ram[0x20u] = ac;
-        ac = ram[0x21u];
-        status = s6502_game_hle_status_nz(status, ac);
-        ac = s6502_game_hle_sbc8(&status, ac, ram[0x24u]);
-        ram[0x21u] = ac;
-    }
-
-    iy = 0u;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = candidate_value;
-    status = s6502_game_hle_status_nz(status, ac);
-    iy = candidate_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    object_pointer[candidate_offset] = ac;
-
-    iy = reference_pointer_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = (uint8_t)reference;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x26u] = ac;
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = (uint8_t)(reference >> 8);
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x27u] = ac;
-
-    iy = reference_index;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = reference_value;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x23u] = ac;
-    iy = candidate_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[candidate_offset];
-    status = s6502_game_hle_status_nz(status, ac);
-    status |= 0x01u;
-    ac = s6502_game_hle_sbc8(&status, ac, ram[0x23u]);
-
-    *ac_value = ac;
-    *iy_value = iy;
-    *status_value = status;
+    uint16_t index = (uint16_t)(object_pointer[index_offset] |
+        ((uint16_t)object_pointer[(uint8_t)(index_offset + 1u)] << 8));
+    uint16_t base = (uint16_t)(object_pointer[data_pointer_offset] |
+        ((uint16_t)object_pointer[(uint8_t)(data_pointer_offset + 1u)] << 8));
+    uint16_t address = (uint16_t)(base + index - subtract);
+    uint8_t difference = (uint8_t)(candidate_value - reference_value);
+    /* Only final scratch values and the comparison flags are observable.
+     * Pointer arithmetic flags are killed by the final byte subtraction. */
+    ram[0x20u] = (uint8_t)address;
+    ram[0x21u] = (uint8_t)(address >> 8);
+    ram[0x24u] = subtract ? 0u : (uint8_t)(index >> 8);
+    object_pointer[candidate_offset] = candidate_value;
+    ram[0x26u] = (uint8_t)reference;
+    ram[0x27u] = (uint8_t)(reference >> 8);
+    ram[0x23u] = reference_value;
+    *ac_value = difference;
+    *iy_value = candidate_offset;
+    *status_value = fw_sub8_status(candidate_value, reference_value, *status_value);
     (void)data;
+    (void)reference_pointer_offset;
+    (void)reference_index;
 }
 
 static __attribute__((noinline)) int
@@ -11637,35 +11817,18 @@ s6502_game_hle_record_scan_resume_region(
             cycles += stage_cycles;
             ++iterations;
 
-            iy = match->index_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[match->index_offset];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x20u] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[(uint8_t)(match->index_offset + 1u)];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x21u] = ac;
-            ac = ram[0x20u];
-            status = s6502_game_hle_status_nz(status, ac);
-            status &= (uint8_t)~0x01u;
-            ac = s6502_game_hle_adc8(&status, ac, 3u);
-            ram[0x20u] = ac;
-            ac = ram[0x21u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_adc8(&status, ac, 0u);
-            ram[0x21u] = ac;
-            iy = match->index_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = ram[0x20u];
-            status = s6502_game_hle_status_nz(status, ac);
-            object_pointer[match->index_offset] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = ram[0x21u];
-            status = s6502_game_hle_status_nz(status, ac);
-            object_pointer[(uint8_t)(match->index_offset + 1u)] = ac;
+            {
+                uint16_t previous = (uint16_t)(object_pointer[match->index_offset] |
+                    ((uint16_t)object_pointer[(uint8_t)(match->index_offset + 1u)] << 8));
+                uint16_t next = (uint16_t)(previous + 3u);
+                ram[0x20u] = (uint8_t)next;
+                ram[0x21u] = (uint8_t)(next >> 8);
+                object_pointer[match->index_offset] = (uint8_t)next;
+                object_pointer[(uint8_t)(match->index_offset + 1u)] = (uint8_t)(next >> 8);
+                iy = (uint8_t)(match->index_offset + 1u);
+                ac = (uint8_t)(next >> 8);
+                status = fw_add16_status(previous, 3u, status);
+            }
             pc = match->virtual_pc;
             break;
         }
@@ -11889,35 +12052,13 @@ static __attribute__((noinline)) int s6502_game_hle_record_reverse_region(
                 candidate0, reference0, &ac, &iy, &status
             );
 
-            iy = match->index_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[match->index_offset];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x20u] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = object_pointer[(uint8_t)(match->index_offset + 1u)];
-            status = s6502_game_hle_status_nz(status, ac);
-            ram[0x21u] = ac;
-            ac = ram[0x20u];
-            status = s6502_game_hle_status_nz(status, ac);
-            status |= 0x01u;
-            ac = s6502_game_hle_sbc8(&status, ac, 3u);
-            ram[0x20u] = ac;
-            ac = ram[0x21u];
-            status = s6502_game_hle_status_nz(status, ac);
-            ac = s6502_game_hle_sbc8(&status, ac, 0u);
-            ram[0x21u] = ac;
-            iy = match->index_offset;
-            status = s6502_game_hle_status_nz(status, iy);
-            ac = (uint8_t)decremented;
-            status = s6502_game_hle_status_nz(status, ac);
-            object_pointer[match->index_offset] = ac;
-            ++iy;
-            status = s6502_game_hle_status_nz(status, iy);
+            status = fw_sub16_status(index, 3u, status);
+            ram[0x20u] = (uint8_t)decremented;
+            ram[0x21u] = (uint8_t)(decremented >> 8);
+            object_pointer[match->index_offset] = (uint8_t)decremented;
+            object_pointer[(uint8_t)(match->index_offset + 1u)] = (uint8_t)(decremented >> 8);
+            iy = (uint8_t)(match->index_offset + 1u);
             ac = (uint8_t)(decremented >> 8);
-            status = s6502_game_hle_status_nz(status, ac);
-            object_pointer[(uint8_t)(match->index_offset + 1u)] = ac;
             return_pc = match->virtual_pc;
         } else {
             iy = match->found_offset;
@@ -11976,7 +12117,6 @@ static __attribute__((noinline)) int s6502_game_hle_table_chain_region(
     uint8_t sp = (uint8_t)initial_sp;
     uint8_t status = (uint8_t)initial_status;
     uint8_t value;
-    uint8_t temporary;
 
     if (!match || !result || match->firmware_pc != 0xd6afu)
         return -1;
@@ -12022,156 +12162,30 @@ static __attribute__((noinline)) int s6502_game_hle_table_chain_region(
     if (cycles > cycle_budget)
         return 0;
 
-    /* Restore the caller's saved $23/$24 operands. */
-    sp = (uint8_t)(sp + 1u);
-    ac = ram[0x100u | sp];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x23u] = ac;
-    sp = (uint8_t)(sp + 1u);
-    ac = ram[0x100u | sp];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x24u] = ac;
-
-    /* Add the object base to the multiplication result. */
-    iy = 0u;
-    status = s6502_game_hle_status_nz(status, iy);
-    status &= (uint8_t)~0x01u;
-    ac = object_pointer[0];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x20u]);
-    ram[0x20u] = ac;
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[1];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x21u]);
-    ram[0x21u] = ac;
-
-    /* Load the table selector and multiply it by two. */
-    iy = 4u;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = value;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x20u] = ac;
-    ac = 0u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x21u] = ac;
-    temporary = ram[0x20u];
-    status = (uint8_t)(
-        (status & (uint8_t)~0x01u) | ((temporary >> 7) & 0x01u)
-    );
-    temporary = (uint8_t)(temporary << 1);
-    status = s6502_game_hle_status_nz(status, temporary);
-    ram[0x20u] = temporary;
-    temporary = ram[0x21u];
-    value = (uint8_t)(status & 0x01u);
-    status = (uint8_t)(
-        (status & (uint8_t)~0x01u) | ((temporary >> 7) & 0x01u)
-    );
-    temporary = (uint8_t)((temporary << 1) | value);
-    status = s6502_game_hle_status_nz(status, temporary);
-    ram[0x21u] = temporary;
-
-    /* Resolve the two-byte pointer from the object's table. */
-    iy = 0x25u;
-    status = s6502_game_hle_status_nz(status, iy);
-    status &= (uint8_t)~0x01u;
-    ac = object_pointer[0x25u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x20u]);
-    ram[0x20u] = ac;
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[0x26u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x21u]);
-    ram[0x21u] = ac;
-    iy = 0u;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = table_pointer[0];
-    status = s6502_game_hle_status_nz(status, ac);
-    ix = ac;
-    status = s6502_game_hle_status_nz(status, ix);
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = table_pointer[1];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x21u] = ac;
-    ram[0x20u] = ix;
-    ac = ram[0x20u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x23u] = ac;
-    ac = ram[0x21u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x24u] = ac;
-
-    /* Read the selected structure field and store its zero-extended value. */
-    ac = match->field_offset;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x20u] = ac;
-    ac = 0u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x21u] = ac;
-    status &= (uint8_t)~0x01u;
-    ac = ram[0x20u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x23u]);
-    ram[0x20u] = ac;
-    ac = ram[0x21u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, ram[0x24u]);
-    ram[0x21u] = ac;
-    iy = 0u;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = field_pointer[0];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x20u] = ac;
-    ac = 0u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x21u] = ac;
-    iy = match->output_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = ram[0x20u];
-    status = s6502_game_hle_status_nz(status, ac);
-    mem_write((uint16_t)(object + iy), ac);
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = ram[0x21u];
-    status = s6502_game_hle_status_nz(status, ac);
-    mem_write((uint16_t)(object + iy), ac);
-
-    /* Prepare the next multiply-by-five firmware call and its stack image. */
-    iy = 0x10u;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = object_pointer[0x10u];
-    status = s6502_game_hle_status_nz(status, ac);
-    iy = 0x1eu;
-    status = s6502_game_hle_status_nz(status, iy);
-    status &= (uint8_t)~0x01u;
-    ac = s6502_game_hle_adc8(&status, ac, object_pointer[0x1eu]);
-    ram[0x20u] = ac;
-    ac = 0u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x21u] = ac;
-    ac = ram[0x24u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x100u | sp] = ac;
-    sp = (uint8_t)(sp - 1u);
-    ac = ram[0x23u];
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x100u | sp] = ac;
-    sp = (uint8_t)(sp - 1u);
-    ac = 5u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x23u] = ac;
-    ac = 0u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ram[0x24u] = ac;
+    /* The lookup is already resolved. Commit its native result once,
+     * then prepare the next call; intermediate zero-page copies are dead. */
+    ix = (uint8_t)table_entry;
+    ram[0x23u] = (uint8_t)table_entry;
+    ram[0x24u] = (uint8_t)(table_entry >> 8);
+    ram[0x20u] = field_pointer[0];
+    ram[0x21u] = 0u;
+    mem_write((uint16_t)(object + match->output_offset), ram[0x20u]);
+    mem_write((uint16_t)(object + (uint8_t)(match->output_offset + 1u)), 0u);
+    {
+        uint8_t left = object_pointer[0x10u], right = object_pointer[0x1eu];
+        ram[0x20u] = (uint8_t)(left + right);
+        ram[0x21u] = 0u;
+        status = (uint8_t)((fw_add8_status(left, right, initial_status) & ~0x82u) | 2u);
+    }
+    sp = (uint8_t)(initial_sp + 2u);
+    ram[0x100u | sp] = ram[0x24u];
+    ram[0x100u | (uint8_t)(sp - 1u)] = ram[0x23u];
+    ram[0x23u] = 5u; ram[0x24u] = 0u;
     return_pc = (uint16_t)(initial_pc + 0x91u);
-    ram[0x100u | sp] = (uint8_t)(return_pc >> 8);
-    sp = (uint8_t)(sp - 1u);
-    ram[0x100u | sp] = (uint8_t)return_pc;
-    sp = (uint8_t)(sp - 1u);
+    ram[0x100u | (uint8_t)(sp - 2u)] = (uint8_t)(return_pc >> 8);
+    ram[0x100u | (uint8_t)(sp - 3u)] = (uint8_t)return_pc;
+    sp = (uint8_t)(sp - 4u);
+    ac = 0u; iy = 0x1eu;
 
     result->cycles = cycles;
     result->pc = match->firmware_pc;
@@ -12392,24 +12406,9 @@ static __attribute__((noinline)) int s6502_game_hle_object_flow_region(
     ram[0x20u] = (uint8_t)final_value;
     ram[0x21u] = (uint8_t)(final_value >> 8);
 
-    status = (uint8_t)initial_status;
-    status &= (uint8_t)~0x01u;
-    ac = match->table_bias;
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(&status, ac, (uint8_t)table_entry);
-    ac = 0u;
-    status = s6502_game_hle_status_nz(status, ac);
-    ac = s6502_game_hle_adc8(
-        &status, ac, (uint8_t)(table_entry >> 8)
-    );
-    iy = match->output_offset;
-    status = s6502_game_hle_status_nz(status, iy);
-    ac = (uint8_t)final_value;
-    status = s6502_game_hle_status_nz(status, ac);
-    ++iy;
-    status = s6502_game_hle_status_nz(status, iy);
+    status = fw_add16_status(table_entry, match->table_bias, initial_status);
+    iy = (uint8_t)(match->output_offset + 1u);
     ac = (uint8_t)(final_value >> 8);
-    status = s6502_game_hle_status_nz(status, ac);
     object_pointer[match->output_offset] = (uint8_t)final_value;
     object_pointer[(uint8_t)(match->output_offset + 1u)] = ac;
 
@@ -12485,6 +12484,12 @@ static uint8_t s6502_game_aot_legacy_pattern_at(
     return 0u;
 }
 
+static int s6502_semantic_safe_pair(uint8_t low, uint8_t high)
+{
+    return low >= 6u && low != 0xffu && high == low + 1u &&
+        !(low >= 10u && low <= 14u);
+}
+
 static uint8_t s6502_game_aot_template_at(
     const uint8_t *code, uint32_t remaining, uint8_t semantic
 )
@@ -12494,6 +12499,8 @@ static uint8_t s6502_game_aot_template_at(
 
     if (!semantic || semantic > C6502_TEMPLATE_SPEC_COUNT)
         return 0u;
+    if (!remaining || !(c6502_template_first_index[code[0]] & (1u << (semantic - 1u))))
+        return 0u;
     spec = &c6502_template_specs[semantic - 1u];
     if (remaining < spec->size)
         return 0u;
@@ -12501,6 +12508,54 @@ static uint8_t s6502_game_aot_template_at(
         if ((code[index] & spec->mask[index]) !=
             (spec->bytes[index] & spec->mask[index]))
             return 0u;
+    }
+    /* C6502 emits the old OPER1 immediate-load template for arbitrary
+     * adjacent zero-page words as well.  The generated mask deliberately
+     * leaves both destinations open; enforce the relationship here so a
+     * coincidental pair of unrelated byte stores can never be fused.  A
+     * $ff->$00 pair stays on the ordinary path because the resident IRAM
+     * handler addresses its second byte linearly from the zero-page base. */
+    if (semantic == C6502_TEMPLATE_LOAD_OPER1_IMM16 &&
+        (code[3] == 0xffu ||
+         code[7] != (uint8_t)(code[3] + 1u)))
+        return 0u;
+    if (semantic >= C6502_TEMPLATE_ADD16_IMM_GENERIC &&
+        semantic <= C6502_TEMPLATE_SUB16_PRESERVE_GENERIC) {
+        uint8_t base = semantic >= C6502_TEMPLATE_ADD16_PRESERVE_GENERIC
+            ? 2u : 0u;
+        uint8_t src = code[base + 2u], dst = code[base + 6u];
+        /* Direct zero-page RAM only. Snapshotting a word is invalid when
+         * writing its low byte can change the pending high-byte read. */
+        if (!s6502_semantic_safe_pair(src, code[base + 8u]) ||
+            !s6502_semantic_safe_pair(dst, code[base + 12u]) ||
+            dst == src + 1u)
+            return 0u;
+    }
+    if (semantic == C6502_TEMPLATE_ADD16_REGS_GENERIC ||
+        semantic == C6502_TEMPLATE_SUB16_REGS_GENERIC) {
+        if (!s6502_semantic_safe_pair(code[2], code[8]) ||
+            !s6502_semantic_safe_pair(code[4], code[10]) ||
+            !s6502_semantic_safe_pair(code[6], code[12]) ||
+            code[6] == code[2] + 1u || code[6] == code[4] + 1u)
+            return 0u;
+    }
+    if (semantic == C6502_TEMPLATE_STORE16_IMM_GENERIC ||
+        semantic == C6502_TEMPLATE_COPY16_GENERIC) {
+        if (!s6502_semantic_safe_pair(code[3], code[7])) return 0u;
+        if (semantic == C6502_TEMPLATE_COPY16_GENERIC &&
+            !s6502_semantic_safe_pair(code[1], code[5])) return 0u;
+    }
+    if (semantic == C6502_TEMPLATE_LOAD16_INDIRECT_GENERIC) {
+        if (code[3] != code[8] ||
+            !s6502_semantic_safe_pair(code[3], (uint8_t)(code[3] + 1u)) ||
+            !s6502_semantic_safe_pair(code[5], code[10]) ||
+            code[5] == code[3] || code[5] == code[3] + 1u ||
+            code[5] + 1u == code[3]) return 0u;
+    }
+    if (semantic == C6502_TEMPLATE_STORE16_INDIRECT_GENERIC) {
+        if (code[5] != code[10] ||
+            !s6502_semantic_safe_pair(code[5], (uint8_t)(code[5] + 1u)) ||
+            !s6502_semantic_safe_pair(code[3], code[8])) return 0u;
     }
     return (uint8_t)(7u + semantic);
 }
@@ -12519,6 +12574,8 @@ static uint8_t s6502_game_aot_pattern_at_priority(
         return 0u;
     if (priority == 0u)
         return s6502_game_aot_legacy_pattern_at(code, remaining);
+    if (!c6502_template_first_index[code[0]])
+        return 0u;
     if (priority == 1u) {
         if (code[0] != 0xa2u)
             return 0u;
@@ -12530,6 +12587,23 @@ static uint8_t s6502_game_aot_pattern_at_priority(
         uint8_t first_kind;
         uint8_t second_kind = C6502_TEMPLATE_NONE;
 
+        /* Prefer the live V2 implementation over legacy shadow templates. */
+        for (first_kind = C6502_TEMPLATE_ADD16_IMM_GENERIC;
+             first_kind <= C6502_TEMPLATE_STORE_STACK8_GENERIC;
+             ++first_kind) {
+            /* Keep tiny loads behind arithmetic/indirect word phrases in
+             * the bounded entry table; they must not evict longer work. */
+            if (first_kind == C6502_TEMPLATE_STORE16_IMM_GENERIC ||
+                first_kind == C6502_TEMPLATE_COPY16_GENERIC ||
+                first_kind >= C6502_TEMPLATE_LOAD_STACK8_GENERIC)
+                continue;
+            if (!(c6502_template_first_index[code[0]] & (1u << (first_kind - 1u))))
+                continue;
+            encoded_pattern = s6502_game_aot_template_at(
+                code, remaining, first_kind);
+            if (encoded_pattern)
+                return encoded_pattern;
+        }
         if (code[0] == 0x08u) {
             first_kind = C6502_TEMPLATE_STACK_ADD16;
             second_kind = C6502_TEMPLATE_STACK_SUB16;
@@ -12543,13 +12617,23 @@ static uint8_t s6502_game_aot_pattern_at_priority(
         encoded_pattern = s6502_game_aot_template_at(
             code, remaining, first_kind
         );
-        if (encoded_pattern || !second_kind)
+        if (encoded_pattern)
             return encoded_pattern;
-        return s6502_game_aot_template_at(
-            code, remaining, second_kind
-        );
+        if (second_kind) {
+            encoded_pattern = s6502_game_aot_template_at(
+                code, remaining, second_kind);
+            if (encoded_pattern)
+                return encoded_pattern;
+        }
+        return 0u;
     }
     if (priority == 3u) {
+        encoded_pattern = s6502_game_aot_template_at(code, remaining,
+            C6502_TEMPLATE_STORE16_IMM_GENERIC);
+        if (encoded_pattern) return encoded_pattern;
+        encoded_pattern = s6502_game_aot_template_at(code, remaining,
+            C6502_TEMPLATE_COPY16_GENERIC);
+        if (encoded_pattern) return encoded_pattern;
         if (code[0] != 0xa9u)
             return 0u;
         encoded_pattern = s6502_game_aot_template_at(
@@ -12563,6 +12647,13 @@ static uint8_t s6502_game_aot_pattern_at_priority(
     if (priority == 4u) {
         uint8_t first_kind;
         uint8_t second_kind = C6502_TEMPLATE_NONE;
+
+        encoded_pattern = s6502_game_aot_template_at(code, remaining,
+            C6502_TEMPLATE_LOAD_STACK8_GENERIC);
+        if (encoded_pattern) return encoded_pattern;
+        encoded_pattern = s6502_game_aot_template_at(code, remaining,
+            C6502_TEMPLATE_STORE_STACK8_GENERIC);
+        if (encoded_pattern) return encoded_pattern;
 
         if (code[0] == 0xa9u) {
             first_kind = C6502_TEMPLATE_STORE_CHAR_ARG_IMM;
@@ -12646,6 +12737,175 @@ static const uint8_t s6502_game_aot_opcode_size[256] = {
     2u, 2u, 1u, 1u, 1u, 2u, 2u, 1u, 1u, 3u, 1u, 1u, 1u, 3u, 3u, 1u,
 };
 
+static int s6502_game_aot_trace_safe_zp_store(uint8_t address)
+{
+    return address > _TISR &&
+        (address < _BK_SEL || address > _BK_ADRH);
+}
+
+/* Decode only instructions whose complete observable semantics can be kept
+ * inside one straight-line tracelet.  Control transfers delimit a trace.
+ * Stores which could alter bank registers or the mapped game code are also
+ * delimiters; the normal engine handles those and refreshes all mappings. */
+static int s6502_game_aot_trace_opcode_info(
+    const uint8_t *code, uint32_t remaining,
+    uint8_t *instruction_size, uint8_t *cycle_cost
+)
+{
+    uint8_t opcode;
+    uint8_t size;
+    uint8_t cost;
+
+    if (!code || !remaining)
+        return 0;
+    opcode = code[0];
+    size = s6502_game_aot_opcode_size[opcode];
+    if (!size || size > remaining)
+        return 0;
+    switch (opcode) {
+    /* Register, flag, stack and accumulator operations. */
+    case 0x08u: cost = 3u; break; /* PHP */
+    case 0x0au: case 0x18u: case 0x2au: case 0x38u:
+    case 0x4au: case 0x58u: case 0x6au: case 0x78u:
+    case 0x88u: case 0x8au: case 0x98u: case 0x9au:
+    case 0xa8u: case 0xaau: case 0xb8u: case 0xbau:
+    case 0xc8u: case 0xcau: case 0xd8u: case 0xe8u:
+    case 0xeau: case 0xf8u:
+        cost = 2u;
+        break;
+    case 0x28u: case 0x68u: cost = 4u; break; /* PLP / PLA */
+    case 0x48u: cost = 3u; break;             /* PHA */
+
+    /* Immediate ALU, compare and load operations. */
+    case 0x09u: case 0x29u: case 0x49u: case 0x69u:
+    case 0xa0u: case 0xa2u: case 0xa9u: case 0xc0u:
+    case 0xc9u: case 0xe0u: case 0xe9u:
+        cost = 2u;
+        break;
+
+    /* Zero-page reads and read/modify/write operations. */
+    case 0x05u: case 0x25u: case 0x45u: case 0x65u:
+    case 0xa4u: case 0xa5u: case 0xa6u: case 0xc4u:
+    case 0xc5u: case 0xe4u: case 0xe5u:
+        cost = 3u;
+        break;
+    case 0x06u: case 0x26u: case 0x46u: case 0x66u:
+    case 0xc6u: case 0xe6u:
+        if (!s6502_game_aot_trace_safe_zp_store(code[1]))
+            return 0;
+        cost = 5u;
+        break;
+    case 0x84u: case 0x85u: case 0x86u:
+        if (!s6502_game_aot_trace_safe_zp_store(code[1]))
+            return 0;
+        cost = 3u;
+        break;
+
+    /* Indexed zero-page reads.  They retain READ8 so wraparound and the
+     * page-zero aliases remain exact.  Indexed stores are deliberately not
+     * fused because the runtime index could select a bank register. */
+    case 0x15u: case 0x35u: case 0x55u: case 0x75u:
+    case 0xb4u: case 0xb5u: case 0xb6u: case 0xd5u:
+    case 0xf5u:
+        cost = 4u;
+        break;
+
+    /* Absolute reads and compares. */
+    case 0x0du: case 0x2du: case 0x4du: case 0x6du:
+    case 0xacu: case 0xadu: case 0xaeu: case 0xccu:
+    case 0xcdu: case 0xecu: case 0xedu:
+        cost = 4u;
+        break;
+
+    /* Absolute stores are safe only in the fixed non-code address range. */
+    case 0x8cu: case 0x8du: case 0x8eu:
+    {
+        uint16_t address = (uint16_t)(code[1] | ((uint16_t)code[2] << 8));
+
+        if (address < 0x0100u || address >= 0x5000u)
+            return 0;
+        cost = 4u;
+        break;
+    }
+
+    /* Absolute indexed reads; the runtime path adds the real page-crossing
+     * cycle. */
+    case 0x19u: case 0x1du: case 0x39u: case 0x3du:
+    case 0x59u: case 0x5du: case 0x79u: case 0x7du:
+    case 0xb9u: case 0xbcu: case 0xbdu: case 0xbeu:
+    case 0xd9u: case 0xddu: case 0xf9u: case 0xfdu:
+        cost = 4u;
+        break;
+
+    /* Read-only (zp),Y forms.  A dynamic store can target bank/code and is
+     * therefore left to the resident engine. */
+    case 0x11u: case 0x31u: case 0x51u: case 0x71u:
+    case 0xb1u: case 0xd1u: case 0xf1u:
+        cost = 5u;
+        break;
+    default:
+        return 0;
+    }
+    *instruction_size = size;
+    *cycle_cost = cost;
+    return 1;
+}
+
+static int s6502_game_aot_has_entry(uint32_t physical_pc)
+{
+    uint16_t slot = s6502_game_aot_hash_slot(physical_pc);
+    uint16_t entry_id = s6502_game_aot_hash[slot];
+
+    while (entry_id &&
+        s6502_game_aot_entries[entry_id - 1u].physical_pc != physical_pc) {
+        slot = (uint16_t)((slot + 1u) &
+            (S6502_GAME_AOT_HASH_SIZE - 1u));
+        entry_id = s6502_game_aot_hash[slot];
+    }
+    return entry_id != 0u;
+}
+
+static uint8_t s6502_game_aot_trace_size_at(
+    const uint8_t *game, uint32_t code_size, uint32_t offset,
+    uint8_t *instruction_count, uint8_t *cycle_cost
+)
+{
+    uint32_t cursor = offset;
+    uint32_t byte_count = 0u;
+    uint32_t cycles = 0u;
+    uint8_t instructions = 0u;
+
+    while (cursor < code_size &&
+           instructions < S6502_GAME_AOT_TRACE_MAX_INSTRUCTIONS &&
+           byte_count < S6502_GAME_AOT_TRACE_MAX_BYTES) {
+        uint8_t size;
+        uint8_t cost;
+        uint32_t physical_pc = 0x20d000u + cursor;
+
+        if (instructions && s6502_game_aot_has_entry(physical_pc))
+            break;
+#ifdef GAM4980_ENABLE_FIRMWARE_HLE
+        if (instructions && s6502_game_hle_entry_p(physical_pc))
+            break;
+#endif
+        if (!s6502_game_aot_trace_opcode_info(
+                game + cursor, code_size - cursor, &size, &cost) ||
+            (offset & ~0x0fffu) != ((cursor + size - 1u) & ~0x0fffu) ||
+            byte_count + size > S6502_GAME_AOT_TRACE_MAX_BYTES)
+            break;
+        cursor += size;
+        byte_count += size;
+        cycles += cost;
+        ++instructions;
+    }
+    if (instructions < S6502_GAME_AOT_TRACE_MIN_INSTRUCTIONS ||
+        byte_count > 0xffu)
+        return 0u;
+    *instruction_count = instructions;
+    *cycle_cost = (uint8_t)(cycles > 0xffu ? 0xffu : cycles);
+    return (uint8_t)byte_count;
+}
+
 static int s6502_game_aot_cfg_test(uint32_t offset)
 {
     return offset < S6502_GAME_AOT_CFG_LIMIT &&
@@ -12668,8 +12928,9 @@ static void s6502_game_aot_cfg_enqueue(
     s6502_game_aot_cfg_item_t *item;
 
     if (offset >= code_size || offset >= S6502_GAME_AOT_CFG_LIMIT ||
-        virtual_pc < 0x5000u || virtual_pc >= 0x9000u ||
-        s6502_game_aot_cfg_test(offset))
+        virtual_pc < 0x5000u || virtual_pc >= 0x9000u)
+        return;
+    if (s6502_game_aot_cfg_test(offset))
         return;
     s6502_game_aot_cfg_set(offset);
     if (*queue_tail >= S6502_GAME_AOT_CFG_QUEUE_SIZE)
@@ -12804,14 +13065,35 @@ static void s6502_game_aot_recover_cfg(
                 uint32_t linked_physical_pc;
 
                 if (s6502_game_aot_resolve_far_call(
-                        table_address, &linked_pc, &linked_physical_pc) &&
-                    linked_physical_pc >= 0x20d000u &&
-                    linked_physical_pc - 0x20d000u < code_size)
-                    s6502_game_aot_cfg_enqueue(
-                        linked_physical_pc - 0x20d000u, linked_pc,
-                        code_size, &queue_tail
-                    );
+                        table_address, &linked_pc, &linked_physical_pc)) {
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+                    native_function_preload_note(linked_physical_pc);
+#endif
+                    if (linked_physical_pc >= 0x20d000u &&
+                        linked_physical_pc - 0x20d000u < code_size)
+                        s6502_game_aot_cfg_enqueue(
+                            linked_physical_pc - 0x20d000u, linked_pc,
+                            code_size, &queue_tail
+                        );
+                }
             }
+
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+            if ((opcode == 0x20u || opcode == 0x4cu) && instruction_size == 3u) {
+                uint16_t target = (uint16_t)(game[offset+1u] |
+                    ((uint16_t)game[offset+2u] << 8));
+                unsigned hops;
+                /* Fixed firmware calls and direct JMP API stubs. Do not
+                 * resolve game-bank addresses against the initial bank. */
+                for (hops = 0u; hops < 8u && target >= 0xd000u; ++hops) {
+                    native_function_preload_note(PA(target));
+                    if (target > 0xfffdu || mem_readx(target) != 0x4cu)
+                        break;
+                    target = (uint16_t)(mem_readx((uint16_t)(target+1u)) |
+                        ((uint16_t)mem_readx((uint16_t)(target+2u)) << 8));
+                }
+            }
+#endif
 
             if (opcode == 0x20u && instruction_size == 3u) {
                 uint16_t target = (uint16_t)(
@@ -12873,6 +13155,18 @@ static uint8_t s6502_game_aot_semantic_cycles(uint8_t semantic)
     case C6502_TEMPLATE_SUB16_OPER1_OPER2: return 20u;
     case C6502_TEMPLATE_LOAD_OPER1_INDY16: return 20u;
     case C6502_TEMPLATE_STORE_OPER1_INDY16: return 22u;
+    case C6502_TEMPLATE_ADD16_IMM_GENERIC:
+    case C6502_TEMPLATE_SUB16_IMM_GENERIC: return 18u;
+    case C6502_TEMPLATE_ADD16_PRESERVE_GENERIC:
+    case C6502_TEMPLATE_SUB16_PRESERVE_GENERIC: return 27u;
+    case C6502_TEMPLATE_ADD16_REGS_GENERIC:
+    case C6502_TEMPLATE_SUB16_REGS_GENERIC: return 20u;
+    case C6502_TEMPLATE_STORE16_IMM_GENERIC: return 10u;
+    case C6502_TEMPLATE_COPY16_GENERIC: return 12u;
+    case C6502_TEMPLATE_LOAD16_INDIRECT_GENERIC: return 20u;
+    case C6502_TEMPLATE_STORE16_INDIRECT_GENERIC: return 22u;
+    case C6502_TEMPLATE_LOAD_STACK8_GENERIC: return 7u;
+    case C6502_TEMPLATE_STORE_STACK8_GENERIC: return 8u;
     default: return 0u;
     }
 }
@@ -12938,6 +13232,158 @@ static int s6502_game_aot_add_entry(
     return 1;
 }
 
+static int s6502_game_aot_add_trace_entry(
+    const uint8_t *game, uint32_t code_size, uint32_t offset
+)
+{
+    uint8_t instruction_count;
+    uint8_t cycle_cost;
+    uint8_t trace_size;
+    uint32_t physical_pc;
+    uint16_t slot;
+    s6502_game_aot_entry_t *entry;
+
+    if (offset >= code_size ||
+        s6502_game_aot_entry_count >= S6502_GAME_AOT_MAX_ENTRIES)
+        return 0;
+    physical_pc = 0x20d000u + offset;
+    slot = s6502_game_aot_hash_slot(physical_pc);
+    while (s6502_game_aot_hash[slot]) {
+        if (s6502_game_aot_entries[
+                s6502_game_aot_hash[slot] - 1u].physical_pc == physical_pc)
+            return 0;
+        slot = (uint16_t)((slot + 1u) &
+            (S6502_GAME_AOT_HASH_SIZE - 1u));
+    }
+    trace_size = s6502_game_aot_trace_size_at(
+        game, code_size, offset, &instruction_count, &cycle_cost
+    );
+    if (!trace_size)
+        return 0;
+
+    entry = &s6502_game_aot_entries[s6502_game_aot_entry_count];
+    entry->physical_pc = physical_pc;
+    entry->linked_physical_pc = 0u;
+    entry->linked_table_address = 0u;
+    entry->linked_virtual_pc = 0u;
+    entry->linear_next_entry = 0u;
+    entry->pattern = S6502_GAME_AOT_TRACE_PATTERN;
+    entry->size = trace_size;
+    entry->semantic = 0u;
+    /* This field is otherwise only descriptive metadata.  For a tracelet it
+     * carries the predecoded instruction count, avoiding a second byte walk
+     * at runtime. */
+    entry->memory_class = instruction_count;
+    entry->cycle_cost = cycle_cost;
+    entry->linked_bank_number = 0u;
+    ++s6502_game_aot_entry_count;
+    ++s6502_game_aot_trace_entry_count;
+    ++s6502_game_aot_reachable_count;
+    s6502_game_aot_hash[slot] = s6502_game_aot_entry_count;
+    return 1;
+}
+
+static void s6502_game_aot_add_trace_entries(
+    const uint8_t *game, uint32_t code_size, uint16_t start
+)
+{
+    uint16_t original_entry_count = s6502_game_aot_entry_count;
+    uint16_t index;
+    uint32_t offset;
+
+    if (!GAM4980_ENABLE_LEGACY_INSTRUCTION_AOT)
+        return;
+
+    /* Existing semantic/legacy entries often end in the middle of a larger
+     * compiler expression.  Give their fallthrough first chance so the
+     * already-linked AOT path can continue without returning to IRAM. */
+    for (index = 0u;
+         index < original_entry_count &&
+             s6502_game_aot_entry_count < S6502_GAME_AOT_MAX_ENTRIES;
+         ++index) {
+        const s6502_game_aot_entry_t *entry =
+            &s6502_game_aot_entries[index];
+        uint32_t offset = entry->physical_pc - 0x20d000u + entry->size;
+
+        s6502_game_aot_add_trace_entry(game, code_size, offset);
+    }
+    /* Reconstruct CFG heads from the retained reachable-instruction bitmap
+     * after the candidate queue is no longer needed.  Keeping a separate
+     * uint32_t head array cost 16 KiB and pushed large KF2 images over the
+     * practical 9288 desktop loader limit.  This linear pass is load-time
+     * only and recovers the same entry/call/branch heads without permanent
+     * storage.  Duplicate heads are rejected by the physical-PC hash. */
+    if (start >= 0x5000u && start < 0x9000u)
+        s6502_game_aot_add_trace_entry(
+            game, code_size, (uint32_t)(start - 0x5000u)
+        );
+    for (offset = 0u;
+         offset + 2u < code_size &&
+             s6502_game_aot_entry_count < S6502_GAME_AOT_MAX_ENTRIES;
+         ++offset) {
+        uint8_t opcode;
+        uint8_t instruction_size;
+        uint32_t next_offset;
+        uint8_t encoded_pattern;
+
+        if (!s6502_game_aot_cfg_test(offset))
+            continue;
+        opcode = game[offset];
+        instruction_size = s6502_game_aot_opcode_size[opcode];
+        if (!instruction_size || instruction_size > code_size - offset)
+            continue;
+        next_offset = offset + instruction_size;
+        encoded_pattern = s6502_game_aot_pattern_at_priority(
+            game + offset, code_size - offset, 1u
+        );
+        if (encoded_pattern == (uint8_t)(7u + C6502_TEMPLATE_FAR_CALL)) {
+            uint16_t table_address = (uint16_t)(
+                game[offset + 1u] | ((uint16_t)game[offset + 5u] << 8)
+            );
+            uint16_t linked_pc;
+            uint32_t linked_physical_pc;
+
+            if (s6502_game_aot_resolve_far_call(
+                    table_address, &linked_pc, &linked_physical_pc) &&
+                linked_physical_pc >= 0x20d000u &&
+                linked_physical_pc - 0x20d000u < code_size)
+                s6502_game_aot_add_trace_entry(
+                    game, code_size, linked_physical_pc - 0x20d000u
+                );
+        }
+        if (opcode == 0x20u && instruction_size == 3u) {
+            uint16_t target = (uint16_t)(
+                game[offset + 1u] | ((uint16_t)game[offset + 2u] << 8)
+            );
+
+            s6502_game_aot_add_trace_entry(game, code_size, next_offset);
+            if (target >= 0x5000u && target < 0x9000u)
+                s6502_game_aot_add_trace_entry(
+                    game, code_size,
+                    (offset & ~0x3fffu) + (uint32_t)(target - 0x5000u)
+                );
+        } else if ((opcode & 0x1fu) == 0x10u) {
+            long branch_offset = (int8_t)game[offset + 1u];
+
+            s6502_game_aot_add_trace_entry(game, code_size, next_offset);
+            s6502_game_aot_add_trace_entry(
+                game, code_size,
+                (uint32_t)((long)next_offset + branch_offset)
+            );
+        } else if (opcode == 0x4cu && instruction_size == 3u) {
+            uint16_t target = (uint16_t)(
+                game[offset + 1u] | ((uint16_t)game[offset + 2u] << 8)
+            );
+
+            if (target >= 0x5000u && target < 0x9000u)
+                s6502_game_aot_add_trace_entry(
+                    game, code_size,
+                    (offset & ~0x3fffu) + (uint32_t)(target - 0x5000u)
+                );
+        }
+    }
+}
+
 static void s6502_game_aot_link_linear_successors(void)
 {
     uint16_t index;
@@ -12974,6 +13420,21 @@ static void s6502_game_aot_link_linear_successors(void)
     }
 }
 
+static gam4980_analysis_io_fn analysis_io;
+static uint32_t analysis_cache_status;
+void gam4980_set_analysis_io(gam4980_analysis_io_fn io) { analysis_io = io; }
+u32 gam4980_analysis_cache_status(void) { return analysis_cache_status; }
+#ifndef GAM4980_ANALYSIS_BUILD_ID
+#define GAM4980_ANALYSIS_BUILD_ID 1u
+#endif
+static uint32_t analysis_hash(const void *data, uint32_t size)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t hash = 2166136261u;
+    while (size--) hash = (hash ^ *p++) * 16777619u;
+    return hash;
+}
+
 static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
 {
     uint32_t offset;
@@ -12984,11 +13445,23 @@ static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
     uint8_t reachable_pass;
     uint8_t priority;
     uint8_t aot_progress = 0u;
+    uint32_t cache_header[8] = {0};
+    uint32_t cache_key = 0u;
+    int cache_hit = 0;
 
+    analysis_cache_status = 0u;
+
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+    native_function_preload_reset();
+#endif
     s6502_game_aot_entry_count = 0;
     s6502_game_aot_direct_link_hits = 0u;
     s6502_game_aot_linear_link_hits = 0u;
+    s6502_game_aot_runtime_lift_hits = 0u;
     s6502_game_aot_linear_link_count = 0u;
+    s6502_game_aot_trace_entry_count = 0u;
+    s6502_game_aot_trace_hits = 0u;
+    s6502_game_aot_trace_instruction_hits = 0u;
 #ifdef GAM4980_AOT_DIAGNOSTICS
     gam4980_memset(
         s6502_game_aot_direct_link_stage_hits, 0,
@@ -13003,6 +13476,9 @@ static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
     s6502_game_aot_reachable_count = 0u;
     s6502_game_aot_code_size = 0u;
     s6502_game_aot_code_base = game;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    s6502_static_native_bind_game(0, 0u);
+#endif
     gam4980_memset(
         s6502_game_aot_semantic_hits, 0,
         sizeof(s6502_game_aot_semantic_hits)
@@ -13036,6 +13512,9 @@ static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
     if (code_size < GAM4980_GAME_HEADER_SIZE || code_size > size)
         code_size = size;
     s6502_game_aot_code_size = code_size;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    s6502_static_native_bind_game(game, size);
+#endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
     if (s6502_firmware_hle_enabled) {
         gam4980_report_load_progress(
@@ -13059,6 +13538,15 @@ static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
         s6502_game_aot_recover_cfg(game, code_size, start);
         gam4980_report_load_progress(GAM4980_LOAD_STAGE_CFG, 1u, 1u);
     }
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+    else {
+        /* Native function preloading remains useful with load-AOT off.
+         * This is just the bounded CFG walk, not semantic/AOT generation. */
+        gam4980_report_load_progress(GAM4980_LOAD_STAGE_CFG, 0u, 1u);
+        s6502_game_aot_recover_cfg(game, code_size, start);
+        gam4980_report_load_progress(GAM4980_LOAD_STAGE_CFG, 1u, 1u);
+    }
+#endif
 
     /* Reachable compiler templates are collected before the conservative
      * whole-code fallback.  Within each pass, long/expensive semantics win
@@ -13074,8 +13562,42 @@ static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
      * The 16-bit metadata stores encoded pattern, reachability and priority.
      * If an unusually template-dense GAM exceeds the fixed queue, retain the
      * exact old collector as a no-allocation fallback. */
+    if (s6502_game_aot_requested && analysis_io) {
+        cache_key = analysis_hash(game, code_size);
+        analysis_cache_status = 1u;
+        if (analysis_io(0, 0u, cache_header, sizeof(cache_header)) &&
+            cache_header[0] == 0x31434147u &&
+            cache_header[1] == GAM4980_ANALYSIS_BUILD_ID &&
+            cache_header[2] == size && cache_header[3] == code_size &&
+            cache_header[4] == cache_key && cache_header[5] == 0u &&
+            cache_header[6] <= S6502_GAME_AOT_CFG_QUEUE_SIZE &&
+            analysis_io(0, sizeof(cache_header), s6502_game_aot_cfg_queue,
+                cache_header[6] * sizeof(s6502_game_aot_cfg_queue[0])) &&
+            analysis_hash(s6502_game_aot_cfg_queue,
+                cache_header[6] * sizeof(s6502_game_aot_cfg_queue[0])) == cache_header[7]) {
+            cache_hit = 1;
+            candidate_count = (uint16_t)cache_header[6];
+            for (offset = 0u; offset < candidate_count; ++offset) {
+                uint32_t at = s6502_game_aot_cfg_queue[offset].offset;
+                uint16_t meta = s6502_game_aot_cfg_queue[offset].virtual_pc;
+                if (at >= code_size || code_size - at < 3u ||
+                    s6502_game_aot_pattern_at_priority(game + at, code_size - at, (uint8_t)(meta >> 9)) != (uint8_t)meta ||
+                    meta != ((uint8_t)meta | (s6502_game_aot_cfg_test(at) ? 0x100u : 0u) |
+                        ((uint16_t)(meta >> 9) << 9)) || (meta >> 9) > 4u) {
+                    cache_hit = 0;
+                    break;
+                }
+            }
+            if (cache_hit) analysis_cache_status = 2u;
+        }
+    }
+    if (!cache_hit) {
+        candidate_count = 0u;
+        /* Include no stale struct padding in the persistent checksum. */
+        gam4980_memset(s6502_game_aot_cfg_queue, 0, sizeof(s6502_game_aot_cfg_queue));
+    }
     for (offset = 0u;
-         s6502_game_aot_requested && offset + 3u <= code_size;
+         !cache_hit && s6502_game_aot_requested && offset + 3u <= code_size;
          ++offset) {
         uint8_t matched_priority = 0u;
         uint8_t encoded_pattern = s6502_game_aot_pattern_at(
@@ -13164,8 +13686,35 @@ static void s6502_game_aot_prepare(const uint8_t *game, uint32_t size)
         gam4980_report_load_progress(
             GAM4980_LOAD_STAGE_AOT_INDEX, 10u, 10u
         );
-    if (s6502_game_aot_requested)
+    if (s6502_game_aot_requested) {
+        if (!cache_hit && analysis_io) {
+            candidate_count = s6502_game_aot_entry_count;
+            gam4980_memset(s6502_game_aot_cfg_queue, 0, sizeof(s6502_game_aot_cfg_queue));
+            for (offset = 0u; offset < candidate_count; ++offset) {
+                uint32_t at = s6502_game_aot_entries[offset].physical_pc - 0x20d000u;
+                uint8_t pattern = s6502_game_aot_entries[offset].pattern + 1u;
+                uint8_t pri;
+                for (pri = 0u; pri < 4u; ++pri)
+                    if (s6502_game_aot_pattern_at_priority(game + at, code_size - at, pri) == pattern) break;
+                s6502_game_aot_cfg_queue[offset].offset = at;
+                s6502_game_aot_cfg_queue[offset].virtual_pc = (uint16_t)(pattern |
+                    (s6502_game_aot_cfg_test(at) ? 0x100u : 0u) | ((uint16_t)pri << 9));
+            }
+            cache_header[0] = 0x31434147u;
+            cache_header[1] = GAM4980_ANALYSIS_BUILD_ID;
+            cache_header[2] = size; cache_header[3] = code_size;
+            cache_header[4] = cache_key; cache_header[5] = 0u;
+            cache_header[6] = candidate_count;
+            cache_header[7] = analysis_hash(s6502_game_aot_cfg_queue,
+                candidate_count * sizeof(s6502_game_aot_cfg_queue[0]));
+            if (analysis_io(1, 0u, cache_header, sizeof(cache_header)) &&
+                analysis_io(1, sizeof(cache_header), s6502_game_aot_cfg_queue,
+                    candidate_count * sizeof(s6502_game_aot_cfg_queue[0])))
+                analysis_cache_status = 3u;
+        }
+        s6502_game_aot_add_trace_entries(game, code_size, start);
         s6502_game_aot_link_linear_successors();
+    }
     s6502_game_aot_enabled =
         s6502_game_aot_requested && s6502_game_aot_entry_count != 0u;
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
@@ -13429,7 +13978,7 @@ static void native_module_refresh_cooldowns(void)
         }
     }
     native_module_next_cooldown_batch = next;
-    if (changed)
+    if (changed && !native_function_union_active)
         native_module_rebuild_page_entries();
 }
 
@@ -13458,10 +14007,75 @@ static void native_module_end_burst(void)
         GAM4980_NATIVE_MODULE_NONE;
 }
 
+#ifdef GAM4980_STATIC_NATIVE_GAME
+static uint32_t s6502_static_native_game_hash(
+    const uint8_t *data, uint32_t size
+)
+{
+    uint32_t hash = 0x811c9dc5u;
+
+    while (size--) {
+        hash ^= *data++;
+        hash *= 0x01000193u;
+    }
+    return hash;
+}
+
+static void s6502_static_native_bind_game(
+    const uint8_t *game, uint32_t size
+)
+{
+    uint32_t code_size;
+    uint32_t was_bound = s6502_static_native_bound;
+    uint16_t entry;
+
+    s6502_static_native_bound = 0u;
+    if (!game || size != GAM4980_STATIC_NATIVE_GAME_SIZE || size < 0x46u) {
+        if (was_bound) {
+            ++native_module_mapping_epoch;
+            native_module_rebuild_page_entries();
+        }
+        return;
+    }
+    entry = (uint16_t)(game[0x40u] | ((uint16_t)game[0x41u] << 8));
+    code_size = (uint32_t)game[0x42u] |
+        ((uint32_t)game[0x43u] << 8) |
+        ((uint32_t)game[0x44u] << 16) |
+        ((uint32_t)game[0x45u] << 24);
+    if (entry != GAM4980_STATIC_NATIVE_GAME_ENTRY ||
+        code_size != GAM4980_STATIC_NATIVE_GAME_CODE_SIZE ||
+        s6502_static_native_game_hash(game, size) !=
+            GAM4980_STATIC_NATIVE_GAME_HASH) {
+        if (was_bound) {
+            ++native_module_mapping_epoch;
+            native_module_rebuild_page_entries();
+        }
+        return;
+    }
+    s6502_static_native_bound = 1u;
+    ++native_module_mapping_epoch;
+    native_module_rebuild_page_entries();
+}
+#endif
+
 static void native_module_rebuild_page_entries(void)
 {
     uint32_t module_index;
 
+    ++native_module_full_rebuild_count;
+    native_function_union_active = native_module_function_package &&
+        native_module_status_value == 1u && native_module_header;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    /* Static game pages have priority when their mapping is active. Retain
+     * the legacy mapped table when both package modes are used together. */
+    if (s6502_static_native_bound)
+        native_function_union_active = 0u;
+#endif
+    for (module_index = 0u; module_index < 16u; ++module_index)
+        native_module_last_bank[module_index] = sys.bk_tab[module_index];
+    native_module_last_bank_valid = 0xffffu;
+    gam4980_memset(native_function_page_head, 0xff,
+        sizeof(native_function_page_head));
     gam4980_memset(
         native_module_page_entries, 0,
         sizeof(native_module_page_entries)
@@ -13470,8 +14084,30 @@ static void native_module_rebuild_page_entries(void)
         native_module_page_conflicts, 0,
         sizeof(native_module_page_conflicts)
     );
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    if (s6502_static_native_bound) {
+        uint32_t static_index;
+
+        for (static_index = 0u;
+             static_index < GAM4980_STATIC_NATIVE_PAGE_COUNT;
+             ++static_index) {
+            const gam4980_static_native_page_t *page_entry =
+                &gam4980_static_native_pages[static_index];
+            uint32_t page = page_entry->page;
+
+            if (page_entry->slot >= 16u || page >= 256u ||
+                sys.bk_tab[page_entry->slot] != page_entry->bank)
+                continue;
+            /* Statically linked code always wins over an optional pageable
+             * package: it needs neither a file read nor an arena bridge. */
+            native_module_page_entries[page] =
+                (uint32_t)(unsigned long)page_entry->entry;
+        }
+    }
+#endif
     if (native_module_status_value != 1u || !native_module_header)
         return;
+    native_module_rebuild_module_visit_count += native_module_header->module_count;
     for (module_index = 0u;
          module_index < native_module_header->module_count;
          ++module_index) {
@@ -13481,7 +14117,9 @@ static void native_module_rebuild_page_entries(void)
             &native_module_runtime[module_index];
         uint32_t link_index;
 
-        if (!runtime->static_valid || native_module_cooldown_active(runtime))
+        runtime->function_page_next = 0xffffu;
+        if (!runtime->static_valid || (!native_function_union_active &&
+            native_module_cooldown_active(runtime)))
             continue;
         for (link_index = 0u; link_index < module->link_count;
              ++link_index) {
@@ -13492,16 +14130,16 @@ static void native_module_rebuild_page_entries(void)
             uint32_t first_page = (link->guest_pc >> 8) & 0xffu;
             uint32_t page_count = 1u;
             uint32_t page_offset;
-            uint32_t page_entry = runtime->loaded
+            uint32_t page_entry = native_module_function_package
+                ? (uint32_t)(unsigned long)native_module_firmware_entry
+                : runtime->loaded
                 ? (uint32_t)(unsigned long)(
-                    native_module_code_base +
-                    (uint32_t)runtime->allocation_first *
-                        GAM4980_NATIVE_ALLOC_UNIT_SIZE +
-                    link->entry_offset
+                    runtime->code + link->entry_offset
                   )
                 : (uint32_t)(unsigned long)native_module_fault_entry;
 
-            if (slot >= 16u || sys.bk_tab[slot] != bank)
+            if (slot >= 16u || (!native_function_union_active &&
+                sys.bk_tab[slot] != bank))
                 continue;
             for (page_offset = 0u; page_offset < page_count;
                  ++page_offset) {
@@ -13513,13 +14151,21 @@ static void native_module_rebuild_page_entries(void)
                 int page_matches = 1;
 
                 for (match_index = 0u;
-                     match_index < module->match_count; ++match_index) {
+                     match_index < (native_module_function_package
+                        ? 1u : module->match_count); ++match_index) {
                     const gam4980_native_match_record_t *match =
-                        &native_module_matches[
-                            module->match_first + match_index
-                        ];
-                    const s6502_aot_block_t *block =
-                        &s6502_aot_blocks[match->aot_block_id];
+                        native_match_at(module->match_first + match_index);
+                    const s6502_aot_block_t *block;
+
+                    if (module->flags & GAM4980_NATIVE_MODULE_FIRMWARE) {
+                        uint32_t virtual_pc = (slot << 12) |
+                            (match->physical_pc & 0xfffu);
+                        if ((virtual_pc >> 8) == page) page_has_match = 1;
+                        /* Immutable ROM function bytes were checked on open.
+                         * The length field is not an index into old AOT. */
+                        continue;
+                    }
+                    block = &s6502_aot_blocks[match->aot_block_id];
 
                     if ((block->virtual_pc >> 8) != page)
                         continue;
@@ -13530,6 +14176,21 @@ static void native_module_rebuild_page_entries(void)
                     }
                 }
                 if (!page_has_match || !page_matches)
+                    continue;
+                if (native_module_function_package) {
+                    runtime->function_page_next = native_function_page_head[page];
+                    native_function_page_head[page] = (uint16_t)module_index;
+                }
+                if ((module->flags & GAM4980_NATIVE_MODULE_FIRMWARE) &&
+                    native_module_page_entries[page]) {
+                    /* Separate authored functions can share a 256-byte page.
+                     * Route by full physical PC instead of letting the first
+                     * module shadow every later function on that page. */
+                    native_module_page_entries[page] =
+                        (uint32_t)(unsigned long)native_module_firmware_entry;
+                    continue;
+                }
+                if (native_module_page_entries[page])
                     continue;
                 if (native_module_page_conflicts[page])
                     continue;
@@ -13545,6 +14206,60 @@ static void native_module_rebuild_page_entries(void)
     }
 }
 
+static void native_module_residency_changed(void)
+{
+    /* The FUNCTION table contains permanent guarded gateways, not resident
+     * code addresses. Loading, freeing or cooling a function cannot stale it. */
+    if (!native_function_union_active)
+        native_module_rebuild_page_entries();
+}
+
+static uint8_t *native_module_heap_allocate(uint32_t size)
+{
+    uint8_t *result;
+    int reinstall = 0;
+
+    if (!native_heap_alloc || !native_heap_free || !size)
+        return 0;
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+    reinstall = s6502_iram_exec_enabled && s6502_iram_exec_residency_valid;
+    if (reinstall)
+        gam4980_invalidate_iram_exec_residency();
+#endif
+    result = native_heap_alloc(native_heap_context, size);
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+    if (reinstall && !s6502_iram_install_exec_range())
+        s6502_iram_exec_enabled = 0;
+#else
+    (void)reinstall;
+#endif
+    return result;
+}
+
+static int native_module_heap_release(uint8_t *allocation)
+{
+    int result;
+    int reinstall = 0;
+
+    if (!allocation)
+        return 1;
+    if (!native_heap_free)
+        return 0;
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+    reinstall = s6502_iram_exec_enabled && s6502_iram_exec_residency_valid;
+    if (reinstall)
+        gam4980_invalidate_iram_exec_residency();
+#endif
+    result = native_heap_free(native_heap_context, allocation);
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
+    if (reinstall && !s6502_iram_install_exec_range())
+        s6502_iram_exec_enabled = 0;
+#else
+    (void)reinstall;
+#endif
+    return result;
+}
+
 static void native_module_release_units(uint32_t module_index)
 {
     gam4980_native_runtime_module_t *runtime;
@@ -13554,6 +14269,31 @@ static void native_module_release_units(uint32_t module_index)
         module_index >= native_module_header->module_count)
         return;
     runtime = &native_module_runtime[module_index];
+    if (native_module_function_package) {
+        /* A native memory callback can trigger a load while its caller is
+         * still on the host stack. Never free an in-flight return address. */
+        if (runtime->active_calls)
+            return;
+        if (runtime->code &&
+            !native_module_heap_release(runtime->code))
+            return;
+        /* Unpublish only after a successful release, and only if this slot
+         * still belongs to this allocation. Same-PC functions in another bank
+         * can have replaced it; refusing eviction must not disable a hot entry. */
+        if (native_module_records[module_index].flags & GAM4980_NATIVE_MODULE_REGISTER) {
+            uint32_t pc = native_module_links[native_module_records[module_index].link_first].guest_pc;
+            uint32_t *slot = native_register_entries[pc & 255u];
+            if (slot[0] == pc && slot[3] == (uint32_t)(unsigned long)&runtime->active_calls)
+                slot[2] = 0u;
+            native_profile_publish(pc);
+        }
+        native_module_resident_code_bytes -= runtime->code_allocation_size;
+        runtime->code = 0;
+        runtime->code_allocation_size = 0u;
+        runtime->register_referenced = 0u;
+        runtime->loaded = 0u;
+        return;
+    }
     for (unit = 0u; unit < runtime->allocation_count; ++unit) {
         uint32_t index = (uint32_t)runtime->allocation_first + unit;
 
@@ -13605,13 +14345,21 @@ static int native_module_evict_oldest(void)
          ++module_index) {
         const gam4980_native_module_record_t *module =
             &native_module_records[module_index];
-        const gam4980_native_runtime_module_t *runtime =
+        gam4980_native_runtime_module_t *runtime =
             &native_module_runtime[module_index];
 
         if (!runtime->loaded ||
+            runtime->active_calls ||
             (module->flags & GAM4980_NATIVE_MODULE_PINNED) ||
             native_module_key(module_index) == active_key)
             continue;
+        /* Private calls bypass the C bridge's LRU stamp. Consume their cheap
+         * reference bit only under eviction pressure, giving those bodies a
+         * second chance without maintaining a timestamp on every call. */
+        if (runtime->register_referenced) {
+            runtime->register_referenced = 0u;
+            runtime->stamp = ++native_module_clock;
+        }
         if (selected == GAM4980_NATIVE_MODULE_NONE ||
             runtime->stamp < oldest) {
             selected = module_index;
@@ -13623,6 +14371,8 @@ static int native_module_evict_oldest(void)
     native_module_runtime[selected].evicted_batch =
         native_module_batch_clock;
     native_module_release_units(selected);
+    if (native_module_runtime[selected].loaded)
+        return 0;
     ++native_module_eviction_count;
     return 1;
 }
@@ -13650,9 +14400,23 @@ static int native_module_allocate_units(
 static void native_module_invalidate_game(void)
 {
     uint32_t module_index;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    int invalidated_static = s6502_static_native_bound != 0u;
 
-    if (!native_module_game_bound || !native_module_header)
+    if (invalidated_static) {
+        s6502_static_native_bound = 0u;
+        ++s6502_static_native_invalidations;
+        ++native_module_mapping_epoch;
+    }
+#endif
+
+    if (!native_module_game_bound || !native_module_header) {
+#ifdef GAM4980_STATIC_NATIVE_GAME
+        if (invalidated_static)
+            native_module_rebuild_page_entries();
+#endif
         return;
+    }
     native_module_game_bound = 0u;
     ++native_module_mapping_epoch;
     for (module_index = 0u;
@@ -13679,12 +14443,25 @@ static int native_module_game_write_overlaps(uint32_t offset, uint32_t size)
     uint32_t write_first;
     uint32_t write_last;
 
-    if (!native_module_game_bound || !native_module_game_header || !size ||
-        offset >= 0x15000u + native_module_game_header->game_code_size ||
-        offset + size <= 0x15000u)
+    if (!size || offset + size <= 0x15000u)
         return 0;
     write_first = offset > 0x15000u ? offset - 0x15000u : 0u;
     write_last = offset + size - 0x15000u;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    if (s6502_static_native_bound) {
+        for (index = 0u; index < GAM4980_STATIC_NATIVE_SPAN_COUNT; ++index) {
+            const gam4980_static_native_span_t *span =
+                &gam4980_static_native_spans[index];
+
+            if (write_first < span->offset + span->size &&
+                write_last > span->offset)
+                return 1;
+        }
+    }
+#endif
+    if (!native_module_game_bound || !native_module_game_header ||
+        offset >= 0x15000u + native_module_game_header->game_code_size)
+        return 0;
     for (index = 0u;
          index < native_module_game_header->game_code_span_count;
          ++index) {
@@ -13716,25 +14493,58 @@ static int native_module_load(uint32_t module_index)
         module->code_size + GAM4980_NATIVE_ALLOC_UNIT_SIZE - 1u
     ) / GAM4980_NATIVE_ALLOC_UNIT_SIZE;
     if (!runtime->static_valid || !allocation_count ||
-        allocation_count > native_module_alloc_unit_count)
+        (!native_module_function_package &&
+         allocation_count > native_module_alloc_unit_count))
         return 0;
     if (runtime->loaded) {
         runtime->stamp = ++native_module_clock;
         return 1;
     }
-    if (!native_module_allocate_units(
+    if (native_module_function_package && runtime->code) {
+        /* A previous read may have failed while the host temporarily refused
+         * to free its allocation. Retry release, never overwrite ownership. */
+        native_module_release_units(module_index);
+        if (runtime->code)
+            return 0;
+    }
+    if (native_module_function_package) {
+        uint32_t bytes = (module->code_size + 3u) & ~3u;
+        if (!bytes || bytes > GAM4980_NATIVE_CODE_ARENA_SIZE)
+            return 0;
+        while (bytes > GAM4980_NATIVE_CODE_ARENA_SIZE -
+                       native_module_resident_code_bytes) {
+            if (!native_module_evict_oldest()) {
+                ++native_module_fallback_count;
+                native_module_residency_changed();
+                return 0;
+            }
+        }
+        code = native_module_heap_allocate(bytes);
+        while (!code && native_module_evict_oldest())
+            code = native_module_heap_allocate(bytes);
+        if (!code) {
+            ++native_module_fallback_count;
+            native_module_residency_changed();
+            return 0;
+        }
+        runtime->code = code;
+        runtime->code_allocation_size = bytes;
+        native_module_resident_code_bytes += bytes;
+    } else if (!native_module_allocate_units(
             module_index, allocation_count, &allocation_first
         )) {
         ++native_module_fallback_count;
         return 0;
+    } else {
+        code = native_module_code_base +
+            allocation_first * GAM4980_NATIVE_ALLOC_UNIT_SIZE;
+        runtime->code = code;
     }
-    code = native_module_code_base +
-        allocation_first * GAM4980_NATIVE_ALLOC_UNIT_SIZE;
     if (!native_module_read(module->code_offset, code, module->code_size) ||
         native_module_hash(code, module->code_size) != module->code_hash) {
         native_module_release_units(module_index);
         ++native_module_fallback_count;
-        native_module_rebuild_page_entries();
+        native_module_residency_changed();
         return 0;
     }
     for (reloc_index = 0u; reloc_index < module->reloc_count;
@@ -13748,7 +14558,7 @@ static int native_module_load(uint32_t module_index)
             reloc->code_offset > module->code_size - 4u) {
             native_module_release_units(module_index);
             ++native_module_fallback_count;
-            native_module_rebuild_page_entries();
+            native_module_residency_changed();
             return 0;
         }
         value = (uint32_t)(unsigned long)code + reloc->addend;
@@ -13758,25 +14568,60 @@ static int native_module_load(uint32_t module_index)
         target[3] = (uint8_t)(value >> 24);
     }
     runtime->loaded = 1u;
+    if ((module->flags & GAM4980_NATIVE_MODULE_REGISTER) &&
+        (!(module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) || gam4980_firmware_hle_enabled())) {
+        uint32_t pc = native_module_links[module->link_first].guest_pc;
+        uint32_t *entry = native_register_entries[pc & 255u];
+        entry[0] = pc;
+        entry[1] = native_module_links[module->link_first].required_mapping & 65535u;
+        entry[2] = (uint32_t)(unsigned long)(runtime->code + module->working_set);
+        entry[3] = (uint32_t)(unsigned long)&runtime->active_calls;
+        native_profile_publish(pc);
+    }
     runtime->stamp = ++native_module_clock;
     runtime->last_load_batch = native_module_batch_clock;
     ++native_module_load_count;
     native_module_bytes_loaded_count += module->code_size;
-    native_module_rebuild_page_entries();
+    native_module_residency_changed();
     return 1;
 }
 
 static void native_module_refresh_bank(uint8_t sel)
 {
-    if (native_module_status_value != 1u || !native_module_header ||
-        sel >= 16u)
+    uint16_t physical_bank;
+
+    if (sel >= 16u)
         return;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    if (!s6502_static_native_bound &&
+        (native_module_status_value != 1u || !native_module_header))
+        return;
+#else
+    if (native_module_status_value != 1u || !native_module_header)
+        return;
+#endif
+    ++native_module_bank_refresh_count;
+    physical_bank = sys.bk_tab[sel];
+    if ((native_module_last_bank_valid & (uint16_t)(1u << sel)) &&
+        native_module_last_bank[sel] == physical_bank) {
+        ++native_module_bank_nochange_count;
+        return;
+    }
+    native_module_last_bank[sel] = physical_bank;
+    native_module_last_bank_valid |= (uint16_t)(1u << sel);
     /* Generated modules may chain several control-terminated blocks while
      * keeping guest state in one native activation.  Any bank remap is a hard
      * chain barrier, including a remap triggered from the module's WRITE8
      * callback.  The module observes this epoch before dispatching its next
      * block and returns to IRAM before using stale physical-code assumptions. */
     ++native_module_mapping_epoch;
+    if (native_function_union_active) {
+        /* Every possible callable entry is already indexed. Exact physical
+         * mapping checks in the gateways prevent calls through stale banks;
+         * a bank write therefore needs no catalogue walk or table clears. */
+        ++native_module_function_bank_fastpath_count;
+        return;
+    }
     /* A bank write can occur through a callback while code in one of the two
      * pageable slots is still on the host call stack.  Never overwrite that
      * slot in-place; the next dispatch miss loads the new bank safely. */
@@ -13788,6 +14633,54 @@ static void native_module_refresh_bank(uint8_t sel)
     native_module_rebuild_page_entries();
 }
 
+static uint32_t native_function_module_for_pc(uint16_t pc)
+{
+    uint32_t module_index;
+    uint32_t physical;
+    uint32_t *cached = native_function_entry_cache[(pc ^ (pc >> 8)) & 255u];
+
+    if (!native_module_function_package || native_module_status_value != 1u ||
+        !native_module_header)
+        return GAM4980_NATIVE_MODULE_NONE;
+    physical = ((uint32_t)sys.bk_tab[pc >> 12] << 12) | (pc & 0xfffu);
+    if (cached[0] == physical && cached[1] &&
+        cached[1] <= native_module_header->module_count) {
+        module_index = cached[1] - 1u;
+        {
+            const gam4980_native_module_record_t *module = &native_module_records[module_index];
+            const gam4980_native_runtime_module_t *runtime = &native_module_runtime[module_index];
+            if (native_module_links[module->link_first].guest_pc == pc &&
+                native_match_at(module->match_first)->physical_pc == physical &&
+                runtime->static_valid && !native_module_cooldown_active(runtime) &&
+                (!(module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) || gam4980_firmware_hle_enabled()))
+                return module_index;
+        }
+    }
+    for (module_index = native_function_page_head[pc >> 8];
+         module_index < native_module_header->module_count;
+         module_index = native_module_runtime[module_index].function_page_next) {
+        const gam4980_native_module_record_t *module =
+            &native_module_records[module_index];
+        const gam4980_native_link_record_t *link =
+            &native_module_links[module->link_first];
+        const gam4980_native_runtime_module_t *runtime =
+            &native_module_runtime[module_index];
+        /* The immutable union includes functions from mutually exclusive
+         * banks. Both the exact virtual entry and physical ROM identity are
+         * required; a guard span or an alias in another slot is not callable. */
+        if (link->guest_pc == pc &&
+            native_match_at(module->match_first)->physical_pc == physical &&
+            runtime->static_valid && !native_module_cooldown_active(runtime) &&
+            (!(module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) ||
+             gam4980_firmware_hle_enabled())) {
+            cached[0] = physical;
+            cached[1] = module_index + 1u;
+            return module_index;
+        }
+    }
+    return GAM4980_NATIVE_MODULE_NONE;
+}
+
 static int native_module_ensure_pc(uint16_t pc)
 {
     uint32_t module_index;
@@ -13795,6 +14688,22 @@ static int native_module_ensure_pc(uint16_t pc)
 
     if (native_module_status_value != 1u || !native_module_header)
         return 0;
+    if (native_module_function_package) {
+        /* Called by the external C loop AFTER the IRAM burst returns.
+         * Heap and file gateways may restore IRAM; never invoke them below
+         * a live IRAM callback return address. Loaded guarded misses return
+         * zero here so the complete interpreter can make progress. */
+        module_index = native_function_module_for_pc(pc);
+        if (module_index == GAM4980_NATIVE_MODULE_NONE ||
+            native_module_runtime[module_index].loaded)
+            return 0;
+        ++native_module_fault_attempt_count;
+        native_module_record_transition(
+            s6502_native_shared_metrics.current_module_key,
+            native_module_key(module_index)
+        );
+        return native_module_load(module_index);
+    }
     /* A resident entry has already been attempted by IRAM.  Returning one
      * here would retry a deliberate native miss (decimal mode, HLE boundary,
      * or an unlisted PC) forever instead of reaching the complete C path. */
@@ -13844,6 +14753,126 @@ static int native_module_ensure_pc(uint16_t pc)
     return 0;
 }
 
+static uint32_t native_module_firmware_entry_once(s6502_iram_asm_context_t *context)
+{
+    typedef uint32_t (*entry_fn)(s6502_iram_asm_context_t *);
+    uint32_t index,pc,physical;
+    if(!context || native_module_status_value!=1u || !native_module_header)return 0u;
+    pc=(uint16_t)context->pc;
+    physical=((uint32_t)sys.bk_tab[pc>>12]<<12)|(pc&0xfffu);
+    for(index=native_module_function_package?native_function_module_for_pc((uint16_t)pc):0u;
+        index<native_module_header->module_count;
+        index=native_module_function_package?GAM4980_NATIVE_MODULE_NONE:index+1u){
+        const gam4980_native_module_record_t *module=&native_module_records[index];
+        gam4980_native_runtime_module_t *runtime=&native_module_runtime[index];
+        uint32_t match_index;
+        if(!(module->flags&GAM4980_NATIVE_MODULE_FIRMWARE) || !runtime->static_valid ||
+           native_module_cooldown_active(runtime))continue;
+        for(match_index=0;match_index<(native_module_function_package?1u:module->match_count);++match_index){
+            const gam4980_native_match_record_t *match=native_match_at(module->match_first+match_index);
+            uint32_t executed,previous_key;
+            uint32_t profile_kind = (module->flags & GAM4980_NATIVE_MODULE_TEXT) ? 1u : 0u;
+            uint32_t started = 0u;
+            uint32_t (*clock_fn)(void) = 0;
+            if(native_module_function_package) {
+                if(physical!=match->physical_pc)continue;
+            } else if(physical<match->physical_pc || physical-match->physical_pc>=match->aot_block_id)continue;
+            if(native_module_function_package) {
+                /* The assembly caller still has an IRAM return address.
+                 * A cold function is faulted only after returning to C. */
+                if(!runtime->loaded)return 0u;
+            } else if(!native_module_load(index))return 0u;
+            if (module->flags & GAM4980_NATIVE_MODULE_REGISTER) {
+                uint32_t *slot = native_register_entries[pc & 255u];
+                slot[0] = pc; slot[1] = physical >> 12;
+                slot[2] = (uint32_t)(unsigned long)(runtime->code + module->working_set);
+                slot[3] = (uint32_t)(unsigned long)&runtime->active_calls;
+                native_profile_publish(pc);
+            }
+            context->graphics = (uint32_t)(unsigned long)&native_graphics_services;
+            if (module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) {
+                native_graphics_services.version = FW_GRAPHICS_SERVICE_VERSION;
+                native_graphics_services.page3 = (uint32_t)(unsigned long)s6502_page3;
+                native_graphics_services.banks = (uint32_t)(unsigned long)sys.bk_tab;
+                native_graphics_services.write8_resolved = (uint32_t)(unsigned long)native_graphics_write8_resolved;
+                native_graphics_services.poll = (uint32_t)(unsigned long)native_graphics_poll;
+                native_graphics_services.metrics = s6502_native_shared_metrics.diagnostics_enabled
+                    ? (uint32_t)(unsigned long)native_graphics_io_metrics : 0u;
+                context->graphics = (uint32_t)(unsigned long)&native_graphics_services;
+                if (s6502_native_shared_metrics.diagnostics_enabled) {
+                    ++native_graphics_host_profile[profile_kind][0];
+                    clock_fn = host_profile.current ? (uint32_t (*)(void))(unsigned long)native_graphics_services.clock : 0;
+                    if (clock_fn) started = host_profile.ticks[profile_kind ? HP_TEXT : HP_GRAPHICS];
+                }
+            }
+            previous_key=s6502_native_shared_metrics.current_module_key;
+            ++runtime->active_calls;
+            s6502_native_shared_metrics.current_module_key=native_module_key(index);
+            {
+                u32 previous = host_profile_enter((module->flags & GAM4980_NATIVE_MODULE_GRAPHICS)
+                    ? (profile_kind ? HP_TEXT : HP_GRAPHICS) : HP_NATIVE);
+                u32 previous_owner = host_function_owner;
+                if (host_profile.current && index < HP_FUNCTION_COUNT) {
+                    host_function_owner = index;
+                    host_function_profile[index][0] = physical;
+                    ++host_function_profile[index][1];
+                } else host_function_owner = HP_FUNCTION_COUNT;
+                executed=((entry_fn)(void *)(runtime->code+module->entry_offset))(context);
+                host_profile_leave(previous);
+                if (host_function_owner < HP_FUNCTION_COUNT && executed)
+                    ++host_function_profile[host_function_owner][2];
+                host_function_owner = previous_owner;
+            }
+            if (module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) {
+                if (s6502_native_shared_metrics.diagnostics_enabled) {
+                    ++native_graphics_host_profile[profile_kind][executed ? 1u : 4u];
+                    if (clock_fn) {
+                        uint32_t elapsed = host_profile.ticks[profile_kind ? HP_TEXT : HP_GRAPHICS] - started;
+                        native_graphics_host_profile[profile_kind][2] += elapsed;
+                        if (elapsed > native_graphics_host_profile[profile_kind][3])
+                            native_graphics_host_profile[profile_kind][3] = elapsed;
+                    }
+                }
+            }
+            --runtime->active_calls;
+            s6502_native_shared_metrics.current_module_key=previous_key;
+            runtime->stamp=++native_module_clock;
+            if(executed && index<32u && s6502_native_shared_metrics.diagnostics_enabled)
+                native_module_firmware_route_mask|=1u<<index;
+            return executed;
+        }
+    }
+    return 0u;
+}
+
+static uint32_t native_module_firmware_entry(s6502_iram_asm_context_t *context)
+{
+    uint32_t total = 0u, count = 0u;
+    if (!context) return 0u;
+    do {
+        uint32_t before = context->cycles;
+        uint32_t consumed = native_module_firmware_entry_once(context);
+        if (!consumed) break;
+        total += consumed;
+        ++count;
+        /* Keep state in the same context across resident firmware functions.
+         * This avoids an IRAM spill/reload pair per function, but is NOT a
+         * new register ABI. Never load code here while an IRAM return address
+         * is live, and never cross the guest deadline or a shutdown. */
+        if (context->cycles <= before || context->cycles >= context->cycle_budget ||
+            sys_halt_p() || count >= 32u) break;
+        if (native_module_page_entries[((uint16_t)context->pc) >> 8] !=
+                (uint32_t)(unsigned long)native_module_firmware_entry)
+            break;
+    } while (1);
+    if (s6502_native_shared_metrics.diagnostics_enabled && count) {
+        s6502_native_shared_metrics.chain_links += count - 1u;
+        if (count > s6502_native_shared_metrics.max_chain)
+            s6502_native_shared_metrics.max_chain = count;
+    }
+    return total;
+}
+
 static uint32_t native_module_fault_entry(
     s6502_iram_asm_context_t *context
 )
@@ -13853,6 +14882,8 @@ static uint32_t native_module_fault_entry(
     uint32_t entry;
 
     if (!context)
+        return 0u;
+    if (native_module_function_package)
         return 0u;
     page = ((uint16_t)context->pc) >> 8;
     if (!native_module_ensure_pc((uint16_t)context->pc))
@@ -13866,6 +14897,45 @@ static uint32_t native_module_fault_entry(
 
 void gam4980_native_modules_close(void)
 {
+    uint32_t module_index;
+
+    /* The application closes after the engine returns, never from a native
+     * callback. Defensive guard protects a still-live host return address. */
+    for (module_index = 0u; native_module_header &&
+         module_index < native_module_header->module_count; ++module_index)
+        if (native_module_runtime[module_index].active_calls)
+            return;
+    if (native_module_function_package) {
+        for (module_index = 0u; native_module_header &&
+             module_index < native_module_header->module_count; ++module_index) {
+            native_module_release_units(module_index);
+            if (native_module_runtime[module_index].code)
+                return;
+        }
+    }
+    if (native_code_arena_owned) {
+        if (!native_module_heap_release(native_code_arena))
+            return;
+        native_code_arena = 0;
+        native_code_arena_size = 0u;
+        native_code_arena_owned = 0u;
+    }
+    if (native_module_manifest_owned &&
+        !native_module_heap_release(native_module_manifest))
+        return;
+    native_code_arena_owned = 0u;
+    native_module_manifest = 0;
+    native_module_manifest_size = 0u;
+    native_module_manifest_owned = 0u;
+    native_module_function_package = 0u;
+    native_module_resident_code_bytes = 0u;
+    native_function_union_active = 0u;
+    native_module_last_bank_valid = 0u;
+    native_module_full_rebuild_count = 0u;
+    native_module_bank_refresh_count = 0u;
+    native_module_bank_nochange_count = 0u;
+    native_module_function_bank_fastpath_count = 0u;
+    native_module_rebuild_module_visit_count = 0u;
     native_module_reader = 0;
     native_module_reader_context = 0;
     native_module_file_size = 0u;
@@ -13881,10 +14951,15 @@ void gam4980_native_modules_close(void)
     native_module_status_value = 0u;
     native_module_preloaded_count = 0u;
     native_module_load_count = 0u;
+    native_module_firmware_route_mask = 0u;
     native_module_eviction_count = 0u;
     native_module_bytes_loaded_count = 0u;
     native_module_fallback_count = 0u;
     native_module_game_bound = 0u;
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    s6502_static_native_bound = 0u;
+    s6502_static_native_invalidations = 0u;
+#endif
     native_module_mapping_epoch = 0u;
     native_module_batch_clock = 0u;
     native_module_fault_budget = 0u;
@@ -13906,6 +14981,13 @@ void gam4980_native_modules_close(void)
         native_module_page_entries, 0,
         sizeof(native_module_page_entries)
     );
+    gam4980_memset(native_function_page_head, 0xff,
+        sizeof(native_function_page_head));
+    gam4980_memset(native_register_entries, 0, sizeof(native_register_entries));
+#if defined(__s1c33__)
+    gam4980_memset(native_profile_register_entries, 0, sizeof(native_profile_register_entries));
+#endif
+    gam4980_memset(native_function_entry_cache, 0, sizeof(native_function_entry_cache));
     gam4980_memset(
         native_module_page_conflicts, 0,
         sizeof(native_module_page_conflicts)
@@ -13948,10 +15030,18 @@ int gam4980_native_modules_open(
     gam4980_native_header_t first_header;
     uint32_t code_start;
     uint32_t module_index;
+    /* Function packages repeat immutable family guards. Cache their hashes
+     * only for this open (768 bytes of stack), not once per callable alias. */
+    uint32_t guard_hash_cache[64][3];
+    uint32_t guard_hash_count = 0u;
+    uint32_t guard_hash_next = 0u;
 
     gam4980_native_modules_close();
-    if (!reader || !file_size || !native_code_arena ||
-        native_code_arena_size < GAM4980_NATIVE_MANIFEST_LIMIT + 32u)
+    if (native_module_header || native_module_manifest_owned ||
+        native_code_arena_owned)
+        return 0;
+    if (!reader || !file_size ||
+        ((!native_heap_alloc || !native_heap_free) && !native_code_arena))
         return 0;
     native_module_reader = reader;
     native_module_reader_context = context;
@@ -13963,11 +15053,16 @@ int gam4980_native_modules_open(
         !((first_header.format_version ==
                 GAM4980_NATIVE_FORMAT_VERSION &&
             first_header.header_size == GAM4980_NATIVE_HEADER_SIZE) ||
+          (NATIVE_FIRMWARE_FORMAT(first_header.format_version) &&
+            first_header.header_size == GAM4980_NATIVE_HEADER_SIZE) ||
           (first_header.format_version ==
                 GAM4980_NATIVE_GAME_FORMAT_VERSION &&
             first_header.header_size ==
                 GAM4980_NATIVE_GAME_FULL_HEADER_SIZE)) ||
-        first_header.abi_version != GAM4980_NATIVE_ABI_VERSION ||
+        !(first_header.abi_version == GAM4980_NATIVE_ABI_VERSION ||
+          ((first_header.abi_version == GAM4980_NATIVE_GRAPHICS_ABI_VERSION ||
+            first_header.abi_version == GAM4980_NATIVE_REGISTER_ABI_VERSION) &&
+           NATIVE_FIRMWARE_FORMAT(first_header.format_version))) ||
         first_header.file_size != file_size ||
         !first_header.module_count ||
         first_header.module_count > GAM4980_NATIVE_MAX_MODULES ||
@@ -13976,7 +15071,7 @@ int gam4980_native_modules_open(
         first_header.link_count > GAM4980_NATIVE_MAX_LINKS ||
         first_header.payload_offset < first_header.header_size ||
         first_header.payload_offset > GAM4980_NATIVE_MANIFEST_LIMIT ||
-        first_header.payload_offset > native_code_arena_size ||
+        first_header.payload_offset > file_size ||
         first_header.payload_size != file_size -
             first_header.payload_offset ||
         !native_module_range_valid(
@@ -13985,7 +15080,8 @@ int gam4980_native_modules_open(
         ) ||
         !native_module_range_valid(
             first_header.match_offset, first_header.match_count,
-            GAM4980_NATIVE_MATCH_SIZE, first_header.payload_offset
+            first_header.format_version == GAM4980_NATIVE_COMPACT_FORMAT_VERSION ? 4u :
+                GAM4980_NATIVE_MATCH_SIZE, first_header.payload_offset
         ) ||
         !native_module_range_valid(
             first_header.reloc_offset, first_header.reloc_count,
@@ -13996,17 +15092,30 @@ int gam4980_native_modules_open(
             GAM4980_NATIVE_LINK_SIZE, first_header.payload_offset
         ))
         goto invalid_package;
+    if (native_heap_alloc && native_heap_free) {
+        native_module_manifest = native_module_heap_allocate(
+            first_header.payload_offset
+        );
+        native_module_manifest_owned = 1u;
+    } else if (first_header.payload_offset <= native_code_arena_size) {
+        native_module_manifest = native_code_arena;
+    }
+    if (!native_module_manifest)
+        goto invalid_package;
+    native_module_manifest_size = first_header.payload_offset;
     if (!native_module_read(
-            0u, native_code_arena, first_header.payload_offset
-        ))
+            0u, native_module_manifest, first_header.payload_offset
+        ) || native_module_hash(native_module_manifest,
+                sizeof(first_header)) != native_module_hash(
+                (const uint8_t *)&first_header, sizeof(first_header)))
         goto invalid_package;
     native_module_header =
-        (gam4980_native_header_t *)(void *)native_code_arena;
+        (gam4980_native_header_t *)(void *)native_module_manifest;
     if (native_module_header->format_version ==
         GAM4980_NATIVE_GAME_FORMAT_VERSION) {
         native_module_game_header =
             (gam4980_native_game_header_t *)(void *)(
-                native_code_arena + GAM4980_NATIVE_HEADER_SIZE
+                native_module_manifest + GAM4980_NATIVE_HEADER_SIZE
             );
         if (native_module_game_header->package_flags !=
                 GAM4980_NATIVE_PACKAGE_GAME ||
@@ -14016,7 +15125,7 @@ int gam4980_native_modules_open(
             goto invalid_package;
     }
     if (native_module_hash(
-            native_code_arena + GAM4980_NATIVE_HEADER_SIZE,
+            native_module_manifest + GAM4980_NATIVE_HEADER_SIZE,
             native_module_header->payload_offset -
                 GAM4980_NATIVE_HEADER_SIZE
         ) != native_module_header->manifest_hash)
@@ -14025,16 +15134,16 @@ int gam4980_native_modules_open(
     if (native_module_game_header && !native_module_game_bound)
         goto invalid_package;
     native_module_records = (gam4980_native_module_record_t *)(void *)(
-        native_code_arena + native_module_header->module_offset
+        native_module_manifest + native_module_header->module_offset
     );
     native_module_matches = (gam4980_native_match_record_t *)(void *)(
-        native_code_arena + native_module_header->match_offset
+        native_module_manifest + native_module_header->match_offset
     );
     native_module_relocs = (gam4980_native_reloc_record_t *)(void *)(
-        native_code_arena + native_module_header->reloc_offset
+        native_module_manifest + native_module_header->reloc_offset
     );
     native_module_links = (gam4980_native_link_record_t *)(void *)(
-        native_code_arena + native_module_header->link_offset
+        native_module_manifest + native_module_header->link_offset
     );
     if (native_module_game_header) {
         for (module_index = 0u;
@@ -14055,19 +15164,51 @@ int gam4980_native_modules_open(
                 goto invalid_package;
         }
     }
-    code_start = (
-        native_module_header->payload_offset +
-        GAM4980_NATIVE_ALLOC_UNIT_SIZE - 1u
-    ) & ~(GAM4980_NATIVE_ALLOC_UNIT_SIZE - 1u);
-    if (code_start >= native_code_arena_size)
+    if (native_module_header->format_version == GAM4980_NATIVE_COMPACT_FORMAT_VERSION) {
+        const uint32_t *refs = (const uint32_t *)(const void *)native_module_matches;
+        for (module_index = 0u; module_index < native_module_header->match_count; ++module_index)
+            if (refs[module_index] >= native_module_header->reloc_count)
+                goto invalid_package;
+    }
+    native_module_function_package = NATIVE_FIRMWARE_FORMAT(native_module_header->format_version);
+    for (module_index = 0u;
+         module_index < native_module_header->module_count; ++module_index) {
+        if (!(native_module_records[module_index].flags &
+              GAM4980_NATIVE_MODULE_FUNCTION))
+            native_module_function_package = 0u;
+    }
+    if (native_module_header->format_version == GAM4980_NATIVE_COMPACT_FORMAT_VERSION &&
+        !native_module_function_package)
         goto invalid_package;
-    native_module_code_base = native_code_arena + code_start;
-    native_module_alloc_unit_count =
-        (native_code_arena_size - code_start) /
-        GAM4980_NATIVE_ALLOC_UNIT_SIZE;
-    if (!native_module_alloc_unit_count ||
-        native_module_alloc_unit_count > GAM4980_NATIVE_MAX_ALLOC_UNITS)
-        goto invalid_package;
+    if (native_module_function_package) {
+        if (!native_heap_alloc || !native_heap_free)
+            goto invalid_package;
+    } else {
+        /* Backward-compatible page packages retain their arena allocator,
+         * but reserve it only when such a package is actually opened. */
+        if (!native_code_arena) {
+            native_code_arena = native_module_heap_allocate(
+                GAM4980_NATIVE_CODE_ARENA_SIZE
+            );
+            if (!native_code_arena)
+                goto invalid_package;
+            native_code_arena_size = GAM4980_NATIVE_CODE_ARENA_SIZE;
+            native_code_arena_owned = 1u;
+        }
+        code_start = native_module_manifest == native_code_arena ? (
+            native_module_header->payload_offset +
+            GAM4980_NATIVE_ALLOC_UNIT_SIZE - 1u
+        ) & ~(GAM4980_NATIVE_ALLOC_UNIT_SIZE - 1u) : 0u;
+        if (code_start >= native_code_arena_size)
+            goto invalid_package;
+        native_module_code_base = native_code_arena + code_start;
+        native_module_alloc_unit_count =
+            (native_code_arena_size - code_start) /
+            GAM4980_NATIVE_ALLOC_UNIT_SIZE;
+        if (!native_module_alloc_unit_count ||
+            native_module_alloc_unit_count > GAM4980_NATIVE_MAX_ALLOC_UNITS)
+            goto invalid_package;
+    }
     gam4980_memset(
         native_module_unit_owner, 0xff, sizeof(native_module_unit_owner)
     );
@@ -14079,13 +15220,25 @@ int gam4980_native_modules_open(
         uint32_t index;
         int game_module =
             (module->flags & GAM4980_NATIVE_MODULE_GAME) != 0u;
+        if (((module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) &&
+             (!native_module_function_package || (native_module_header->abi_version !=
+                 GAM4980_NATIVE_GRAPHICS_ABI_VERSION && native_module_header->abi_version !=
+                 GAM4980_NATIVE_REGISTER_ABI_VERSION))) ||
+            ((module->flags & GAM4980_NATIVE_MODULE_TEXT) &&
+             !(module->flags & GAM4980_NATIVE_MODULE_GRAPHICS)))
+            goto invalid_package;
         int valid = module->code_size > 0u &&
-            module->code_size <= native_module_alloc_unit_count *
-                GAM4980_NATIVE_ALLOC_UNIT_SIZE &&
+            module->code_size <= (native_module_function_package ?
+                GAM4980_NATIVE_CODE_ARENA_SIZE :
+                native_module_alloc_unit_count *
+                    GAM4980_NATIVE_ALLOC_UNIT_SIZE) &&
             module->code_offset >= native_module_header->payload_offset &&
             module->code_offset <= file_size &&
             module->code_size <= file_size - module->code_offset &&
             module->entry_offset < module->code_size &&
+            (!(module->flags & GAM4980_NATIVE_MODULE_REGISTER) ||
+                (native_module_function_package && module->working_set < module->code_size &&
+                 !(module->working_set & 1u))) &&
             module->match_first <= native_module_header->match_count &&
             module->match_count <= native_module_header->match_count -
                 module->match_first &&
@@ -14095,13 +15248,67 @@ int gam4980_native_modules_open(
             module->link_first <= native_module_header->link_count &&
             module->link_count <= native_module_header->link_count -
                 module->link_first &&
+            (!NATIVE_FIRMWARE_FORMAT(native_module_header->format_version) ||
+                ((module->flags & GAM4980_NATIVE_MODULE_FIRMWARE) &&
+                 module->match_count && module->link_count && !game_module)) &&
+            (!(module->flags & GAM4980_NATIVE_MODULE_FUNCTION) ||
+                (native_module_function_package && module->match_count &&
+                 module->link_count == 1u && !module->reloc_count)) &&
+            (!(module->flags & GAM4980_NATIVE_MODULE_GRAPHICS) ||
+                (native_module_function_package &&
+                 (native_module_header->abi_version == GAM4980_NATIVE_GRAPHICS_ABI_VERSION ||
+                  native_module_header->abi_version == GAM4980_NATIVE_REGISTER_ABI_VERSION))) &&
+            (!(module->flags & GAM4980_NATIVE_MODULE_TEXT) ||
+                (module->flags & GAM4980_NATIVE_MODULE_GRAPHICS)) &&
             (!game_module ||
                 (native_module_game_bound && module->match_count == 0u));
 
         for (index = 0u; valid && index < module->match_count; ++index) {
             const gam4980_native_match_record_t *match =
-                &native_module_matches[module->match_first + index];
+                native_match_at(module->match_first + index);
             const s6502_aot_block_t *block;
+
+            if (module->flags & GAM4980_NATIVE_MODULE_FIRMWARE) {
+                uint32_t offset, byte_index, hash = 2166136261u;
+                uint32_t cache_index;
+                /* Handwritten functions bind to ROM bytes, never an AOT ID.
+                 * Validate while the filesystem is available during load. */
+                if (!NATIVE_FIRMWARE_FORMAT(native_module_header->format_version) ||
+                    game_module || match->module_index !=
+                        (native_module_header->format_version == GAM4980_NATIVE_COMPACT_FORMAT_VERSION ?
+                         0xffffffffu : module_index) ||
+                    match->physical_pc < 0xe00000u ||
+                    match->physical_pc >= 0x1000000u ||
+                    !match->aot_block_id ||
+                    match->aot_block_id > 0x1000u ||
+                    match->aot_block_id > 0x1000000u - match->physical_pc) {
+                    valid = 0;
+                    break;
+                }
+                offset = match->physical_pc - 0xe00000u;
+                for (cache_index = 0u; cache_index < guard_hash_count;
+                     ++cache_index)
+                    if (guard_hash_cache[cache_index][0] == match->physical_pc &&
+                        guard_hash_cache[cache_index][1] == match->aot_block_id)
+                        break;
+                if (cache_index < guard_hash_count) {
+                    hash = guard_hash_cache[cache_index][2];
+                } else {
+                    for (byte_index = 0u; byte_index < match->aot_block_id;
+                         ++byte_index)
+                        hash = (hash ^ rom_read_byte(GAM4980_ROM_REGION_E,
+                            offset + byte_index)) * 16777619u;
+                    cache_index = guard_hash_next;
+                    guard_hash_next = (guard_hash_next + 1u) & 63u;
+                    if (guard_hash_count < 64u)
+                        ++guard_hash_count;
+                    guard_hash_cache[cache_index][0] = match->physical_pc;
+                    guard_hash_cache[cache_index][1] = match->aot_block_id;
+                    guard_hash_cache[cache_index][2] = hash;
+                }
+                if (hash != match->signature_hash) valid = 0;
+                continue;
+            }
 
             if (match->module_index != module_index ||
                 match->aot_block_id >= S6502_AOT_BLOCK_COUNT) {
@@ -14135,21 +15342,53 @@ int gam4980_native_modules_open(
                 (link->required_mapping >> 16) >= 16u ||
                 link->entry_offset >= module->code_size)
                 valid = 0;
+            if (valid && native_module_function_package) {
+                const gam4980_native_match_record_t *entry =
+                    native_match_at(module->match_first);
+                uint32_t physical =
+                    ((link->required_mapping & 0xffffu) << 12) |
+                    (link->guest_pc & 0xfffu);
+                if (physical != entry->physical_pc ||
+                    (link->guest_pc >> 12) !=
+                        (link->required_mapping >> 16) ||
+                    link->entry_offset != module->entry_offset)
+                    valid = 0;
+            }
         }
         native_module_runtime[module_index].allocation_first = 0xffu;
         native_module_runtime[module_index].allocation_count = 0u;
         native_module_runtime[module_index].static_valid = valid ? 1u : 0u;
     }
     native_module_status_value = 1u;
+    /* Build callable gateways before preload. Their immutable union remains
+     * valid as individual code allocations become resident or are evicted. */
+    native_module_rebuild_page_entries();
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+    if (native_module_function_package)
+        native_function_preload_prepare();
+#endif
     for (module_index = 0u;
          module_index < native_module_header->module_count;
          ++module_index) {
-        if ((native_module_records[module_index].flags &
-             GAM4980_NATIVE_MODULE_PRELOAD) &&
+        int preload = (native_module_records[module_index].flags &
+            GAM4980_NATIVE_MODULE_PRELOAD) != 0u;
+        if (native_module_function_package) {
+            preload = 0;
+#ifdef GAM4980_DYNAMIC_NATIVE_ALL
+            if (native_module_runtime[module_index].static_valid)
+                preload = native_function_preload_candidate(
+                    native_match_at(native_module_records[module_index].match_first)->physical_pc
+                );
+#endif
+        }
+        if ((native_module_records[module_index].flags & GAM4980_NATIVE_MODULE_GRAPHICS) &&
+            !gam4980_firmware_hle_enabled())
+            preload = 0;
+        if (preload &&
             native_module_load(module_index))
             ++native_module_preloaded_count;
     }
-    native_module_rebuild_page_entries();
+    native_module_residency_changed();
     return 1;
 
 invalid_package:
@@ -14184,6 +15423,11 @@ u32 gam4980_native_module_preloaded(void)
 }
 
 u32 gam4980_native_module_loads(void) { return native_module_load_count; }
+u32 gam4980_native_module_full_rebuilds(void) { return native_module_full_rebuild_count; }
+u32 gam4980_native_module_bank_refreshes(void) { return native_module_bank_refresh_count; }
+u32 gam4980_native_module_bank_nochanges(void) { return native_module_bank_nochange_count; }
+u32 gam4980_native_module_function_bank_fastpaths(void) { return native_module_function_bank_fastpath_count; }
+u32 gam4980_native_module_rebuild_module_visits(void) { return native_module_rebuild_module_visit_count; }
 u32 gam4980_native_module_evictions(void)
 {
     return native_module_eviction_count;
@@ -14284,11 +15528,37 @@ u32 gam4980_native_module_transition_error(u32 rank)
 }
 u32 gam4980_native_module_arena_size(void)
 {
-    return native_code_arena_size;
+    return native_module_function_package ? native_module_manifest_size +
+        native_module_resident_code_bytes : native_code_arena_size +
+        (native_module_manifest_owned ? native_module_manifest_size : 0u);
+}
+u32 gam4980_native_module_function_mode(void)
+{
+    return native_module_function_package;
+}
+u32 gam4980_native_module_resident_bytes(void)
+{
+    uint32_t module_index, bytes = 0u;
+    if (native_module_function_package)
+        return native_module_resident_code_bytes;
+    for (module_index = 0u; native_module_header &&
+         module_index < native_module_header->module_count; ++module_index)
+        if (native_module_runtime[module_index].loaded)
+            bytes += native_module_runtime[module_index].allocation_count *
+                GAM4980_NATIVE_ALLOC_UNIT_SIZE;
+    return bytes;
+}
+u32 gam4980_native_module_manifest_bytes(void)
+{
+    return native_module_manifest_size;
+}
+u32 gam4980_native_module_code_limit(void)
+{
+    return GAM4980_NATIVE_CODE_ARENA_SIZE;
 }
 u32 gam4980_native_module_slot_size(void)
 {
-    return GAM4980_NATIVE_ALLOC_UNIT_SIZE;
+    return native_module_function_package ? 4u : GAM4980_NATIVE_ALLOC_UNIT_SIZE;
 }
 u32 gam4980_native_module_resident_count(void)
 {
@@ -14308,6 +15578,8 @@ u32 gam4980_native_module_alloc_units_used(void)
     uint32_t unit;
     uint32_t count = 0u;
 
+    if (native_module_function_package)
+        return native_module_resident_code_bytes / 4u;
     for (unit = 0u; unit < native_module_alloc_unit_count; ++unit)
         if (native_module_unit_owner[unit] != 0xffu)
             ++count;
@@ -14315,7 +15587,8 @@ u32 gam4980_native_module_alloc_units_used(void)
 }
 u32 gam4980_native_module_alloc_units_total(void)
 {
-    return native_module_alloc_unit_count;
+    return native_module_function_package ? GAM4980_NATIVE_CODE_ARENA_SIZE / 4u :
+        native_module_alloc_unit_count;
 }
 u32 gam4980_native_module_format(void)
 {
@@ -14323,17 +15596,85 @@ u32 gam4980_native_module_format(void)
 }
 u32 gam4980_native_module_game_bound(void)
 {
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    if (s6502_static_native_bound)
+        return 1u;
+#endif
     return native_module_game_bound;
 }
 u32 gam4980_native_module_game_blocks(void)
 {
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    if (s6502_static_native_bound)
+        return GAM4980_STATIC_NATIVE_SELECTED_BLOCKS;
+#endif
     return native_module_game_header
         ? native_module_game_header->game_block_count : 0u;
 }
 u32 gam4980_native_module_game_bytes(void)
 {
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    if (s6502_static_native_bound)
+        return GAM4980_STATIC_NATIVE_SELECTED_CODE_BYTES;
+#endif
     return native_module_game_header
         ? native_module_game_header->game_native_bytes : 0u;
+}
+u32 gam4980_static_native_compiled(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return 1u;
+#else
+    return 0u;
+#endif
+}
+u32 gam4980_static_native_bound(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return s6502_static_native_bound;
+#else
+    return 0u;
+#endif
+}
+u32 gam4980_static_native_modules(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return GAM4980_STATIC_NATIVE_MODULE_COUNT;
+#else
+    return 0u;
+#endif
+}
+u32 gam4980_static_native_blocks(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return GAM4980_STATIC_NATIVE_SELECTED_BLOCKS;
+#else
+    return 0u;
+#endif
+}
+u32 gam4980_static_native_guest_bytes(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return GAM4980_STATIC_NATIVE_SELECTED_GUEST_BYTES;
+#else
+    return 0u;
+#endif
+}
+u32 gam4980_static_native_code_bytes(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return GAM4980_STATIC_NATIVE_SELECTED_CODE_BYTES;
+#else
+    return 0u;
+#endif
+}
+u32 gam4980_static_native_invalidations(void)
+{
+#ifdef GAM4980_STATIC_NATIVE_GAME
+    return s6502_static_native_invalidations;
+#else
+    return 0u;
+#endif
 }
 #endif
 
@@ -14582,6 +15923,26 @@ u32 gam4980_game_aot_linear_link_count(void)
 u32 gam4980_game_aot_linear_link_hits(void)
 {
     return s6502_game_aot_linear_link_hits;
+}
+
+u32 gam4980_game_aot_runtime_lift_hits(void)
+{
+    return s6502_game_aot_runtime_lift_hits;
+}
+
+u32 gam4980_game_aot_trace_entry_count(void)
+{
+    return s6502_game_aot_trace_entry_count;
+}
+
+u32 gam4980_game_aot_trace_hits(void)
+{
+    return s6502_game_aot_trace_hits;
+}
+
+u32 gam4980_game_aot_trace_instruction_hits(void)
+{
+    return s6502_game_aot_trace_instruction_hits;
 }
 
 u32 gam4980_game_aot_direct_link_stage_hits(u32 stage)
@@ -15001,6 +16362,22 @@ static void ram_vwrite(uint16_t addr, uint8_t val)
     ram_write(PA(addr), val);
 }
 
+static uint32_t mapped_bank_physical[16];
+static uint16_t mapped_bank_valid;
+
+static int mapped_bank_unchanged(uint8_t sel, uint32_t physical, uint8_t *base,
+    uint8_t (*reader)(uint16_t), void (*writer)(uint16_t, uint8_t))
+{
+    uint32_t page = (uint32_t)sel * 16u;
+    /* Include the actual backing pointer: a cache replacement or a new game
+     * allocation must not be mistaken for an unchanged bank number. Null
+     * (failed/cold) maps always rebuild. Flash command-mode maps are excluded. */
+    return base && (mapped_bank_valid & (1u << sel)) &&
+        mapped_bank_physical[sel] == physical &&
+        sys.mem_r[page] == base && sys.mem_r[page + 15u] == base + 0xf00u &&
+        sys.mem_ir[page] == reader && sys.mem_iw[page] == writer;
+}
+
 static void mem_bs(uint8_t sel)
 {
     uint32_t paddr = PA(sel * 0x1000);
@@ -15014,6 +16391,9 @@ static void mem_bs(uint8_t sel)
         s6502_game_aot_bank_mask &= (uint16_t)~(1u << sel);
 #endif
     if (paddr < 0x8000) {
+        if (mapped_bank_unchanged(sel, paddr, sys.ram + paddr,
+                                  ram_vread, ram_vwrite))
+            goto mapping_unchanged;
         for (int i = 0; i < 16; i += 1) {
             sys.mem_r[sel * 16 + i] = sys.ram + paddr + i * 0x100;
             sys.mem_ir[sel * 16 + i] = ram_vread;
@@ -15040,6 +16420,8 @@ static void mem_bs(uint8_t sel)
             bank = rom_cached_bank(
                 sel, GAM4980_ROM_REGION_8, paddr - 0x800000
             );
+        if (mapped_bank_unchanged(sel, paddr, bank, rom_8_vread, invalid_write))
+            goto mapping_unchanged;
         for (int i = 0; i < 16; i += 1) {
             sys.mem_r[sel * 16 + i] = bank ? bank + i * 0x100 : 0;
             sys.mem_ir[sel * 16 + i] = rom_8_vread;
@@ -15054,6 +16436,8 @@ static void mem_bs(uint8_t sel)
             bank = rom_cached_bank(
                 sel, GAM4980_ROM_REGION_E, paddr - 0xe00000
             );
+        if (mapped_bank_unchanged(sel, paddr, bank, rom_e_vread, invalid_write))
+            goto mapping_unchanged;
         for (int i = 0; i < 16; i += 1) {
             sys.mem_r[sel * 16 + i] = bank ? bank + i * 0x100 : 0;
             sys.mem_ir[sel * 16 + i] = rom_e_vread;
@@ -15068,12 +16452,61 @@ static void mem_bs(uint8_t sel)
     }
 #ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
     s6502_iram_refresh_page_kind_range((uint32_t)sel * 16u, 16u);
+#endif
+    mapped_bank_physical[sel] = paddr;
+    mapped_bank_valid |= (uint16_t)(1u << sel);
+mapping_unchanged:
+    /* Feature/dispatch state may change independently of memory ownership. */
+#ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
     if (s6502_iram_exec_enabled)
         s6502_iram_refresh_dispatch_bank(sel);
 #endif
 #if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
     native_module_refresh_bank(sel);
 #endif
+}
+
+/* Only used by the native bank contract: no guest instruction or IRQ runs
+ * between its low/high writes. Discard transient maps, not final side effects. */
+static uint32_t native_bank_map4(uint32_t bank)
+{
+    uint32_t i;
+    if (native_graphics_services.bank_metrics) ++native_bank_metrics[0];
+    if (sys.mem_iw[0] != page0_write || sys.mem_ir[0] != page0_read ||
+        sys.mem_r[0x20] != sys.ram + 0x2000 ||
+        (sys.mem_iw[0x20] != ram_write &&
+         !(sys.mem_iw[0x20] == ram_vwrite && sys.bk_tab[2] == 2u)))
+        return 0u;
+#if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
+    ++native_module_callback_depth;
+#endif
+    for (i=0;i<4u;++i) {
+        sys.bk_sel=(uint8_t)(5u+i);
+        sys.bk_tab[5u+i]=(uint16_t)((bank+i)&0xfffu);
+        mem_bs((uint8_t)(5u+i));
+    }
+    sys.ram[0x2000]=(uint8_t)((bank+3u)>>8);
+#if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
+    --native_module_callback_depth;
+#endif
+    if (native_graphics_services.bank_metrics) { ++native_bank_metrics[1];native_bank_metrics[2]+=4u; }
+    return 1u;
+}
+static uint32_t native_bank_descriptor_safe(uint32_t address)
+{
+    uint32_t i;
+    if (address<0x400u || address>0xfffdu ||
+        (address<=0x8fffu && address+2u>=0x5000u)) return 0u;
+    for(i=0;i<3u;++i) {
+        uint32_t at=address+i,page=at>>8,physical;
+        if (sys.mem_ir[page]==ram_read) physical=at;
+        else if (sys.mem_ir[page]==ram_vread) physical=PA(at);
+        else if (sys.mem_ir[page]==rom_e_vread || sys.mem_ir[page]==rom_8_vread) continue;
+        else if (sys.mem_ir[page]==flash_vread && !sys.flash_cmd && sys.mem_r[page]) continue;
+        else return 0u;
+        if(physical<0x400u || (physical>=0x2000u && physical<=0x2002u))return 0u;
+    }
+    return 1u;
 }
 
 static uint8_t mem_readx(uint16_t addr)
@@ -15114,6 +16547,23 @@ static void mem_write(uint16_t addr, uint8_t val)
 {
     return sys.mem_iw[addr >> 8](addr, val);
 }
+
+#if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
+static uint32_t native_graphics_write8_resolved(uint16_t addr, uint8_t val)
+{
+    uint32_t physical = 0xffffffffu;
+    if (sys.mem_iw[addr >> 8] == ram_write)
+        physical = addr;
+    else if (sys.mem_iw[addr >> 8] == ram_vwrite)
+        physical = ((uint32_t)sys.bk_tab[addr >> 12] << 12) | (addr & 0xfffu);
+    native_module_mem_write(addr, val);
+#if defined(GAM4980_TARGET_9288) && defined(GAM4980_ENABLE_BARE_SESSION)
+    if (!gam4980_9288_bare_active())
+        native_graphics_services.framebuffer = 0u;
+#endif
+    return physical < GAM4980_RAM_SIZE ? physical : 0xffffffffu;
+}
+#endif
 
 enum _key {
     KEY_ON_OFF     = 0x00,      /* 开关 */
@@ -15204,11 +16654,6 @@ int gam4980_init(const gam4980_buffers_t *buffers)
 #if defined(GAM4980_ENABLE_BARE_SESSION) && defined(GAM4980_TARGET_9288)
         || !buffers->rom_cache ||
         buffers->rom_cache_size < GAM4980_BARE_ROM_CACHE_SIZE
-#ifdef GAM4980_DYNAMIC_NATIVE_ALL
-        ||
-        !buffers->native_code ||
-        buffers->native_code_size < GAM4980_NATIVE_CODE_ARENA_SIZE
-#endif
 #endif
         )
         return -1;
@@ -15278,6 +16723,10 @@ int gam4980_init(const gam4980_buffers_t *buffers)
     s6502_firmware_hle_multiply_validation = 0u;
     s6502_firmware_hle_compare_validation = 0u;
     s6502_firmware_hle_bank_switch_validation = 0u;
+    s6502_firmware_hle_bank_query_validation = 0u;
+    s6502_firmware_hle_bank_range_validation = 0u;
+    s6502_firmware_hle_bank_get_validation = 0u;
+    s6502_bank_query_hits = s6502_bank_query_cycles = 0u;
     s6502_firmware_hle_c_runtime_validation = 0u;
     s6502_firmware_hle_compare_long_validation = 0u;
     s6502_firmware_hle_indirect_call_validation = 0u;
@@ -15352,6 +16801,7 @@ int gam4980_init(const gam4980_buffers_t *buffers)
 #endif
 #endif
 #endif
+    mapped_bank_valid = 0u;
     sys.ram = buffers->ram;
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
     s6502_firmware_hle_banks = sys.bk_tab;
@@ -15373,9 +16823,15 @@ int gam4980_init(const gam4980_buffers_t *buffers)
     rom_bank_cache = (uint8_t (*)[ROM_BANK_SIZE])buffers->rom_cache;
 #endif
 #if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
+    gam4980_native_modules_close();
+    if (native_module_header || native_module_manifest_owned ||
+        native_code_arena_owned)
+        return -1;
     native_code_arena = buffers->native_code;
     native_code_arena_size = buffers->native_code_size;
-    gam4980_native_modules_close();
+    native_heap_alloc = buffers->native_alloc;
+    native_heap_free = buffers->native_free;
+    native_heap_context = buffers->native_alloc_context;
 #endif
     fb = buffers->framebuffer;
     gam4980_memset(sys.ram, 0x00, GAM4980_RAM_SIZE);
@@ -15754,7 +17210,21 @@ static void sys_step()
                 exec_slice = core_runtime_poll_max_guest_cycles;
 
             sys_isr();
-            executed = s6502_exec(&sys.cpu, exec_slice);
+            {
+                static u32 sample_cursor;
+                /* The frontend supplies this clock only with debug enabled.
+                 * s6502_performance_debug is deliberately constant zero in
+                 * LIGHT builds and must not gate this independent sampler. */
+                int sample = native_graphics_services.clock &&
+                    ((++sample_cursor & 15u) == 0u);
+                if (sample) {
+                    host_profile.clock = (u32 (*)(void))(unsigned long)native_graphics_services.clock;
+                    ++host_profile.samples;
+                    (void)host_profile_switch(HP_CORE);
+                }
+                executed = s6502_exec(&sys.cpu, exec_slice);
+                if (sample) (void)host_profile_switch(HP_OFF);
+            }
             step_ticked += executed;
 #ifdef GAM4980_RUNTIME_PERFORMANCE_LOG
             if (s6502_performance_debug) {
@@ -16063,6 +17533,15 @@ u32 gam4980_native_module_transition_error(u32 rank)
     return 0u;
 }
 u32 gam4980_native_module_arena_size(void) { return 0u; }
+u32 gam4980_native_module_function_mode(void) { return 0u; }
+u32 gam4980_native_module_full_rebuilds(void) { return 0u; }
+u32 gam4980_native_module_bank_refreshes(void) { return 0u; }
+u32 gam4980_native_module_bank_nochanges(void) { return 0u; }
+u32 gam4980_native_module_function_bank_fastpaths(void) { return 0u; }
+u32 gam4980_native_module_rebuild_module_visits(void) { return 0u; }
+u32 gam4980_native_module_resident_bytes(void) { return 0u; }
+u32 gam4980_native_module_manifest_bytes(void) { return 0u; }
+u32 gam4980_native_module_code_limit(void) { return 0u; }
 u32 gam4980_native_module_slot_size(void) { return 0u; }
 u32 gam4980_native_module_resident_count(void) { return 0u; }
 u32 gam4980_native_module_alloc_units_used(void) { return 0u; }
@@ -16088,8 +17567,14 @@ void gam4980_deinit(void)
 #endif
 #if defined(GAM4980_IRAM_EXEC_ASM) && defined(GAM4980_ENABLE_AOT)
     gam4980_native_modules_close();
+    if (native_module_header || native_module_manifest_owned ||
+        native_code_arena_owned)
+        return;
     native_code_arena = 0;
     native_code_arena_size = 0u;
+    native_heap_alloc = 0;
+    native_heap_free = 0;
+    native_heap_context = 0;
 #endif
     fb = 0;
     shutdown_requested = 0;

@@ -1,6 +1,6 @@
 /* E.BIN high-level emulation blocks. Included inside s6502_exec(). */
 
-#ifdef GAM4980_ENABLE_AGGRESSIVE_REGION_HLE
+#if defined(GAM4980_ENABLE_AGGRESSIVE_REGION_HLE) && !defined(GAM4980_NATIVE_GRAPHICS_ONLY)
   _hle_ebin_picture_head:
     {
       int hle_status = s6502_firmware_hle_picture_head_call(
@@ -152,6 +152,7 @@
     }
 #endif
 
+#if defined(GAM4980_ENABLE_AGGRESSIVE_REGION_HLE) && !defined(GAM4980_NATIVE_GRAPHICS_ONLY)
   _hle_ebin_graphics_address:
     {
       int hle_status = s6502_firmware_hle_graphics_address(
@@ -260,6 +261,7 @@
       status = s6502_hle_direct_result.status;
       goto _exit;
     }
+#endif
 
   _hle_ebin_bitmap_copy:
     {
@@ -388,6 +390,7 @@
       goto _exit;
     }
 
+#ifndef GAM4980_NATIVE_GRAPHICS_ONLY
   _hle_ebin_glyph_row:
     {
       s6502_hle_glyph_result_t hle_result;
@@ -462,6 +465,7 @@
       goto _exit;
     }
 
+#endif
   _hle_ebin_shift_blit:
     {
       uint8_t *hle_ram = s6502_stack_ram;
@@ -613,73 +617,117 @@
     }
 
   _hle_ebin_byte_fill:
-    {
-      uint8_t *hle_ram = s6502_stack_ram;
-      uint16_t hle_address;
-      uint16_t hle_count;
-      uint8_t hle_value;
-      uint8_t hle_y;
+    ea = ix;
+    dt = 0u;
+    goto _hle_ebin_byte_transfer;
 
-      /* Collapse E.BIN $7937-$793f and the final $7933-$7936 loop test.
-       * This primitive is called repeatedly while the opening scroll is
-       * composed.  Keep WRITE8 so mapped I/O and 16-bit wrapping stay exact. */
+  _hle_ebin_byte_fill_partial:
+    dt = 1u;
+
+  _hle_ebin_byte_transfer:
+    {
+      uint16_t count = ea;
+      uint8_t value = dt ? (uint8_t)ac : 0u;
+      uint8_t x = (uint8_t)ix, y = (uint8_t)iy;
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_BYTE_FILL, et);
-      hle_count = ix;
-      hle_y = iy;
-      hle_value = 0u;
-      while (hle_count != 0u) {
-        /* $03 is the fourth direct-memory data port, not ordinary zero-page
-         * RAM.  READ8 preserves its auto-increment side effect.  Reload the
-         * destination pointer too, for exact low-RAM aliasing behavior. */
-        hle_value = READ8(0x0003u);
-        hle_address = (uint16_t)(
-            hle_ram[0x2fu] | ((uint16_t)hle_ram[0x30u] << 8)
-        );
-        hle_address = (uint16_t)(hle_address + hle_y);
-        WRITE8(hle_address, hle_value);
-        ++hle_y;
-        --hle_count;
+      /* DATA3 is an auto-incrementing port, not a constant fill byte.
+       * Full and partial entries share this single ordered transfer kernel. */
+      while (count--) {
+        uint16_t address;
+        value = READ8(0x0003u);
+        address = (uint16_t)(s6502_stack_ram[0x2fu] |
+            ((uint16_t)s6502_stack_ram[0x30u] << 8));
+        WRITE8((uint16_t)(address + y), value);
+        ++y; --x;
       }
-      iy = hle_y;
-      ix = 0u;
-      ac = hle_value;
+      ac = value; ix = x; iy = y;
       SET_C(1);
       SET_NZ(ix);
-      pc = 0x7940u;
+      pc = dt ? 0x7937u : 0x7940u;
       goto _exit;
     }
 
-  _hle_ebin_byte_fill_partial:
+  _hle_ebin_bank_get:
     {
-      uint8_t *hle_ram = s6502_stack_ram;
-      uint16_t hle_address;
-      uint16_t hle_count = ea;
-      uint8_t hle_value = ac;
-      uint8_t hle_y = iy;
-      uint8_t hle_x = ix;
-
-      /* Consume only complete 20-cycle non-final iterations that fit the
-       * current exec slice.  X remains nonzero, so the architectural resume
-       * point is the original loop body at $7937. */
+      uint16_t pointer;
       CYCLES(et);
-      S6502_HLE_RECORD(S6502_HLE_ID_BYTE_FILL, et);
-      while (hle_count-- != 0u) {
-        hle_value = READ8(0x0003u);
-        hle_address = (uint16_t)(
-            hle_ram[0x2fu] | ((uint16_t)hle_ram[0x30u] << 8)
-        );
-        hle_address = (uint16_t)(hle_address + hle_y);
-        WRITE8(hle_address, hle_value);
-        ++hle_y;
-        --hle_x;
+      S6502_HLE_RECORD(S6502_HLE_ID_BANK_SWITCH, et);
+      PUSH(status | FLAG_B | FLAG_U);
+      PUSH(ac);
+      pointer = READ16(0x28u);
+      WRITE8(0x2fu, READ8(pointer));
+      WRITE8(0x30u, READ8((uint16_t)(pointer + 1u)));
+      ac = POP();
+      WRITE8(0x0cu, ac);
+      ac = READ8(0x0du);
+      WRITE8(READ16(0x2fu), ac);
+      ac = READ8(0x0eu);
+      iy = 1u;
+      WRITE8((uint16_t)(READ16(0x2fu) + 1u), ac);
+      status = POP() | FLAG_U | FLAG_B;
+      pc = POP(); pc |= (uint16_t)POP() << 8; ++pc;
+      goto _exit;
+    }
+
+  _hle_ebin_bank_range:
+    {
+      uint16_t pointer, sum;
+      CYCLES(et);
+      S6502_HLE_RECORD(S6502_HLE_ID_BANK_SWITCH, et);
+      if(pc==0xf475u) {
+        PUSH(status | FLAG_B | FLAG_U);
+        WRITE8(0x0cu,ac);
+        pointer=(uint16_t)(READ8(0x28u)|((uint16_t)READ8(0x29u)<<8));
+        ac=READ8((uint16_t)(pointer+1u)); WRITE8(0x0du,ac);
+        ac=READ8((uint16_t)(pointer+2u)); WRITE8(0x0eu,ac);
+        PUSH(ac);
+        iy=0;
+        ix=(uint8_t)(READ8(pointer)-1u);
       }
-      ac = hle_value;
-      iy = hle_y;
-      ix = hle_x;
-      SET_C(1);
-      SET_NZ(ix);
-      pc = 0x7937u;
+      while(ix) {
+        sum=(uint16_t)(READ8(0x0du)+1u);
+        WRITE8(0x0cu,(uint8_t)(READ8(0x0cu)+1u));
+        WRITE8(0x0du,(uint8_t)sum);
+        ac=(uint8_t)(POP()+(sum>>8));
+        WRITE8(0x0eu,ac);
+        PUSH(ac);
+        --ix;
+      }
+      ac=POP();
+      status=(uint8_t)(POP()|FLAG_U|FLAG_B);
+      pc=POP(); pc=(uint16_t)(pc|((uint16_t)POP()<<8)); ++pc;
+      goto _exit;
+    }
+
+  _hle_ebin_bank_query:
+    {
+      uint16_t bank, base, difference;
+      uint8_t bias;
+      CYCLES(et);
+      ++s6502_bank_query_hits;
+      s6502_bank_query_cycles += et;
+      S6502_HLE_RECORD(S6502_HLE_ID_BANK_SWITCH, et);
+      if (pc == 0xf4a5u) {
+        PUSH(status | FLAG_B | FLAG_U);
+        PUSH(ix);
+        PUSH(iy);
+      }
+      if (pc != 0xf4afu) WRITE8(0x000cu, 5u);
+      bank = (uint16_t)(READ8(0x000du) | ((uint16_t)READ8(0x000eu) << 8));
+      bias = (bank >> 8) < READ8(0x03d5u) ? 0xe0u : 0u;
+      WRITE8(0x2000u, bias);
+      base = bias ? (uint16_t)(READ8(0x2029u) | ((uint16_t)READ8(0x202au) << 8))
+                  : (uint16_t)(READ8(0x03d6u) | ((uint16_t)READ8(0x03d5u) << 8));
+      difference = (uint16_t)(bank - base);
+      WRITE8(0x2000u, (uint8_t)((difference >> 2) + bias));
+      iy = POP();
+      ix = POP();
+      ac = READ8(0x2000u);
+      status = (uint8_t)(POP() | FLAG_U | FLAG_B);
+      pc = POP();
+      pc = (uint16_t)(pc | ((uint16_t)POP() << 8));
+      pc = (uint16_t)(pc + 1u);
       goto _exit;
     }
 
@@ -763,84 +811,22 @@
       uint16_t hle_sum;
       uint8_t hle_bank;
 
-      ac = 5u;
-      SET_NZ(ac);
-      WRITE8(0x000cu, ac);
-
-      ac = READ8(0x2000u);
-      SET_NZ(ac);
-      SET_C(ac & 0x80u);
-      ac = (uint8_t)(ac << 1);
-      SET_NZ(ac);
-      ix = ac;
-      SET_NZ(ix);
-      ac = 0u;
-      SET_NZ(ac);
-      ac = (uint8_t)((ac << 1) | CARRY);
-      SET_C(0);
-      SET_NZ(ac);
-      iy = ac;
-      SET_NZ(iy);
-      ac = ix;
-      SET_NZ(ac);
-      SET_C(ac & 0x80u);
-      ac = (uint8_t)(ac << 1);
-      SET_NZ(ac);
-      ix = ac;
-      SET_NZ(ix);
-      ac = iy;
-      SET_NZ(ac);
-      ac = (uint8_t)((ac << 1) | CARRY);
-      SET_C(0);
-      SET_NZ(ac);
-      iy = ac;
-      SET_NZ(iy);
-
-      ac = ix;
-      SET_NZ(ac);
-      SET_C(0);
-      dt = READ8(0x2001u);
-      hle_sum = (uint16_t)(ac + dt);
-      SET_C(hle_sum > 0xffu);
-      SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-      ac = (uint8_t)hle_sum;
-      SET_NZ(ac);
-      WRITE8(0x000du, ac);
-      ac = iy;
-      SET_NZ(ac);
-      dt = READ8(0x2002u);
-      hle_sum = (uint16_t)(ac + dt + CARRY);
-      SET_C(hle_sum > 0xffu);
-      SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-      ac = (uint8_t)hle_sum;
-      SET_NZ(ac);
+      /* Mapping is a native 16-bit offset calculation. The caller's P is
+       * restored below, so none of the intermediate arithmetic flags live. */
+      WRITE8(0x000cu, 5u);
+      hle_sum = (uint16_t)((uint16_t)READ8(0x2000u) << 2);
+      iy = hle_sum >> 8;
+      hle_sum = (uint16_t)((hle_sum & 255u) + READ8(0x2001u));
+      WRITE8(0x000du, (uint8_t)hle_sum);
+      ac = (uint8_t)(iy + READ8(0x2002u) + (hle_sum >> 8));
       WRITE8(0x000eu, ac);
       WRITE8(0x2000u, ac);
-
-      /* Advance physical bank and logical selector for windows 6, 7 and 8.
-       * WRITE8 is deliberate: $0C-$0E update the emulator's mapping table. */
       for (hle_bank = 0u; hle_bank < 3u; ++hle_bank) {
-        ac = READ8(0x000du);
-        SET_NZ(ac);
-        dt = READ8(0x000cu);
-        ++dt;
-        SET_NZ(dt);
+        hle_sum = (uint16_t)(READ8(0x000du) + 1u);
+        dt = (uint8_t)(READ8(0x000cu) + 1u);
         WRITE8(0x000cu, dt);
-        SET_C(0);
-        hle_sum = (uint16_t)(ac + 1u);
-        SET_C(hle_sum > 0xffu);
-        SET_V((ac ^ hle_sum) & (1u ^ hle_sum) & 0x80u);
-        ac = (uint8_t)hle_sum;
-        SET_NZ(ac);
-        WRITE8(0x000du, ac);
-        ac = 0u;
-        SET_NZ(ac);
-        dt = READ8(0x2000u);
-        hle_sum = (uint16_t)(ac + dt + CARRY);
-        SET_C(hle_sum > 0xffu);
-        SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-        ac = (uint8_t)hle_sum;
-        SET_NZ(ac);
+        WRITE8(0x000du, (uint8_t)hle_sum);
+        ac = (uint8_t)(READ8(0x2000u) + (hle_sum >> 8));
         WRITE8(0x000eu, ac);
         WRITE8(0x2000u, ac);
       }
@@ -862,226 +848,88 @@
 
   _hle_ebin_and_long:
     {
-      uint16_t hle_left;
-      uint16_t hle_right;
-      uint16_t hle_output;
-      uint16_t hle_sum;
-      uint8_t hle_index;
-
-      /* E.BIN $D2CA-$D2F5: __and_long().  Operands are indirect four-byte
-       * values and the result is stored at __temp_store+8. */
+      uint16_t left = READ16W(0x20u), right = READ16W(0x23u);
+      uint16_t output = READ16W(0x2au);
+      unsigned i;
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_AND_LONG, et);
-      hle_left = READ16W(0x0020u);
-      hle_right = READ16W(0x0023u);
-      hle_output = READ16W(0x002au);
-      for (hle_index = 0u; hle_index < 4u; ++hle_index) {
-        iy = hle_index;
-        SET_NZ(iy);
-        ac = READ8((uint16_t)(hle_left + hle_index));
-        SET_NZ(ac);
-        dt = READ8((uint16_t)(hle_right + hle_index));
-        ac = (uint8_t)(ac & dt);
-        SET_NZ(ac);
-        iy = (uint8_t)(8u + hle_index);
-        SET_NZ(iy);
-        WRITE8((uint16_t)(hle_output + iy), ac);
+      /* Keep sequential memory effects, not per-byte virtual flags. */
+      for (i = 0u; i < 4u; ++i) {
+        ac = READ8((uint16_t)(left + i));
+        dt = READ8((uint16_t)(right + i));
+        ac &= dt;
+        WRITE8((uint16_t)(output + 8u + i), ac);
       }
-
-      /* Preserve the nested JSR $D596 stack writes before folding
-       * __ld_oper1_temp_store_addr into this call. */
-      PUSH(0xd2u);
-      PUSH(0xf4u);
-      PUSH(ac);
-      SET_C(0);
-      ac = READ8(0x002au);
-      SET_NZ(ac);
-      dt = 8u;
-      hle_sum = (uint16_t)(ac + dt);
-      SET_C(hle_sum > 0xffu);
-      SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-      ac = (uint8_t)hle_sum;
-      SET_NZ(ac);
-      WRITE8(0x0020u, ac);
-      ac = READ8(0x002bu);
-      SET_NZ(ac);
-      dt = 0u;
-      hle_sum = (uint16_t)(ac + CARRY);
-      SET_C(hle_sum > 0xffu);
-      SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-      ac = (uint8_t)hle_sum;
-      SET_NZ(ac);
-      WRITE8(0x0021u, ac);
-      ac = POP();
-      SET_NZ(ac);
-      pc = POP();
-      pc = (uint16_t)(pc | ((uint16_t)POP() << 8));
-      pc = (uint16_t)(pc + 1u);
-      pc = POP();
-      pc = (uint16_t)(pc | ((uint16_t)POP() << 8));
-      pc = (uint16_t)(pc + 1u);
-      goto _exit;
+      iy = 11u;
+      ea = 1u;
+      goto _hle_ebin_temp_return;
     }
 
   _hle_ebin_load_oper1_temp:
-    {
-      uint16_t hle_sum;
+    CYCLES(et);
+    S6502_HLE_RECORD(S6502_HLE_ID_LOAD_OPER1_TEMP, et);
+    ea = 0u;
 
-      /* E.BIN $D596-$D5A5: __ld_oper1_temp_store_addr(). */
-      CYCLES(et);
-      S6502_HLE_RECORD(S6502_HLE_ID_LOAD_OPER1_TEMP, et);
-      PUSH(ac);
-      SET_C(0);
-      ac = READ8(0x002au);
-      SET_NZ(ac);
-      dt = 8u;
-      hle_sum = (uint16_t)(ac + dt);
-      SET_C(hle_sum > 0xffu);
-      SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-      ac = (uint8_t)hle_sum;
-      SET_NZ(ac);
-      WRITE8(0x0020u, ac);
-      ac = READ8(0x002bu);
-      SET_NZ(ac);
-      dt = 0u;
-      hle_sum = (uint16_t)(ac + CARRY);
-      SET_C(hle_sum > 0xffu);
-      SET_V((ac ^ hle_sum) & (dt ^ hle_sum) & 0x80u);
-      ac = (uint8_t)hle_sum;
-      SET_NZ(ac);
-      WRITE8(0x0021u, ac);
-      ac = POP();
-      SET_NZ(ac);
-      pc = POP();
-      pc = (uint16_t)(pc | ((uint16_t)POP() << 8));
+  _hle_ebin_temp_return:
+    {
+      uint16_t base = READ16W(0x2au);
+      uint16_t address = (uint16_t)(base + 8u);
+      /* Shared native address/return adapter for D2CA and D596. */
+      if (ea) {
+        s6502_stack_ram[0x100u | (uint8_t)sp] = 0xd2u;
+        s6502_stack_ram[0x100u | (uint8_t)(sp - 1u)] = 0xf4u;
+        s6502_stack_ram[0x100u | (uint8_t)(sp - 2u)] = (uint8_t)ac;
+      } else {
+        s6502_stack_ram[0x100u | (uint8_t)sp] = (uint8_t)ac;
+      }
+      WRITE8(0x20u, (uint8_t)address);
+      WRITE8(0x21u, (uint8_t)(address >> 8));
+      status = (fw_add16_status(base, 8u, status) & ~0x82u) |
+          (ac & 128u) | (ac ? 0u : 2u);
+      pc = s6502_stack_ram[0x100u | (uint8_t)(sp + 1u)] |
+          ((uint16_t)s6502_stack_ram[0x100u | (uint8_t)(sp + 2u)] << 8);
+      sp = (uint8_t)(sp + 2u);
       pc = (uint16_t)(pc + 1u);
+      dt = 0u;
       goto _exit;
     }
 
   _hle_ebin_indirect_call:
     {
-      uint16_t hle_difference;
-
-      /* E.BIN $D572-$D585: __indirect_call().  It synthesizes an indirect
-       * JSR by pushing target-1 and executing RTS, while leaving the caller's
-       * return address underneath it. */
+      uint16_t target = READ16W(0x26u);
+      uint16_t minus = (uint16_t)(target - 1u);
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_INDIRECT_CALL, et);
+      WRITE8(0x26u, (uint8_t)minus);
+      WRITE8(0x27u, (uint8_t)(minus >> 8));
+      s6502_stack_ram[0x100u | (uint8_t)sp] = (uint8_t)(minus >> 8);
+      s6502_stack_ram[0x100u | (uint8_t)(sp - 1u)] = (uint8_t)minus;
       iy = ac;
-      SET_NZ(iy);
-      SET_C(1);
-      ac = READ8(0x0026u);
-      SET_NZ(ac);
-      dt = (uint8_t)~1u;
-      hle_difference = (uint16_t)(ac + dt + CARRY);
-      SET_C(hle_difference > 0xffu);
-      SET_V((ac ^ hle_difference) & (dt ^ hle_difference) & 0x80u);
-      ac = (uint8_t)hle_difference;
-      SET_NZ(ac);
-      WRITE8(0x0026u, ac);
-      ac = READ8(0x0027u);
-      SET_NZ(ac);
-      dt = 0xffu;
-      hle_difference = (uint16_t)(ac + dt + CARRY);
-      SET_C(hle_difference > 0xffu);
-      SET_V((ac ^ hle_difference) & (dt ^ hle_difference) & 0x80u);
-      ac = (uint8_t)hle_difference;
-      SET_NZ(ac);
-      WRITE8(0x0027u, ac);
-      PUSH(ac);
-      ac = READ8(0x0026u);
-      SET_NZ(ac);
-      PUSH(ac);
-      ac = iy;
-      SET_NZ(ac);
-      pc = POP();
-      pc = (uint16_t)(pc | ((uint16_t)POP() << 8));
-      pc = (uint16_t)(pc + 1u);
+      status = (fw_sub16_status(target, 1u, status) & ~0x82u) |
+          (ac & 128u) | (ac ? 0u : 2u);
+      pc = target;
       goto _exit;
     }
 
   _hle_ebin_multiply16:
     {
-      uint8_t *hle_ram = s6502_stack_ram;
-      uint8_t hle_operand_low = hle_ram[0x20u];
-      uint8_t hle_operand_high = hle_ram[0x21u];
-      uint8_t hle_multiplier_low = hle_ram[0x23u];
-      uint8_t hle_multiplier_high = hle_ram[0x24u];
-      uint8_t hle_result_low = 0u;
-      uint8_t hle_result_high = 0u;
-      uint8_t hle_multiplier_byte;
-      uint8_t hle_phase;
-      uint8_t hle_loop;
-      uint8_t hle_carry;
-      uint16_t hle_sum;
-
-      /* Collapse E.BIN $D1A2-$D200, the firmware's unsigned 16x16 -> low16
-       * multiply.  Reproduce its stack traffic, return, flags and cycle count;
-       * callers therefore observe the same state as after the original RTS. */
+      uint8_t *ram = s6502_stack_ram;
+      uint32_t a = ram[0x20u] | ((uint32_t)ram[0x21u] << 8);
+      uint32_t b = ram[0x23u] | ((uint32_t)ram[0x24u] << 8);
+      uint16_t product = (uint16_t)(a * b);
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_MULTIPLY16, et);
-      PUSH(hle_multiplier_high);
-      PUSH(hle_multiplier_low);
-      hle_ram[0x26u] = 0u;
-      hle_ram[0x27u] = 0u;
-
-      if ((hle_operand_low | hle_operand_high) != 0u &&
-          (hle_multiplier_low | hle_multiplier_high) != 0u) {
-        hle_phase = hle_multiplier_high != 0u ? 2u : 1u;
-        hle_multiplier_byte = hle_phase == 2u ?
-          hle_multiplier_high : hle_multiplier_low;
-        do {
-          hle_loop = 8u;
-          do {
-            hle_carry = (uint8_t)(hle_result_low >> 7);
-            hle_result_low = (uint8_t)(hle_result_low << 1);
-            SET_C(hle_result_high & 0x80u);
-            hle_result_high = (uint8_t)(
-              (hle_result_high << 1) | hle_carry
-            );
-
-            hle_carry = (uint8_t)(hle_multiplier_byte >> 7);
-            hle_multiplier_byte = (uint8_t)(hle_multiplier_byte << 1);
-            SET_C(hle_carry);
-            if (hle_carry) {
-              hle_sum = (uint16_t)(hle_operand_low + hle_result_low);
-              SET_C(hle_sum > 0xffu);
-              SET_V((hle_operand_low ^ hle_sum) &
-                    (hle_result_low ^ hle_sum) & 0x80u);
-              hle_result_low = (uint8_t)hle_sum;
-
-              hle_sum = (uint16_t)(
-                hle_operand_high + hle_result_high + CARRY
-              );
-              SET_C(hle_sum > 0xffu);
-              SET_V((hle_operand_high ^ hle_sum) &
-                    (hle_result_high ^ hle_sum) & 0x80u);
-              hle_result_high = (uint8_t)hle_sum;
-            }
-          } while (--hle_loop != 0u);
-
-          if (hle_phase == 2u) {
-            hle_phase = 1u;
-            hle_multiplier_byte = hle_multiplier_low;
-          } else {
-            hle_phase = 0u;
-          }
-        } while (hle_phase != 0u);
-        ix = 0u;
-      }
-
-      hle_ram[0x26u] = hle_result_low;
-      hle_ram[0x27u] = hle_result_high;
-      hle_ram[0x20u] = hle_result_low;
-      hle_ram[0x21u] = hle_result_high;
-      ac = POP();
+      ram[0x100u | (uint8_t)sp] = (uint8_t)(b >> 8);
+      ram[0x100u | (uint8_t)(sp - 1u)] = (uint8_t)b;
+      status = fw_mul16_status(a, b, status);
+      if (a && b) ix = 0u;
+      ram[0x20u] = ram[0x26u] = (uint8_t)product;
+      ram[0x21u] = ram[0x27u] = (uint8_t)(product >> 8);
+      ac = b >> 8;
       SET_NZ(ac);
-      hle_ram[0x23u] = ac;
-      ac = POP();
-      SET_NZ(ac);
-      hle_ram[0x24u] = ac;
-      pc = POP();
-      pc = (uint16_t)(pc | (POP() << 8));
+      pc = ram[0x100u | (uint8_t)(sp + 1u)] |
+          ((uint16_t)ram[0x100u | (uint8_t)(sp + 2u)] << 8);
+      sp = (uint8_t)(sp + 2u);
       pc = (uint16_t)(pc + 1u);
       goto _exit;
     }
@@ -1090,7 +938,7 @@
     {
       uint16_t hle_left = READ16W(0x0020u);
       uint16_t hle_right = READ16W(0x0023u);
-      uint16_t hle_difference = 0u;
+      uint32_t hle_a = 0u, hle_b = 0u;
       uint8_t hle_index;
       uint8_t hle_nonzero = 0u;
       uint8_t hle_final_status;
@@ -1100,33 +948,13 @@
        * in all three sampled games. */
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_COMPARE_LONG, et);
-      ix = 0u;
-      SET_NZ(ix);
-      iy = 0u;
-      SET_NZ(iy);
-      SET_C(1);
       for (hle_index = 0u; hle_index < 4u; ++hle_index) {
-        iy = hle_index;
-        ac = READ8((uint16_t)(hle_left + iy));
-        SET_NZ(ac);
-        dt = READ8((uint16_t)(hle_right + iy));
-        dt = (uint8_t)~dt;
-        hle_difference = (uint16_t)(ac + dt + CARRY);
-        SET_C(hle_difference > 0xffu);
-        SET_V((ac ^ hle_difference) & (dt ^ hle_difference) & 0x80u);
-        ac = (uint8_t)hle_difference;
-        SET_NZ(ac);
-        if (ac != 0u) {
-          ++hle_nonzero;
-          ix = hle_nonzero;
-        }
+        hle_a |= (uint32_t)READ8((uint16_t)(hle_left + hle_index)) << (8u * hle_index);
+        hle_b |= (uint32_t)READ8((uint16_t)(hle_right + hle_index)) << (8u * hle_index);
       }
       iy = 3u;
-      hle_final_status = (uint8_t)(status | FLAG_B | FLAG_U);
-      if (hle_nonzero)
-        hle_final_status &= (uint8_t)~FLAG_Z;
-      else
-        hle_final_status |= FLAG_Z;
+      hle_nonzero = (uint8_t)fw_compare_count(hle_a - hle_b, 4u);
+      hle_final_status = fw_compare_status(hle_a, hle_b, 4u, status);
       s6502_stack_ram[0x100u | sp] = hle_final_status;
       ac = hle_final_status;
       ix = hle_nonzero;
@@ -1138,22 +966,7 @@
     }
 
   _hle_ebin_compare16:
-    {
-      s6502_hle_compare_result_t hle_result;
-
-      /* Collapse E.BIN $D340-$D361.  This helper is the firmware's hot
-       * 16-bit comparison primitive and returns its result through flags. */
-      CYCLES(et);
-      S6502_HLE_RECORD(S6502_HLE_ID_COMPARE16, et);
-      s6502_firmware_hle_compare16(sp, status, &hle_result);
-      pc = hle_result.pc;
-      ac = hle_result.ac;
-      ix = hle_result.ix;
-      sp = hle_result.sp;
-      status = hle_result.status;
-      goto _exit;
-    }
-
+    /* Dispatch guards already supply the distinct remaining cost in et. */
   _hle_ebin_compare16_suffix:
     {
       s6502_hle_compare_result_t hle_result;

@@ -79,7 +79,7 @@ index 0bec098..309aa70 100644
  // Allocation order: caller-saved first (prefer spilling cheapest), then
  // callee-saved, then special-purpose (arg/retval registers) last.
 -// R8 is excluded (reserved: kernel table base pointer).
-+// R15 is excluded because the 9288 loader owns it as the application DP.
++// R15 is reserved by RegisterInfo but remains legal in explicit assembly.
  def GR32 : RegisterClass<"S1C33", [i32], 32,
      (add // Scratch (caller-saved, free to use first)
 -         R4, R5, R6, R7, R9,
@@ -91,7 +91,7 @@ index 0bec098..309aa70 100644
 +         R4, R5,
           // Argument registers (highest cost to spill)
 -         R12, R13, R14, R15
-+         R6, R7, R8, R9
++         R6, R7, R8, R9, R15
      )> {
    let DecoderMethod = "DecodeGR32RegisterClass";
  }
@@ -118,3 +118,18 @@ diff --git a/llvm/lib/Target/S1C33/S1C33HoistImmInLoop.cpp b/llvm/lib/Target/S1C
    const S1C33InstrInfo &TII = *MF.getSubtarget<S1C33Subtarget>().getInstrInfo();
    MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
    MachineRegisterInfo &MRI = MF.getRegInfo();
+diff --git a/llvm/lib/Target/S1C33/S1C33DelaySlotFiller.cpp b/llvm/lib/Target/S1C33/S1C33DelaySlotFiller.cpp
+--- a/llvm/lib/Target/S1C33/S1C33DelaySlotFiller.cpp
++++ b/llvm/lib/Target/S1C33/S1C33DelaySlotFiller.cpp
+@@ -142,6 +142,10 @@ bool S1C33DelaySlotFiller::isDelaySlotCandidate(const MachineInstr &MI) const {
+   // one.  For ret.d this means reading from the wrong stack location
+   // (e.g. outgoing arg area instead of return address → jump to 0).
+-  if (definesRegisterSemantically(MI, S1C33::SP, TRI))
++  // Reads are unsafe too: call.d pushes its return address BEFORE the
++  // delay-slot instruction. Moving `ld.w %r6, %sp` into that slot changes
++  // a pointer to a local object into a pointer to the return address.
++  if (definesRegisterSemantically(MI, S1C33::SP, TRI) ||
++      readsRegisterSemantically(MI, S1C33::SP, TRI))
+     return false;
+   // Reject instructions larger than 2 bytes (ext-prefixed instructions).
+   // All standard 16-bit S1C33 instructions have Size==0 (default); only

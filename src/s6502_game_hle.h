@@ -7,6 +7,87 @@
       uint16_t hle_address;
       uint16_t hle_return_pc;
 
+      /* Fold non-wrapping, equal-high-byte counting into one native add.
+       * All continuing comparisons have two nonzero difference bytes, so
+       * their cycle cost is constant. Reserve the final iteration below to
+       * materialize exactly the old registers, scratch RAM and stack image.
+       * Other aliases, wrapping loops and partial budgets keep the adapter. */
+      if (s6502_counter_chain_enabled && et && executed < cycles &&
+          game_hle_counter->increment &&
+          (game_hle_counter->pointer_zp < 0x1fu || game_hle_counter->pointer_zp > 0x24u) &&
+          game_hle_counter->value_high == game_hle_counter->limit_high) {
+        uint32_t hle_value, hle_rounds, hle_budget_rounds, hle_skip;
+        hle_base = READ16W(game_hle_counter->pointer_zp);
+        hle_address = (uint16_t)(hle_base + game_hle_counter->index);
+        if (hle_address >= 0x400u && hle_address < 0x2000u &&
+            s6502_game_hle_row_direct_destination(hle_address, hle_address)) {
+          hle_value = s6502_stack_ram[hle_address];
+          if (hle_value < game_hle_counter->limit_low) {
+            hle_rounds = (game_hle_counter->limit_low - hle_value +
+                game_hle_counter->increment - 1u) / game_hle_counter->increment;
+            hle_budget_rounds = (cycles - executed) / et;
+            if (hle_rounds > hle_budget_rounds) hle_rounds = hle_budget_rounds;
+            if (hle_rounds > 1u) {
+              hle_skip = hle_rounds - 1u;
+              s6502_stack_ram[hle_address] = (uint8_t)(hle_value +
+                  hle_skip * game_hle_counter->increment);
+              CYCLES(hle_skip * et);
+              S6502_HLE_RECORD_BATCH(S6502_HLE_ID_GAME_COUNTER, hle_skip, hle_skip * et);
+              if (host_profile.current || s6502_performance_debug) {
+                hle_counter_chain_hits += hle_skip;
+                hle_counter_folded_rounds += hle_skip;
+              }
+            }
+          }
+        }
+      }
+      if (s6502_counter_chain_enabled &&
+          (game_hle_counter->pointer_zp < 0x1fu || game_hle_counter->pointer_zp > 0x24u)) {
+        hle_base = READ16W(game_hle_counter->pointer_zp);
+        hle_address = (uint16_t)(hle_base + game_hle_counter->index);
+        if (hle_address >= 0x400u && hle_address < 0x2000u &&
+            s6502_game_hle_row_direct_destination(hle_address, hle_address)) {
+          uint32_t value = s6502_stack_ram[hle_address];
+          uint32_t left = value | ((uint32_t)game_hle_counter->value_high << 8);
+          uint32_t right = game_hle_counter->limit_low |
+              ((uint32_t)game_hle_counter->limit_high << 8);
+          uint32_t compare_status = fw_compare_status(left, right, 2u, status);
+          CYCLES(et);
+          S6502_HLE_RECORD(S6502_HLE_ID_GAME_COUNTER, et);
+          /* Materialize only the boundary contract, not LDA/STA/JSR/RTS. */
+          s6502_stack_ram[0x20] = (uint8_t)value;
+          s6502_stack_ram[0x21] = game_hle_counter->value_high;
+          s6502_stack_ram[0x23] = game_hle_counter->limit_low;
+          s6502_stack_ram[0x24] = game_hle_counter->limit_high;
+          hle_return_pc = (uint16_t)(game_hle_counter->virtual_pc + 0x14u);
+          s6502_stack_ram[0x100u | (uint8_t)sp] = (uint8_t)(hle_return_pc >> 8);
+          s6502_stack_ram[0x100u | (uint8_t)(sp - 1u)] = (uint8_t)hle_return_pc;
+          s6502_stack_ram[0x100u | (uint8_t)(sp - 2u)] = (uint8_t)compare_status;
+          ix = fw_compare_count((uint16_t)(left - right), 2u);
+          iy = game_hle_counter->index;
+          status = compare_status;
+          ac = compare_status;
+          pc = game_hle_counter->exit_pc;
+          if (left < right) {
+            uint32_t sum = value + game_hle_counter->increment;
+            ac = (uint8_t)sum;
+            status = (status & ~0xc3u) | (sum > 255u) |
+                (((value ^ sum) & (game_hle_counter->increment ^ sum) & 128u) ? 64u : 0u) |
+                (iy & 128u) | (iy ? 0u : 2u);
+            WRITE8(hle_address, ac);
+            pc = game_hle_counter->virtual_pc;
+            if (executed < cycles && !sys_halt_p()) {
+              et = s6502_game_hle_counter_cycles(game_hle_counter);
+              if (et && (uint32_t)et <= cycles - executed) {
+                if (host_profile.current || s6502_performance_debug) ++hle_counter_chain_hits;
+                S6502_HLE_ATTEMPT(S6502_HLE_ID_GAME_COUNTER);
+                goto _hle_game_counter;
+              }
+            }
+          }
+          goto _exit;
+        }
+      }
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_GAME_COUNTER, et);
 
@@ -61,6 +142,18 @@
         SET_NZ(iy);
         WRITE8(hle_address, ac);
         pc = game_hle_counter->virtual_pc;
+        /* Continue the verified loop without hashing/searching its entry.
+         * Re-estimate from live RAM after every iteration: aliases, wrapping
+         * increments and exact guest deadlines retain their old behavior. */
+        if (s6502_counter_chain_enabled && hle_address >= 0x400u &&
+            hle_address < 0x2000u && executed < cycles && !sys_halt_p()) {
+          et = s6502_game_hle_counter_cycles(game_hle_counter);
+          if (et && (uint32_t)et <= cycles - executed) {
+            if (host_profile.current || s6502_performance_debug) ++hle_counter_chain_hits;
+            S6502_HLE_ATTEMPT(S6502_HLE_ID_GAME_COUNTER);
+            goto _hle_game_counter;
+          }
+        }
       }
       goto _exit;
     }
@@ -465,6 +558,8 @@
       uint8_t hle_subpixel;
       uint16_t hle_source_base;
       uint16_t hle_destination_base;
+      const uint8_t *hle_and_table;
+      const uint8_t *hle_or_table;
 
       CYCLES(et);
       S6502_HLE_RECORD(S6502_HLE_ID_GAME_BITMAP, et);
@@ -480,6 +575,17 @@
       hle_destination_base = READ16W(
         game_hle_bitmap->destination_pointer_zp
       );
+      /* Resolve resident mask tables once for the fused row. Values remain
+       * live (no copied cache), preserving source/table overlap. Destination
+       * writes must not remap banks; special/unstable mappings use READ8. */
+      hle_and_table = 0;
+      hle_or_table = 0;
+      if (s6502_game_hle_row_direct_destination(
+          (uint32_t)hle_destination_base + hle_destination_index,
+          (uint32_t)hle_destination_base + hle_destination_index + 128u)) {
+        hle_and_table = s6502_game_hle_table_pointer(game_hle_bitmap->and_table);
+        hle_or_table = s6502_game_hle_table_pointer(game_hle_bitmap->or_table);
+      }
 
       do {
         uint8_t hle_pixel;
@@ -491,21 +597,52 @@
         hle_source = READ8((uint16_t)(
           hle_source_base + hle_source_index
         ));
+        /* Resource reads may replace a ROM cache line: refresh these views
+         * after the read, never carry a cache pointer across a callback. */
+        if (hle_and_table)
+          hle_and_table = s6502_game_hle_table_pointer(game_hle_bitmap->and_table);
+        if (hle_or_table)
+          hle_or_table = s6502_game_hle_table_pointer(game_hle_bitmap->or_table);
         hle_subpixel = 0u;
+        if (hle_x <= 4u && hle_and_table && hle_or_table) {
+          if (host_profile.current || s6502_performance_debug) ++hle_bitmap_packed_groups;
+          /* Four packed pixels share one x update and boundary check.
+           * No destination write occurs before the fourth pixel here. */
+#define HLE_PACKED_PIXEL(shift, offset) do { \
+          uint8_t bits_ = (uint8_t)((hle_source >> (shift)) & 3u); \
+          if (!bits_) hle_accumulator &= hle_and_table[hle_x + (offset)]; \
+          else if (bits_ == 1u) hle_accumulator |= hle_or_table[hle_x + (offset)]; \
+        } while (0)
+          HLE_PACKED_PIXEL(6u,0u);
+          HLE_PACKED_PIXEL(4u,1u);
+          HLE_PACKED_PIXEL(2u,2u);
+          HLE_PACKED_PIXEL(0u,3u);
+#undef HLE_PACKED_PIXEL
+          hle_x = (uint8_t)(hle_x + 4u);
+          if (hle_x == 8u) {
+            WRITE8((uint16_t)(hle_destination_base + hle_destination_index), hle_accumulator);
+            ++hle_destination_index;
+            iy = hle_destination_index;
+            hle_accumulator = READ8((uint16_t)(hle_destination_base + hle_destination_index));
+            hle_x = 0u;
+          }
+          hle_source = (uint8_t)(hle_source << 6);
+          hle_subpixel = 4u;
+        } else
         for (hle_pixel = 0u; hle_pixel < 4u; ++hle_pixel) {
           uint8_t hle_bits = (uint8_t)(hle_source & 0xc0u);
 
           if (!hle_bits) {
             hle_accumulator = (uint8_t)(
-              hle_accumulator & READ8((uint16_t)(
+              hle_accumulator & (hle_and_table ? hle_and_table[hle_x] : READ8((uint16_t)(
                 game_hle_bitmap->and_table + hle_x
-              ))
+              )))
             );
           } else if (hle_bits == 0x40u) {
             hle_accumulator = (uint8_t)(
-              hle_accumulator | READ8((uint16_t)(
+              hle_accumulator | (hle_or_table ? hle_or_table[hle_x] : READ8((uint16_t)(
                 game_hle_bitmap->or_table + hle_x
-              ))
+              )))
             );
           }
 

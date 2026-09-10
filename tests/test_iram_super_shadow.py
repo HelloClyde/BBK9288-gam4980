@@ -27,7 +27,8 @@ class IramSuperShadowTest(unittest.TestCase):
         self.assertIn("uint8_t *s6502_iram_code_pages[0x100u]", self.core)
         self.assertIn("CTX_CODE_PAGES,         64", self.asm)
         self.assertIn("CTX_SUPER_HITS,         68", self.asm)
-        self.assertIn("S6502_IRAM_ASM_CONTEXT_SIZE                100u", self.abi)
+        self.assertIn("S6502_IRAM_ASM_CONTEXT_SIZE                108u", self.abi)
+        self.assertIn("S6502_IRAM_ASM_CONTEXT_SAVED_FETCH_OFFSET  100u", self.abi)
         self.assertIn("uint32_t code_pages;", self.abi)
         self.assertIn("uint32_t super_hits;", self.abi)
         self.assertIn("uint32_t native_shared_entry;", self.abi)
@@ -99,6 +100,30 @@ class IramSuperShadowTest(unittest.TestCase):
             builder.index("s6502_iram_super_entry_matches"),
             builder.index("shadow[offset] = S6502_IRAM_SHADOW_OPCODE"),
         )
+
+    def test_immediate_word_store_is_a_compiler_wide_phrase(self) -> None:
+        generated = (ROOT / "src" / "s6502_c6502_spec_generated.h").read_text(
+            encoding="utf-8"
+        )
+        matcher = self.core.split(
+            "static uint8_t s6502_game_aot_template_at", 1
+        )[1].split("static uint8_t s6502_game_aot_pattern_at_priority", 1)[0]
+        shadow = self.core.split(
+            "static uint8_t s6502_iram_shadow_template_at", 1
+        )[1].split("static uint8_t s6502_iram_super_entry_kind", 1)[0]
+        handler = self.asm.split(".Lsuper_imm16:", 1)[1].split(
+            ".Lsuper_stack16:", 1
+        )[0]
+
+        self.assertIn(
+            "{2u, 8u, {0xa9u, 0x00u, 0x85u, 0x00u, "
+            "0xa9u, 0x00u, 0x85u, 0x00u",
+            generated,
+        )
+        self.assertIn("code[7] != (uint8_t)(code[3] + 1u)", matcher)
+        self.assertIn("code[7] == (uint8_t)(code[3] + 1u)", shadow)
+        self.assertNotIn(".Lsuper_imm16_dest_ok", handler)
+        self.assertNotIn("jrne  .Lexit_slow1", handler)
 
     def test_debug_off_nops_instruction_counting_without_hot_branch(self) -> None:
         self.assertIn("s6502_iram_count_patch_offsets:", self.asm)

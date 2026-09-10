@@ -327,24 +327,30 @@ int main(int argc, char **argv)
         (unsigned)gam4980_game_aot_direct_link_stage_hits(4u)
     );
     {
-        u64 pattern_hits[16] = {0};
+        u64 pattern_hits[33] = {0};
         u32 entry_id;
 
         for (entry_id = 0u;
              entry_id < gam4980_game_aot_entry_count(); ++entry_id) {
             u32 pattern = gam4980_game_aot_entry_pattern(entry_id);
 
-            if (pattern < 16u)
+            if (pattern < 33u)
                 pattern_hits[pattern] +=
                     gam4980_game_aot_entry_hit_count(entry_id);
         }
-        for (entry_id = 0u; entry_id < 16u; ++entry_id) {
+        for (entry_id = 0u; entry_id < 33u; ++entry_id) {
             if (pattern_hits[entry_id])
                 printf(
                     "game aot pattern=%u hits=%llu\n", (unsigned)entry_id,
                     (unsigned long long)pattern_hits[entry_id]
                 );
         }
+        printf(
+            "game aot trace entries=%u hits=%u instructions=%u\n",
+            (unsigned)gam4980_game_aot_trace_entry_count(),
+            (unsigned)gam4980_game_aot_trace_hits(),
+            (unsigned)gam4980_game_aot_trace_instruction_hits()
+        );
         if (getenv("GAM4980_SMOKE_AOT_ENTRIES")) {
             for (entry_id = 0u;
                  entry_id < gam4980_game_aot_entry_count(); ++entry_id) {
@@ -457,9 +463,10 @@ int main(int argc, char **argv)
     );
 #ifdef GAM4980_ENABLE_GAME_LOAD_AOT
     printf(
-        " game_linear_links=%u game_linear_hits=%u",
+        " game_linear_links=%u game_linear_hits=%u runtime_lifts=%u",
         (unsigned)gam4980_game_aot_linear_link_count(),
-        (unsigned)gam4980_game_aot_linear_link_hits()
+        (unsigned)gam4980_game_aot_linear_link_hits(),
+        (unsigned)gam4980_game_aot_runtime_lift_hits()
     );
 #endif
     printf("\n");

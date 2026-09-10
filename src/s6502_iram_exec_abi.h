@@ -10,7 +10,9 @@
  * GAM4980_IRAM_EXEC_ASM is therefore only valid on the 32-bit 9288 target.
  */
 
-#define S6502_IRAM_ASM_CONTEXT_SIZE                100u
+#define S6502_IRAM_ASM_CONTEXT_SIZE                120u
+#define S6502_IRAM_ASM_CONTEXT_GRAPHICS_OFFSET     104u
+#define S6502_IRAM_ASM_CONTEXT_SAVED_FETCH_OFFSET  100u
 #define S6502_IRAM_ASM_CONTEXT_PC_OFFSET             0u
 #define S6502_IRAM_ASM_CONTEXT_AC_OFFSET             4u
 #define S6502_IRAM_ASM_CONTEXT_IX_OFFSET             8u
@@ -81,6 +83,11 @@ typedef struct s6502_iram_asm_context {
     uint32_t native_epoch;
     uint32_t lcd_write_calls;
     uint32_t lcd_changed_writes;
+    uint32_t saved_fetch; /* transient post-operand host PC, never guest state */
+    uint32_t graphics; /* firmware_native_graphics_services_t, NAT ABI 5 */
+    uint32_t register_entries; /* private ABI: 256 x {PC, bank, entry, active-counter pointer} */
+    uint32_t register_banks;
+    uint32_t register_calls;
 } s6502_iram_asm_context_t;
 
 #define S6502_IRAM_ABI_ASSERT(member, offset_value) \
@@ -92,6 +99,8 @@ _Static_assert(sizeof(uint32_t) == 4u,
 _Static_assert(sizeof(s6502_iram_asm_context_t) ==
     S6502_IRAM_ASM_CONTEXT_SIZE, "s6502 IRAM ABI size mismatch");
 S6502_IRAM_ABI_ASSERT(pc, S6502_IRAM_ASM_CONTEXT_PC_OFFSET);
+S6502_IRAM_ABI_ASSERT(saved_fetch, S6502_IRAM_ASM_CONTEXT_SAVED_FETCH_OFFSET);
+S6502_IRAM_ABI_ASSERT(graphics, S6502_IRAM_ASM_CONTEXT_GRAPHICS_OFFSET);
 S6502_IRAM_ABI_ASSERT(ac, S6502_IRAM_ASM_CONTEXT_AC_OFFSET);
 S6502_IRAM_ABI_ASSERT(ix, S6502_IRAM_ASM_CONTEXT_IX_OFFSET);
 S6502_IRAM_ABI_ASSERT(iy, S6502_IRAM_ASM_CONTEXT_IY_OFFSET);

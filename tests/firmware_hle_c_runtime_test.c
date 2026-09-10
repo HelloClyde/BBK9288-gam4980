@@ -7,8 +7,19 @@
 #define _RLS_
 #define GAM4980_ENABLE_AOT
 #define GAM4980_ENABLE_FIRMWARE_HLE
-#define GAM4980_FIRMWARE_HLE_MASK 0x100u
+#define GAM4980_FIRMWARE_HLE_MASK 0x140u
 #include "../src/gam4980_core.c"
+
+typedef struct {
+    uint32_t pc,ac,ix,iy,sp,status,cycle_budget,cycles;
+    uintptr_t ram,read8,write8;
+} host_compare_context;
+#define FIRMWARE_NATIVE_HOST_TEST
+#define s6502_iram_asm_context_t host_compare_context
+#include "../src/firmware_native_compare.c"
+#include "../src/firmware_native_runtime.c"
+#undef s6502_iram_asm_context_t
+#undef FIRMWARE_NATIVE_HOST_TEST
 
 #define TEST_CASES 10000u
 
@@ -71,6 +82,33 @@ static int compare_hle(
 
     memcpy(sys.ram, initial_ram, GAM4980_RAM_SIZE);
     sys.cpu = initial_cpu;
+    {
+        host_compare_context c={0};
+        c.pc=initial_cpu.pc;c.ac=initial_cpu.ac;c.ix=initial_cpu.ix;c.iy=initial_cpu.iy;
+        c.sp=initial_cpu.sp;c.status=initial_cpu.status;c.cycle_budget=cycles;
+        c.ram=(uintptr_t)sys.ram;c.read8=(uintptr_t)mem_read;c.write8=(uintptr_t)mem_write;
+        uint32_t got=(entry_pc==0xd340u || entry_pc==0xd362u)?
+            firmware_native_compare(&c):firmware_native_runtime(&c);
+        if(got!=cycles || c.pc!=reference_cpu.pc ||
+           c.ac!=reference_cpu.ac || c.ix!=reference_cpu.ix || c.iy!=reference_cpu.iy ||
+           c.sp!=reference_cpu.sp || c.status!=reference_cpu.status ||
+           memcmp(sys.ram,reference_ram,GAM4980_RAM_SIZE)) {
+            fprintf(stderr,"authored compare mismatch pc=%04x\n",entry_pc);return 0;
+        }
+        memcpy(sys.ram,initial_ram,GAM4980_RAM_SIZE);
+    }
+    if(entry_pc==0xd586u || entry_pc==0xd5a6u || entry_pc==0xd5b6u ||
+       entry_pc==0xd7a6u || entry_pc==0xd7e1u || entry_pc==0xd29du ||
+       entry_pc==0xd8bdu || entry_pc==0xdb2fu || entry_pc==0xddb8u ||
+       entry_pc==0xda09u || entry_pc==0xdbe1u || entry_pc==0xdda7u ||
+       entry_pc==0xdde4u || entry_pc==0xddeeu || entry_pc==0xd780u || entry_pc==0xd7b4u || entry_pc==0xd7f1u ||
+       entry_pc==0xda1au || entry_pc==0xdbf2u || entry_pc==0xd8e9u || entry_pc==0xd90bu ||
+       entry_pc==0xd49eu || entry_pc==0xd50cu || entry_pc==0xd85fu || entry_pc==0xd8aeu ||
+       entry_pc==0xd85au || entry_pc==0xd8a5u || entry_pc==0xd4a9u || entry_pc==0xd4c6u ||
+       entry_pc==0xd519u || entry_pc==0xd53au || entry_pc==0xdd1fu || entry_pc==0xdd38u ||
+       entry_pc==0xdd58u || entry_pc==0xdd75u || entry_pc==0xde02u || entry_pc==0xd9dfu || entry_pc==0xd9f3u ||
+       entry_pc==0xdae6u || entry_pc==0xdb19u || entry_pc==0xdac1u || entry_pc==0xdac7u ||
+       entry_pc==0xdaaau || entry_pc==0xdacau || entry_pc==0xdafcu || entry_pc==0xdac4u || entry_pc==0xda3du || entry_pc==0xdc0eu || entry_pc==0xd93fu)return 1;
     gam4980_set_firmware_hle_enabled(1);
     hits_before = s6502_firmware_hle_hits;
     hle_executed = s6502_exec(&sys.cpu, cycles);
@@ -108,7 +146,7 @@ static int run_load_case(
     sys.ram[_SYSCON] = 0u;
     sys.ram[0x2au] = (uint8_t)temp;
     sys.ram[0x2bu] = (uint8_t)(temp >> 8);
-    sys.cpu.pc = 0xd596u;
+    sys.cpu.pc = (uint16_t)(0xd586u+16u*(case_id&3u));
     sys.cpu.ac = (uint8_t)next_random();
     sys.cpu.ix = (uint8_t)next_random();
     sys.cpu.iy = (uint8_t)next_random();
@@ -119,7 +157,7 @@ static int run_load_case(
     sys.ram[0x100u | (uint8_t)(sys.cpu.sp + 2u)] =
         (uint8_t)((return_pc - 1u) >> 8);
     return compare_hle(
-        0xd596u, 31u, return_pc, case_id, initial_ram, reference_ram);
+        sys.cpu.pc, 31u, return_pc, case_id, initial_ram, reference_ram);
 }
 
 static int run_and_case(
@@ -147,7 +185,13 @@ static int run_and_case(
             (((left & 0xffu) + index) > 0xffu) +
             (((right & 0xffu) + index) > 0xffu));
     }
-    sys.cpu.pc = 0xd2cau;
+    {static const uint16_t entries[]={0xd2ca,0xd29d,0xd8bd,0xdb2f,0xddb8,0xd780,0xd7b4,0xd7f1};
+     sys.cpu.pc=entries[case_id%8u];}
+    if(sys.cpu.pc==0xd29du || sys.cpu.pc==0xdb2fu)cycles+=2u;
+    if(sys.cpu.pc==0xd780u || sys.cpu.pc==0xd7b4u || sys.cpu.pc==0xd7f1u){
+        cycles=sys.cpu.pc==0xd780u?105u:sys.cpu.pc==0xd7f1u?111u:113u;
+        for(index=1;index<4;++index)cycles+=((left&255u)+index)>255u;
+    }
     sys.cpu.ac = (uint8_t)next_random();
     sys.cpu.ix = (uint8_t)next_random();
     sys.cpu.iy = (uint8_t)next_random();
@@ -158,7 +202,7 @@ static int run_and_case(
     sys.ram[0x100u | (uint8_t)(sys.cpu.sp + 2u)] =
         (uint8_t)((return_pc - 1u) >> 8);
     return compare_hle(
-        0xd2cau, cycles, return_pc, case_id, initial_ram, reference_ram);
+        sys.cpu.pc, cycles, return_pc, case_id, initial_ram, reference_ram);
 }
 
 static int run_compare_long_case(
@@ -288,11 +332,156 @@ int main(int argc, char **argv)
             !run_compare_long_case(case_id, initial_ram, reference_ram) ||
             !run_indirect_call_case(case_id, initial_ram, reference_ram))
             goto cleanup_core;
+        sys.cpu.pc=0xd340u;sys.cpu.sp=(uint8_t)case_id;
+        sys.cpu.status=(uint8_t)(next_random()&~8u);
+        sys.ram[0x20]=(uint8_t)next_random();sys.ram[0x21]=(uint8_t)next_random();
+        sys.ram[0x23]=(uint8_t)next_random();sys.ram[0x24]=(uint8_t)next_random();
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43u;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44u;
+        if(!compare_hle(0xd340u,s6502_firmware_hle_compare_cycles(),0x4444u,
+            case_id,initial_ram,reference_ram))goto cleanup_core;
+        sys.cpu.pc=(case_id&1u)?0xd7a6u:0xd7e1u;
+        sys.cpu.sp=(uint8_t)case_id;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43u;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44u;
+        if(!compare_hle(sys.cpu.pc,(case_id&1u)?24u:31u,0x4444u,
+            case_id,initial_ram,reference_ram))goto cleanup_core;
+        {
+            static const uint16_t entries[]={0xda09,0xdbe1,0xdda7,0xdde4,0xddee,0xd8e9};
+            uint16_t cost,value;unsigned count;
+            sys.cpu.pc=entries[case_id%6u];sys.cpu.sp=(uint8_t)case_id;
+            sys.cpu.ac=(uint8_t)((case_id&4u)?next_random():0u);
+            sys.cpu.status=(uint8_t)(next_random()&~8u);
+            sys.ram[0x23]=(uint8_t)(case_id%17u);
+            sys.ram[0x20]=(uint8_t)((case_id&4u)?next_random():0u);
+            sys.ram[0x21]=(uint8_t)((case_id&4u)?next_random():0u);
+            count=sys.ram[0x23];value=mem_read16(0x20);
+            cost=sys.cpu.pc==0xdda7u?30u:sys.cpu.pc==0xdde4u?(sys.cpu.ac?13u:12u):
+                sys.cpu.pc==0xddeeu?(value?25u:27u):(!count?11u:count>=8u?18u:16u+7u*count);
+            if(sys.cpu.pc==0xd8e9u)cost=!count?11u:count>=8u?((sys.cpu.ac&128u)?23u:22u):
+                (sys.cpu.ac&128u)?21u+9u*count:20u+7u*count;
+            sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43u;
+            sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44u;
+            if(!compare_hle(sys.cpu.pc,cost,0x4444u,case_id,initial_ram,reference_ram))
+                goto cleanup_core;
+            sys.cpu.pc=case_id%3u==0u?0xd90bu:(case_id&1u)?0xda1au:0xdbf2u;
+            sys.cpu.sp=(uint8_t)case_id;
+            sys.ram[0x23]=(uint8_t)(case_id%19u);
+            sys.ram[0x24]=(uint8_t)((case_id&4u)?0u:next_random());
+            count=sys.ram[0x23];value=sys.ram[0x24];
+            cost=value?((case_id&1u)?19u:20u):!count?((case_id&1u)?17u:16u):
+                count>=16u?((case_id&1u)?30u:29u):22u+15u*count;
+            if(sys.cpu.pc==0xd90bu){
+                unsigned negative=sys.ram[0x21]&128u;
+                cost=value?(negative?26u:25u):!count?16u:count>=16u?
+                    (negative?35u:34u):negative?27u+17u*count:26u+15u*count;
+            }
+            sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43u;
+            sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44u;
+            if(!compare_hle(sys.cpu.pc,cost,0x4444u,case_id,initial_ram,reference_ram))
+                goto cleanup_core;
+        }
+        {
+            static const uint16_t entries[]={0xd49e,0xd50c,0xd85f,0xd8ae,0xd85a,0xd8a5};
+            uint16_t pointer=(uint16_t)(0x300u+case_id%0x700u),cost;
+            sys.cpu.pc=entries[case_id%6u];sys.cpu.sp=(uint8_t)case_id;
+            sys.cpu.ac=(uint8_t)next_random();sys.cpu.status=(uint8_t)(next_random()&~8u);
+            sys.ram[0x20]=sys.ram[0x23]=(uint8_t)pointer;
+            sys.ram[0x21]=sys.ram[0x24]=(uint8_t)(pointer>>8);
+            cost=sys.cpu.pc==0xd49eu?((sys.cpu.ac&128u)?18u:17u):
+                sys.cpu.pc==0xd50cu?((sys.ram[0x23]&128u)?25u:24u):
+                (sys.cpu.pc==0xd85fu?28u:35u)+((pointer&255u)==255u);
+            if(sys.cpu.pc==0xd85au || sys.cpu.pc==0xd8a5u)cost=sys.cpu.pc==0xd85au?13u:23u;
+            sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43u;
+            sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44u;
+            if(!compare_hle(sys.cpu.pc,cost,0x4444u,case_id,initial_ram,reference_ram))goto cleanup_core;
+        }
     }
-    printf("firmware C runtime HLE: %lu load + %lu and + %lu compare-long + "
-           "%lu indirect-call exact-state cases passed\n",
-           (unsigned long)TEST_CASES, (unsigned long)TEST_CASES,
-           (unsigned long)TEST_CASES, (unsigned long)TEST_CASES);
+    for(case_id=0;case_id<TEST_CASES;++case_id){
+        static const uint16_t entries[]={0xd4a9,0xd4c6,0xd519,0xd53a,0xdd1f,0xdd38,0xdd58,0xdd75};
+        unsigned kind=case_id%4u,sign,cost,pointer=0x400u+case_id%0x700u;
+        sys.cpu.pc=entries[case_id%8u];sys.cpu.sp=(uint8_t)case_id;
+        sys.cpu.ac=(uint8_t)next_random();sys.cpu.status=(uint8_t)(next_random()&~8u);
+        sys.ram[0x20]=(uint8_t)next_random();sys.ram[0x21]=(uint8_t)next_random();
+        sys.ram[0x23]=(uint8_t)next_random();sys.ram[0x24]=(uint8_t)next_random();
+        sys.ram[0x2a]=(uint8_t)pointer;sys.ram[0x2b]=(uint8_t)(pointer>>8);
+        sign=kind==0?sys.cpu.ac:kind==1?sys.ram[0x21]:kind==2?sys.ram[0x23]:sys.ram[0x24];
+        cost=(kind==0?80u:kind==1?86u:kind==2?90u:93u)+((sign&128u)!=0u);
+        if(case_id%8u>=4u)cost=kind==0?77u:kind==2?87u:83u;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44;
+        if(!compare_hle(sys.cpu.pc,cost,0x4444,case_id,initial_ram,reference_ram))goto cleanup_core;
+    }
+    for(case_id=0;case_id<TEST_CASES;++case_id){
+        unsigned pointer=0x400u+case_id%0x300u,i,cost;
+        sys.cpu.pc=0xde02;sys.cpu.sp=(uint8_t)case_id;
+        sys.cpu.status=(uint8_t)(next_random()&~8u);
+        sys.ram[0x20]=(uint8_t)pointer;sys.ram[0x21]=(uint8_t)(pointer>>8);
+        sys.ram[0x2a]=0;sys.ram[0x2b]=8;sys.ram[8]=(uint8_t)case_id;
+        for(i=0;i<4;++i)sys.ram[pointer+i]=0;
+        if(case_id&1u)sys.ram[pointer]=1;
+        cost=case_id&1u?75u:77u;
+        for(i=1;i<4;++i)cost+=((pointer&255u)+i)>255u;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44;
+        if(!compare_hle(sys.cpu.pc,cost,0x4444,case_id,initial_ram,reference_ram))goto cleanup_core;
+    }
+    for(case_id=0;case_id<TEST_CASES;++case_id){
+        unsigned value=next_random(),cost=case_id&1u?47u:40u;
+        sys.cpu.pc=case_id&1u?0xd9f3:0xd9df;sys.cpu.sp=(uint8_t)case_id;
+        sys.cpu.status=(uint8_t)(next_random()&~8u);sys.cpu.ac=(uint8_t)next_random();
+        sys.ram[0x20]=sys.ram[0x23]=(uint8_t)value;
+        sys.ram[0x21]=sys.ram[0x24]=(uint8_t)(value>>8);
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44;
+        if(!compare_hle(sys.cpu.pc,cost,0x4444,case_id,initial_ram,reference_ram))goto cleanup_core;
+    }
+    for(case_id=0;case_id<TEST_CASES;++case_id){
+        static const uint16_t entries[]={0xdae6,0xdb19,0xdac1,0xdac7,0xdaaa,0xdaca,0xdafc,0xdac4};
+        unsigned kind=case_id%8u,source=0x500u+(case_id&255u),other=source+case_id%7u;
+        unsigned cost,i;
+        sys.cpu.pc=entries[kind];sys.cpu.sp=(uint8_t)case_id;
+        sys.cpu.status=(uint8_t)(next_random()&~8u);sys.cpu.ac=(uint8_t)next_random();
+        sys.ram[0x20]=(uint8_t)source;sys.ram[0x21]=(uint8_t)(source>>8);
+        sys.ram[0x23]=(uint8_t)other;sys.ram[0x24]=(uint8_t)(other>>8);
+        sys.ram[0x28]=0;sys.ram[0x29]=8;
+        for(i=0;i<12u;++i)sys.ram[source+i]=(uint8_t)next_random();
+        cost=kind<2?58u:kind<4?61u:kind==4?45u:kind==5?55u:kind==6?108u:111u;
+        if(kind<4 || kind>=6){
+            unsigned pointer=kind==0 || kind==2?other:source;
+            for(i=1;i<4;++i)cost+=((pointer&255u)+i)>255u;
+        }
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44;
+        if(!compare_hle(sys.cpu.pc,cost,0x4444,case_id,initial_ram,reference_ram))goto cleanup_core;
+    }
+    for(case_id=0;case_id<TEST_CASES;++case_id){
+        unsigned source=0x500u+(case_id&255u),counts=0x800u+(case_id&255u),base=0xa00u+(case_id&255u);
+        unsigned count=case_id%36u,upper=case_id%8u==0u?128u:0u,cost,i;
+        sys.cpu.pc=(case_id/36u)%3u==2u?0xd93f:(case_id/36u)%3u==1u?0xdc0e:0xda3d;sys.cpu.sp=(uint8_t)case_id;
+        sys.cpu.status=(uint8_t)(next_random()&~8u);
+        sys.ram[0x20]=(uint8_t)source;sys.ram[0x21]=(uint8_t)(source>>8);
+        sys.ram[0x23]=(uint8_t)counts;sys.ram[0x24]=(uint8_t)(counts>>8);
+        sys.ram[0x2a]=(uint8_t)base;sys.ram[0x2b]=(uint8_t)(base>>8);
+        for(i=0;i<4u;++i)sys.ram[source+i]=(uint8_t)next_random();
+        sys.ram[counts]=(uint8_t)count;sys.ram[counts+1]=(uint8_t)upper;
+        sys.ram[counts+2]=sys.ram[counts+3]=0;
+        cost=upper?123u:count>=32u?135u:count?202u+65u*count:165u;
+        for(i=1;i<4;++i){cost+=((counts&255u)+i)>255u;
+            if(!upper && count<32u)cost+=((source&255u)+i)>255u;}
+        if(!upper && count<32u)for(i=0;i<4;++i)cost+=count*(((base&255u)+8u+i)>255u);
+        if(sys.cpu.pc==0xd93fu){
+            unsigned negative=sys.ram[source+3u]&128u;
+            cost+=(negative?10u:12u)+((source&255u)+3u>255u);
+            if(!upper && count<32u)cost+=2u;
+        }
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+1u)]=0x43;
+        sys.ram[0x100u|(uint8_t)(sys.cpu.sp+2u)]=0x44;
+        if(!compare_hle(sys.cpu.pc,cost,0x4444,case_id,initial_ram,reference_ram))goto cleanup_core;
+    }
+    printf("authored firmware runtime: %lu exact-state cases "
+           "(address, long binary, compare32, indirect, compare16, negate, byte/boolean) passed\n",
+           (unsigned long)(14u*TEST_CASES));
     result = 0;
 
 cleanup_core:

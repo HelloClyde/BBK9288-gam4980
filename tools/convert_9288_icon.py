@@ -12,7 +12,7 @@ from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = (
-    PROJECT_ROOT / "assets" / "9288" / "gam4980-icon-imagegen-v3.png"
+    PROJECT_ROOT / "assets" / "9288" / "manual-grid-v4" / "dictionary-30x30.png"
 )
 DEFAULT_OUTPUT = PROJECT_ROOT / "assets" / "9288"
 DEFAULT_FRAME_ROOT = PROJECT_ROOT / "sdk" / "apmk"
@@ -28,19 +28,15 @@ def quantize_grayscale(image: Image.Image, width: int, height: int) -> list[int]
         (width, height), Image.Resampling.LANCZOS
     )
 
-    # Fixed thresholds deliberately pull anti-aliased contour pixels into the
-    # darker 9288 levels.  Adaptive palettes made the pale device shell merge
-    # into the white background after the artwork was reduced to 30x30.
+    # V4 has deliberate thick contours. Use the nearest hardware gray level
+    # rather than the V3 darkening curve, which crushed the keyboard gaps.
     pixels = []
     for value in grayscale.tobytes():
-        if value < 112:
+        if value < 43:
             pixels.append(0)
-        elif value < 208:
+        elif value < 128:
             pixels.append(1)
-        # Imagegen's apparent transparency can arrive as a baked, very pale
-        # checkerboard.  Values above 242 are background white; keeping the
-        # cutoff here prevents that checkerboard from surviving at 30x30.
-        elif value < 242:
+        elif value < 213:
             pixels.append(2)
         else:
             pixels.append(3)
@@ -126,6 +122,11 @@ def write_preview(path: Path, width: int, height: int, pixels: list[int]) -> Non
     preview = Image.new("L", (width, height))
     preview.putdata([level * 85 for level in pixels])
     preview.save(path)
+    # Nearest-neighbor enlargement shows the actual hardware pixels, not
+    # a smoothed high-resolution illustration.
+    preview.resize((width * 6, height * 6), Image.Resampling.NEAREST).save(
+        path.with_name(path.stem + "-6x.png")
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,6 +134,9 @@ def parse_args() -> argparse.Namespace:
         description="Convert the original GAM4980 icon to 9288 2-bpp resources"
     )
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--small-source", type=Path,
+                        default=PROJECT_ROOT / "assets/9288/gam4980-icon-selected-12.png",
+                        help="separately simplified artwork for the 16x16 icon")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--frame-root",
@@ -162,13 +166,12 @@ def main() -> None:
     print(f"built: {resource_path} ({len(resource)} bytes)")
     print(f"preview: {preview_path}")
 
-    # The SDK's 16x16 sample has a different internal illustration. Derive the
-    # small variant from the completed 40x40 icon so both sizes retain exactly
-    # the same frame, shadow, and GAM4980 artwork.
-    large_preview = Image.new("L", (width, height))
-    large_preview.putdata([level * 85 for level in pixels])
+    # Use a dedicated micro-icon rather than shrinking the detailed main icon.
+    # Retain the SDK's exact outer frame; only its interior is replaced.
     stem, width, height = SMALL_ICON_SPEC
-    pixels = quantize_grayscale(large_preview, width, height)
+    small_art = crop_icon_art(Image.open(args.small_source))
+    small_frame = decode_icon(frame_root / f"{stem}.bin", width, height)
+    pixels = compose_with_frame(small_frame, width, height, (2, 2, 14, 14), small_art)
     resource = encode_icon(width, height, pixels)
     resource_path = output / f"{stem}.bin"
     preview_path = output / f"{stem}.png"

@@ -7,7 +7,12 @@
 #define GAM4980_NATIVE_MAGIC              0x54414e47u /* "GNAT" */
 #define GAM4980_NATIVE_FORMAT_VERSION     1u
 #define GAM4980_NATIVE_GAME_FORMAT_VERSION 3u
+#define GAM4980_NATIVE_FIRMWARE_FORMAT_VERSION 4u
+#define GAM4980_NATIVE_COMPACT_FORMAT_VERSION 5u
+#define GAM4980_NATIVE_MODULE_REGISTER 0x100u
 #define GAM4980_NATIVE_ABI_VERSION        4u
+#define GAM4980_NATIVE_GRAPHICS_ABI_VERSION 5u
+#define GAM4980_NATIVE_REGISTER_ABI_VERSION 6u
 #define GAM4980_NATIVE_HEADER_WORDS       16u
 #define GAM4980_NATIVE_HEADER_SIZE        64u
 #define GAM4980_NATIVE_GAME_HEADER_WORDS  8u
@@ -33,6 +38,10 @@
 #define GAM4980_NATIVE_MODULE_PRELOAD     0x00000002u
 #define GAM4980_NATIVE_MODULE_PINNED      0x00000004u
 #define GAM4980_NATIVE_MODULE_GAME        0x00000008u
+#define GAM4980_NATIVE_MODULE_FIRMWARE    0x00000010u
+#define GAM4980_NATIVE_MODULE_FUNCTION    0x00000020u
+#define GAM4980_NATIVE_MODULE_GRAPHICS    0x00000040u
+#define GAM4980_NATIVE_MODULE_TEXT        0x00000080u
 
 #define GAM4980_NATIVE_PACKAGE_GAME       0x00000001u
 
@@ -95,7 +104,7 @@ typedef struct gam4980_native_module_record {
 
 typedef struct gam4980_native_match_record {
     u32 module_index;
-    u32 aot_block_id;
+    u32 aot_block_id; /* FIRMWARE modules: original function byte length */
     u32 physical_pc;
     u32 signature_hash;
 } gam4980_native_match_record_t;

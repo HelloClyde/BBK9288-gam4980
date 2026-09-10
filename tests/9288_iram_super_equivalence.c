@@ -7,7 +7,7 @@
 #define TEST_PAGE 0x40u
 #define TEST_OFFSET 0x40u
 #define TEST_PC ((TEST_PAGE << 8) | TEST_OFFSET)
-#define TEST_CASES 8u
+#define TEST_CASES 18u
 #define SUPER_KINDS 5u
 #define FLAG_N 0x80u
 #define FLAG_V 0x40u
@@ -261,6 +261,100 @@ static int execute_context(
         GAM4980_IRAM_STATUS_RESTORED;
     write_psr(saved_psr);
     return restored;
+}
+
+static int run_fetch_preservation(u32 case_index, u8 value)
+{
+    u8 program[] = {0xa9u,0u,0x8du,0u,0x30u,0x0eu,0u,0x30u,
+                    0x2eu,0u,0x30u,0xc9u,0u,0u};
+    s6502_iram_asm_context_t context;
+    u32 result;
+    u8 expected = (u8)((value << 2) | (value >> 7));
+    u8 flags = FLAG_U | FLAG_I | FLAG_V;
+    u8 difference = (u8)(value - expected);
+    int passed;
+    program[1] = value;
+    program[12] = expected;
+    if (value >= expected) flags |= FLAG_C;
+    if (!difference) flags |= FLAG_Z;
+    flags |= difference & FLAG_N;
+    prepare_memory(program, sizeof(program));
+    g_code_pages[TEST_PAGE] = g_ram + (TEST_PAGE << 8);
+    prepare_context(&context, 0x5au, 0xe0u, FLAG_U | FLAG_I | FLAG_V);
+    passed = execute_context(&context, &result);
+    passed = passed && check_common(&context, result, TEST_PC + 13u,
+        20u, 5u, value, flags) && g_ram[0x3000u] == expected;
+    record_case(case_index, &context, result, passed);
+    return passed;
+}
+
+static int run_mixed_arithmetic(u32 case_index)
+{
+    u8 program[] = {0x69,0,0xe9,0,0x91,0x40,0xb1,0x40,
+        0xd0,2,0xea,0xea,0x30,2,0xea,0xea,0};
+    s6502_iram_asm_context_t context;
+    u32 i, result = 0, sum, cycles, instructions;
+    u8 a, b, value, carry, flags;
+    int passed = 1;
+    prepare_memory(program, sizeof(program));
+    g_code_pages[TEST_PAGE] = g_ram + (TEST_PAGE << 8);
+    g_ram[0x40] = 0xf0;
+    g_ram[0x41] = 0x30;
+    for (i = 0; i < 256; ++i) {
+        a = (u8)i;
+        b = (u8)(i * 37u);
+        g_ram[TEST_PC + 1] = b;
+        g_ram[TEST_PC + 3] = (u8)(i * 13u);
+        prepare_context(&context, a, 0xe0, FLAG_U | FLAG_I | (i & 1));
+        context.iy = 0x20;
+        sum = (u32)a + b + (i & 1);
+        a = (u8)sum;
+        carry = sum > 255u;
+        b = (u8)~(u8)(i * 13u);
+        sum = (u32)a + b + carry;
+        value = (u8)sum;
+        flags = FLAG_U | FLAG_I | (value & FLAG_N);
+        if (!value) flags |= FLAG_Z;
+        if (sum > 255u) flags |= FLAG_C;
+        if ((a ^ value) & (b ^ value) & 0x80u) flags |= FLAG_V;
+        cycles = 16u + (value ? 3u : 6u) + ((value & 0x80u) ? 3u : 6u);
+        instructions = 6u + (value ? 0u : 2u) + ((value & 0x80u) ? 0u : 2u);
+        if (!execute_context(&context, &result) ||
+            context.pc != TEST_PC + 16u || result != cycles ||
+            context.cycles != cycles || context.instructions != instructions ||
+            context.ac != value || context.status != flags ||
+            context.ix != 0x66 || context.iy != 0x20 ||
+            context.control_transitions != 2 || context.exit_reason != S6502_IRAM_EXIT_SLOW ||
+            g_dirty != 0 || g_ram[0x3110] != value)
+            passed = 0;
+    }
+    record_case(case_index, &context, result, passed);
+    return passed;
+}
+
+static int run_materialized_branches(u32 case_index)
+{
+    static const u8 program[] = {0xd0,2,0xea,0xea,0x30,2,0xea,0xea,0};
+    s6502_iram_asm_context_t context;
+    u32 i, result = 0, cycles, instructions;
+    int passed = 1;
+    prepare_memory(program, sizeof(program));
+    g_code_pages[TEST_PAGE] = g_ram + (TEST_PAGE << 8);
+    for (i = 0; i < 256; ++i) {
+        prepare_context(&context, 0x5a, 0xe0, (u8)i);
+        cycles = ((i & FLAG_Z) ? 6u : 3u) + ((i & FLAG_N) ? 3u : 6u);
+        instructions = 2u + ((i & FLAG_Z) ? 2u : 0u) + ((i & FLAG_N) ? 0u : 2u);
+        if (!execute_context(&context, &result) ||
+            context.pc != TEST_PC + 8u || result != cycles ||
+            context.cycles != cycles || context.instructions != instructions ||
+            context.ac != 0x5a || context.status != (u8)i ||
+            context.ix != 0x66 || context.iy != 0x77 ||
+            context.control_transitions != 2 || context.exit_reason != S6502_IRAM_EXIT_SLOW ||
+            g_dirty != 0)
+            passed = 0;
+    }
+    record_case(case_index, &context, result, passed);
+    return passed;
 }
 
 static int run_load_oper1(u32 case_index)
@@ -733,6 +827,214 @@ static T_IramExec install_engine(void)
     return (T_IramExec)(void *)entry;
 }
 
+extern void eq_dda7_register(void), eq_dde4_register(void), eq_ddee_register(void);
+extern void eq_d586_register(void), eq_d596_register(void), eq_d5a6_register(void), eq_d5b6_register(void);
+extern u32 firmware_native_runtime(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_dda7(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_dde4(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_ddee(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_d586(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_d596(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_d5a6(s6502_iram_asm_context_t *c);
+extern u32 firmware_native_runtime_d5b6(s6502_iram_asm_context_t *c);
+static u32 g_register_table[256][4] TEST_STORAGE;
+static struct { u32 active; u32 referenced; } g_register_residency;
+#define g_register_pin g_register_residency.active
+extern u32 bridge_dda7(s6502_iram_asm_context_t *c);
+extern u32 bridge_dde4(s6502_iram_asm_context_t *c);
+extern u32 bridge_ddee(s6502_iram_asm_context_t *c);
+extern u32 bridge_d586(s6502_iram_asm_context_t *c);
+extern u32 bridge_d596(s6502_iram_asm_context_t *c);
+extern u32 bridge_d5a6(s6502_iram_asm_context_t *c);
+extern u32 bridge_d5b6(s6502_iram_asm_context_t *c);
+static u16 g_register_banks[16] TEST_STORAGE;
+static u8 g_register_expected[512] TEST_STORAGE;
+static u8 g_register_before[512] TEST_STORAGE;
+volatile u32 g_register_subcase;
+volatile u32 g_register_failure[17];
+#ifdef GAM4980_NATIVE_PROFILE_TEST
+extern void gam4980_native_profile_trampoline(void);
+static u32 profile_test_target, profile_test_entries, profile_test_leaves, profile_test_error;
+void gam4980_native_profile_begin(s6502_iram_asm_context_t *c, u32 pc, u32 *frame)
+{
+    if (!c || pc < 0xd000u) profile_test_error = 1u;
+    frame[0] = profile_test_target; frame[1] = 0x19880909u; frame[2] = pc;
+    ++profile_test_entries;
+}
+void gam4980_native_profile_end(u32 *frame, u32 accepted)
+{
+    if (frame[1] != 0x19880909u || frame[2] < 0xd000u) profile_test_error = 1u;
+    (void)accepted;
+    ++profile_test_leaves;
+}
+#endif
+static int run_register_leaves(u32 index)
+{
+    static u32 (*const bridges[7])(s6502_iram_asm_context_t *) = {
+        bridge_dda7,bridge_dde4,bridge_ddee,bridge_d586,bridge_d596,bridge_d5a6,bridge_d5b6};
+    static const u16 pcs[7] = {0xdda7,0xdde4,0xddee,0xd586,0xd596,0xd5a6,0xd5b6};
+    static void (*const entries[7])(void) = {eq_dda7_register,eq_dde4_register,eq_ddee_register,
+        eq_d586_register,eq_d596_register,eq_d5a6_register,eq_d5b6_register};
+    static u32 (*const references[7])(s6502_iram_asm_context_t *) = {
+        firmware_native_runtime_dda7,firmware_native_runtime_dde4,firmware_native_runtime_ddee,
+        firmware_native_runtime_d586,firmware_native_runtime_d596,firmware_native_runtime_d5a6,firmware_native_runtime_d5b6};
+    s6502_iram_asm_context_t actual, expected;
+    u32 kind, value, result = 0u, i;
+    int ok = 1;
+    static const u8 program[1] = {0x02};
+    for (kind=0;kind<7u && ok;++kind) for(value=0;value<64u && ok;++value) {
+        g_register_subcase=kind*64u+value;
+        prepare_memory(program,1u);
+        prepare_context(&actual,(u8)(value*17u),(u8)(value*13u),(u8)(value*7u));
+        actual.pc=0x4300u;actual.cycle_budget=(value&1u)?100u:1u;
+        g_ram[0x4300]=0x4c;g_ram[0x4301]=(u8)pcs[kind];g_ram[0x4302]=(u8)(pcs[kind]>>8);
+        actual.dispatch_bits=(u32)(unsigned long)g_dispatch;
+        actual.register_entries=(u32)(unsigned long)g_register_table;
+        actual.register_banks=(u32)(unsigned long)g_register_banks;
+        g_dispatch[pcs[kind]]=1u;
+        g_register_banks[13]=(value&16u)?0xea9:0xea8;
+        g_register_table[pcs[kind]&255u][0]=pcs[kind];
+        g_register_table[pcs[kind]&255u][1]=0xea8;
+        g_register_table[pcs[kind]&255u][2]=(u32)(unsigned long)entries[kind];
+#ifdef GAM4980_NATIVE_PROFILE_TEST
+        profile_test_target = (u32)(unsigned long)entries[kind];
+        g_register_table[pcs[kind]&255u][2]=(u32)(unsigned long)gam4980_native_profile_trampoline;
+#endif
+        g_register_table[pcs[kind]&255u][3]=(u32)(unsigned long)&g_register_pin;
+        g_ram[0x20]=(u8)(value*19u);g_ram[0x21]=(u8)(value*23u);
+        g_ram[0x23]=(u8)(value*29u);g_ram[0x24]=(u8)(value*31u);
+        g_ram[0x2a]=0xff;g_ram[0x2b]=(value&4u)?0xff:0x7f;
+        g_ram[0x100u|(u8)(actual.sp+1u)]=0xff;
+        g_ram[0x100u|(u8)(actual.sp+2u)]=0x40;
+        g_ram[0x4100]=0x02;
+        copy_bytes((u8 *)&expected,(const u8 *)&actual,sizeof(actual));
+        copy_bytes(g_register_before,g_ram,512u);
+        expected.pc=pcs[kind];expected.cycles=3u;
+        if(expected.cycle_budget>3u && g_register_banks[13]==0xea8)references[kind](&expected);
+        copy_bytes(g_register_expected,g_ram,512u);
+        if (g_register_banks[13]==0xea8 && actual.cycle_budget>3u) {
+            s6502_iram_asm_context_t bridge;
+            u32 consumed, metrics[10];
+            copy_bytes((u8 *)&bridge,(const u8 *)&actual,sizeof(bridge));
+            bridge.pc=pcs[kind];bridge.cycles=3u;
+            for(i=0;i<10u;++i)metrics[i]=0;
+            metrics[9]=1;
+            bridge.native_shared_metrics=(u32)(unsigned long)metrics;
+            copy_bytes(g_ram,g_register_before,512u);
+            consumed=bridges[kind](&bridge);
+            if(metrics[0]!=(consumed!=0u) || metrics[1]!=(consumed!=0u) || metrics[2]!=consumed)ok=0;
+            if(consumed!=expected.cycles-3u || bridge.cycles!=expected.cycles ||
+               bridge.pc!=expected.pc || bridge.ac!=expected.ac || bridge.ix!=expected.ix ||
+               bridge.iy!=expected.iy || bridge.sp!=expected.sp || bridge.status!=expected.status)ok=0;
+            for(i=0;i<512u;++i)if(g_ram[i]!=g_register_expected[i])ok=0;
+        }
+        copy_bytes(g_ram,g_register_before,512u);
+        g_register_residency.referenced=0;
+        if(!execute_context(&actual,&result) || g_register_pin)ok=0;
+        if(actual.register_calls && !g_register_residency.referenced)ok=0;
+        if(actual.pc!=expected.pc || actual.ac!=expected.ac || actual.ix!=expected.ix ||
+           actual.iy!=expected.iy || actual.sp!=expected.sp || actual.status!=expected.status ||
+           actual.cycles!=expected.cycles || actual.register_calls!=(expected.cycles>3u))ok=0;
+        for(i=0;i<512u;++i)if(g_ram[i]!=g_register_expected[i])ok=0;
+        if(!ok) {
+            const u32 *a=(const u32 *)&actual,*e=(const u32 *)&expected;
+            for(i=0;i<6u;++i){g_register_failure[i]=a[i];g_register_failure[6u+i]=e[i];}
+            g_register_failure[12]=actual.cycles;g_register_failure[13]=expected.cycles;
+            g_register_failure[14]=actual.register_calls;
+            for(i=0;i<512u;++i)if(g_ram[i]!=g_register_expected[i])break;
+            g_register_failure[15]=i;
+            g_register_failure[16]=i<512u?g_ram[i]|((u32)g_register_expected[i]<<8):0;
+        }
+    }
+#ifdef GAM4980_NATIVE_PROFILE_TEST
+    if (profile_test_error || !profile_test_entries || profile_test_entries != profile_test_leaves) ok=0;
+#endif
+    record_case(index,&actual,result,ok);
+    return ok;
+}
+
+static int run_zero_page_reads(u32 index)
+{
+    static const u8 ops[] = {0xa5,0x05,0x25,0xa4,0xa6};
+    u8 program[] = {0xa5,0,0x02};
+    s6502_iram_asm_context_t context;
+    u32 kind,address,result=0;
+    int ok=1;
+    for(kind=0;kind<5u && ok;++kind) for(address=0;address<256u && ok;++address) {
+        u8 value=(u8)(address*17u), expected, flags;
+        int slow=address<=3u || (address>=12u && address<=14u);
+        program[0]=ops[kind];program[1]=(u8)address;
+        prepare_memory(program,3u);
+        g_code_pages[TEST_PAGE]=g_ram+(TEST_PAGE<<8);
+        g_ram[address]=value;
+        prepare_context(&context,0x5au,0xe0u,FLAG_U|FLAG_I|FLAG_V|FLAG_C);
+        expected=kind==1u?(u8)(0x5a|value):kind==2u?(u8)(0x5a&value):value;
+        flags=FLAG_U|FLAG_I|FLAG_V|FLAG_C;
+        if(!slow)flags|=(expected?0u:FLAG_Z)|(expected&FLAG_N);
+        if(!execute_context(&context,&result))ok=0;
+        if(context.pc!=TEST_PC+(slow?0u:2u) || context.cycles!=(slow?0u:3u) ||
+           context.instructions!=(slow?0u:1u) || context.status!=flags ||
+           context.ac!=((!slow && kind<3u)?expected:0x5au) ||
+           context.ix!=((!slow && kind==4u)?expected:0x66u) ||
+           context.iy!=((!slow && kind==3u)?expected:0x77u) ||
+           context.sp!=0xe0u || context.exit_reason!=S6502_IRAM_EXIT_SLOW ||
+           g_ram[address]!=value)ok=0;
+    }
+    record_case(index,&context,result,ok);
+    return ok;
+}
+
+static int run_indexed_reads(u32 index)
+{
+    static const u16 bases[]={0x3000,0x30ff,0xffff,0xff9a,0x0000};
+    s6502_iram_asm_context_t c;
+    u8 program[]={0xbd,0,0,0x02};
+    u32 k,j,result=0;
+    int ok=1;
+    for(k=0;k<2u && ok;++k)for(j=0;j<5u && ok;++j){
+        u16 base=bases[j], at=(u16)(base+(k?0x77u:0x66u));
+        u8 value=(u8)(j*64u),flags=FLAG_U|FLAG_I|FLAG_V|FLAG_C;
+        int slow=at<=3u || (at>=12u && at<=14u);
+        program[0]=k?0xb9:0xbd;program[1]=(u8)base;program[2]=(u8)(base>>8);
+        prepare_memory(program,4u);g_code_pages[TEST_PAGE]=g_ram+(TEST_PAGE<<8);
+        g_ram[at]=value;prepare_context(&c,0x5a,0xe0,flags);
+        if(!slow)flags|=(value&128u)|(value?0u:FLAG_Z);
+        if(!execute_context(&c,&result) || !check_common(&c,result,TEST_PC+(slow?0u:3u),
+            slow?0u:4u+((base>>8)!=(at>>8)),slow?0u:1u,slow?0x5au:value,flags))ok=0;
+    }
+    record_case(index,&c,result,ok);return ok;
+}
+
+static int run_register_chain(u32 index)
+{
+    const u8 program[]={0x4c,0x96,0xd5};
+    s6502_iram_asm_context_t a,e;
+    u32 result=0,i;int ok=1;
+    prepare_memory(program,3u);g_code_pages[TEST_PAGE]=g_ram+(TEST_PAGE<<8);
+    prepare_context(&a,0x5a,0xe0,FLAG_U|FLAG_C);
+    a.register_entries=(u32)(unsigned long)g_register_table;
+    a.register_banks=(u32)(unsigned long)g_register_banks;
+    a.dispatch_bits=(u32)(unsigned long)g_dispatch;
+    g_register_banks[13]=0xea8;g_dispatch[0xd596]=1;g_dispatch[0xdde4]=1;
+    g_register_table[0x96][0]=0xd596;g_register_table[0x96][1]=0xea8;
+    g_register_table[0x96][2]=(u32)(unsigned long)eq_d596_register;
+    g_register_table[0x96][3]=(u32)(unsigned long)&g_register_pin;
+    g_register_table[0xe4][0]=0xdde4;g_register_table[0xe4][1]=0xea8;
+    g_register_table[0xe4][2]=(u32)(unsigned long)eq_dde4_register;
+    g_register_table[0xe4][3]=(u32)(unsigned long)&g_register_pin;
+    g_ram[0x1e1]=0xe3;g_ram[0x1e2]=0xdd;
+    g_ram[0x1e3]=0xff;g_ram[0x1e4]=0x40;g_ram[0x4100]=2;
+    copy_bytes((u8 *)&e,(const u8 *)&a,sizeof(a));copy_bytes(g_register_before,g_ram,512u);
+    e.pc=0xd596;e.cycles=3;
+    if(!firmware_native_runtime_d596(&e) || !firmware_native_runtime_dde4(&e))ok=0;
+    copy_bytes(g_register_expected,g_ram,512u);copy_bytes(g_ram,g_register_before,512u);
+    if(!execute_context(&a,&result) || g_register_pin || a.register_calls!=2u)ok=0;
+    if(a.pc!=e.pc || a.ac!=e.ac || a.ix!=e.ix || a.iy!=e.iy ||
+       a.sp!=e.sp || a.status!=e.status || a.cycles!=e.cycles)ok=0;
+    for(i=0;i<512u;++i)if(g_ram[i]!=g_register_expected[i])ok=0;
+    record_case(index,&a,result,ok);return ok;
+}
+
 T_WORD App_Main(void)
 {
     int passed = 1;
@@ -769,6 +1071,16 @@ T_WORD App_Main(void)
     passed &= run_sbc_abs_x_cross(5u);
     passed &= run_sta_abs_x(6u);
     passed &= run_cross_page_jmp(7u);
+    passed &= run_fetch_preservation(8u, 0u);
+    passed &= run_fetch_preservation(9u, 0x7fu);
+    passed &= run_fetch_preservation(10u, 0x80u);
+    passed &= run_fetch_preservation(11u, 0xffu);
+    passed &= run_mixed_arithmetic(12u);
+    passed &= run_materialized_branches(13u);
+    passed &= run_register_leaves(14u);
+    passed &= run_zero_page_reads(15u);
+    passed &= run_indexed_reads(16u);
+    passed &= run_register_chain(17u);
     g_super_equiv_report.iram_status =
         (u32)gam4980_9288_iram_status();
     if (g_super_equiv_report.iram_status != GAM4980_IRAM_STATUS_RESTORED) {

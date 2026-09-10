@@ -107,6 +107,56 @@ class NativeModulePackageTest(unittest.TestCase):
         self.assertEqual(module_instructions + 1, sum(block_instruction_counts))
         self.assertEqual(module_transitions + 1, len(block_instruction_counts))
 
+    def test_compiler_argument_runtime_calls_are_lifted_at_callers(self) -> None:
+        signature = bytes.fromhex("a9 2a 20 aa da 20 ca da")
+        records = [
+            (packer.GAME_PHYSICAL_BASE, 0x5000, 0, 5, 2, 0),
+            (packer.GAME_PHYSICAL_BASE + 5, 0x5005, 5, 3, 1, 0),
+        ]
+        rendered = packer.render_module_source(
+            0,
+            [(index, record) for index, record in enumerate(records)],
+            signature,
+            skip_hle_entries=False,
+        )[0]
+
+        self.assertEqual(rendered.count("compiler runtime lift"), 2)
+        self.assertIn("CYCLES(51u);", rendered)
+        self.assertIn("CYCLES(61u);", rendered)
+        self.assertIn("pc = 0xdaaau;", rendered)
+        self.assertIn("pc = 0xdacau;", rendered)
+        self.assertIn("native_instruction_count += 15u;", rendered)
+        self.assertIn("native_instruction_count += 17u;", rendered)
+        self.assertIn("WRITE8(ea, ac);", rendered)
+        self.assertIn("WRITE8((native_u16)(ea + 1u), ac);", rendered)
+
+    def test_emulator_semantic_decoder_keeps_cycles_and_fallback(self) -> None:
+        signature = bytes.fromhex(
+            "a9 34 85 20 a9 12 85 21 "
+            "18 a5 20 65 23 85 20 a5 21 65 24 85 21 60"
+        )
+        record = (
+            packer.GAME_PHYSICAL_BASE, 0x5000, 0, len(signature), 12, 0
+        )
+        emitted, requires_binary = packer.semantic_decode_record(
+            signature, record
+        )
+
+        self.assertTrue(requires_binary)
+        self.assertEqual(emitted[0], "S6502_SEM_STORE16_IMM(0x20u, 0x1234u);")
+        self.assertEqual(
+            emitted[1],
+            "S6502_SEM_ADD16_REGS(0x20u, 0x23u, 0x20u);",
+        )
+        self.assertEqual(emitted[-1], "S6502_AOT_RTS();")
+        rendered = packer.render_module_source(
+            0, [(0, record)], signature, skip_hle_entries=False,
+            decoder=packer.semantic_decode_record,
+        )[0]
+        self.assertIn("if (DECIMAL_p) NATIVE_MISS();", rendered)
+        self.assertIn("CYCLES(10u)", rendered)
+        self.assertIn("CYCLES(cost)", rendered)
+
     def test_memory_split_keeps_old_total(self) -> None:
         core_h = (ROOT / "src" / "gam4980_core.h").read_text(encoding="utf-8")
         self.assertIn("#ifdef GAM4980_DYNAMIC_NATIVE_ALL", core_h)

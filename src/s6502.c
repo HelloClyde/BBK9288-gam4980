@@ -136,6 +136,9 @@ uint32_t S6502_EXEC_FUNCTION(s6502_t *u, uint32_t cycles) {
 #define S6502_FETCH_OPCODE() READX8(pc++)
 #endif
   _exit:
+#ifdef GAM4980_HOST_PROFILE_H
+    host_profile_phase(HP_CORE);
+#endif
 #if defined(S6502_TEST_STOP_PREDICATE)
     if (S6502_TEST_STOP_PREDICATE(pc) && executed) {
 #elif defined(S6502_TEST_STOP_PC)
@@ -187,6 +190,9 @@ uint32_t S6502_EXEC_FUNCTION(s6502_t *u, uint32_t cycles) {
       NEXT;
     };
   _next:
+#ifdef GAM4980_HOST_PROFILE_H
+    host_profile_phase(HP_CORE);
+#endif
 #if defined(S6502_TEST_STOP_PREDICATE)
     if (S6502_TEST_STOP_PREDICATE(pc) && executed) {
 #elif defined(S6502_TEST_STOP_PC)
@@ -231,12 +237,14 @@ uint32_t S6502_EXEC_FUNCTION(s6502_t *u, uint32_t cycles) {
       uint32_t iram_budget = executed < cycles ? cycles - executed : 0u;
       uint32_t iram_result = S6502_IRAM_EXEC_BURST(
           &pc, &ac, &ix, &iy, &sp, &status, iram_budget);
-      uint32_t iram_executed = iram_result & 0x7fffffffu;
+      /* Bit 30 belongs to the wrapper, not the assembly return ABI: the
+       * current PC is a known slow instruction and must not be retried. */
+      uint32_t iram_executed = iram_result & 0x3fffffffu;
 
-      if (iram_executed) {
-        executed += iram_executed;
-        if (iram_result & 0x80000000u)
-          goto _exit;
+      executed += iram_executed;
+      if (iram_result & 0x80000000u)
+        goto _exit;
+      if (iram_executed && !(iram_result & 0x40000000u)) {
         goto _next;
       }
     }

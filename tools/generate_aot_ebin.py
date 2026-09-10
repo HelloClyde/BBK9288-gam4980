@@ -285,7 +285,7 @@ NZ_WRITERS = {
     0x88, 0x8A, 0x98,                   # DEY/TXA/TYA
     0xA0, 0xA2, 0xA4, 0xA5, 0xA6, 0xA8, # loads/transfers
     0xA9, 0xAA, 0xAC, 0xAD, 0xAE,
-    0xB1, 0xBA, 0xBD,
+    0xB1, 0xB5, 0xB9, 0xBA, 0xBD,
     0xC6, 0xC8, 0xCA, 0xCE, 0xDE,       # DEC/INY/DEX
     0xE6, 0xE8, 0xEE,                   # INC/INX
 }
@@ -293,12 +293,12 @@ NZC_WRITERS = {
     0x06, 0x0A, 0x0E, 0x1E,             # ASL
     0x26, 0x2A, 0x2E, 0x3E,             # ROL
     0x46, 0x4A, 0x4E,                   # LSR
-    0x66, 0x6A, 0x6E,                   # ROR
-    0xC0, 0xC5, 0xC9, 0xCD,             # CMP/CPY
+    0x66, 0x6A, 0x6E, 0x76,             # ROR
+    0xC0, 0xC4, 0xC5, 0xC9, 0xCD,       # CMP/CPY
     0xE0, 0xEC,                         # CPX
 }
 ARITHMETIC_WRITERS = {0x65, 0x69, 0x6D, 0x71, 0xE5, 0xE9, 0xED, 0xF1}
-ROTATE_READERS = {0x26, 0x2A, 0x2E, 0x3E, 0x66, 0x6A, 0x6E}
+ROTATE_READERS = {0x26, 0x2A, 0x2E, 0x3E, 0x66, 0x6A, 0x6E, 0x76}
 
 def flag_effects(opcode: int) -> tuple[CpuFlag, CpuFlag]:
     """Return status bits read and written by a supported opcode."""
@@ -591,6 +591,11 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         )
     elif opcode == 0x71:
         line = f"S6502_AOT_ADC_INDY({indirect_base_expr(byte)}, {flags});"
+    elif opcode == 0x76:
+        line = (
+            f"S6502_AOT_ROR_ZP((uint8_t)(0x{byte:02x}u + ix), "
+            f"{flags});"
+        )
     elif opcode == 0x78:
         line = f"S6502_AOT_SEI({flags});"
     elif opcode == 0x84:
@@ -617,6 +622,8 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         )
     elif opcode == 0x91:
         line = f"S6502_AOT_STA_INDY({indirect_base_expr(byte)});"
+    elif opcode == 0x95:
+        line = f"S6502_AOT_STA_ZPX(0x{byte:02x}u);"
     elif opcode == 0x98:
         line = f"S6502_AOT_TYA({flags});"
     elif opcode == 0x99:
@@ -649,6 +656,13 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         line = f"S6502_AOT_LDX({read_expr(word)}, 4, {flags});"
     elif opcode == 0xB1:
         line = f"S6502_AOT_LDA_INDY({indirect_base_expr(byte)}, {flags});"
+    elif opcode == 0xB5:
+        line = (
+            f"S6502_AOT_LDA(READ8((uint8_t)(0x{byte:02x}u + ix)), "
+            f"4, {flags});"
+        )
+    elif opcode == 0xB9:
+        line = f"S6502_AOT_LDA_ABSY(0x{word:04x}u, {flags});"
     elif opcode == 0xBA:
         line = f"S6502_AOT_TSX({flags});"
     elif opcode == 0xBD:
@@ -661,6 +675,8 @@ def emit_instruction(ir: InstructionIR) -> tuple[list[str], bool]:
         )
     elif opcode == 0xC0:
         line = f"S6502_AOT_COMPARE(iy, 0x{byte:02x}u, 2, {flags});"
+    elif opcode == 0xC4:
+        line = f"S6502_AOT_COMPARE(iy, {read_expr(byte)}, 3, {flags});"
     elif opcode == 0xC5:
         line = f"S6502_AOT_COMPARE(ac, {read_expr(byte)}, 3, {flags});"
     elif opcode == 0xC6:
@@ -893,9 +909,19 @@ MACROS = r"""
     ac = READ8(ea); S6502_AOT_SET_NZ_MASK(ac, flags);                       \
     CYCLES(4);                                              \
 } while (0)
+#define S6502_AOT_LDA_ABSY(base, flags) do {                                 \
+    et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
+    CYCLES((!!(0xff00 & (et ^ ea))));                                       \
+    ac = READ8(ea); S6502_AOT_SET_NZ_MASK(ac, flags);                       \
+    CYCLES(4);                                              \
+} while (0)
 #define S6502_AOT_STA_INDY(base) do {                                        \
     et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
     WRITE8(ea, ac); CYCLES(6);                              \
+} while (0)
+#define S6502_AOT_STA_ZPX(base) do {                                         \
+    WRITE8((uint8_t)((uint8_t)(base) + ix), ac);                            \
+    CYCLES(4);                                              \
 } while (0)
 #define S6502_AOT_STA_ABSX(base) do {                                        \
     ea = (uint16_t)((uint16_t)(base) + ix); WRITE8(ea, ac);                 \

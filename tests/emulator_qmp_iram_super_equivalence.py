@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from emulator_qmp_smoke import QmpClient
 
 
-REPORT_WORDS = 70
+REPORT_WORDS = 140
 REPORT_MAGIC = 0x53555045
 IRAM_RESTORED = 2
 
@@ -124,10 +124,12 @@ def main() -> None:
         if magic != REPORT_MAGIC:
             errors.append(f"magic={magic:08x}")
         if completed != 1 or passed != 1 or fail_mask != 0:
+            print('register subcase', read_words(qmp,map_symbol(args.map,'g_register_subcase'),1))
+            print('register failure', read_words(qmp,map_symbol(args.map,'g_register_failure'),17))
             errors.append(
                 f"completed={completed} passed={passed} fail={fail_mask:08x}"
             )
-        if cases_run != 8 or cases_passed != 8:
+        if cases_run != 18 or cases_passed != 18:
             errors.append(f"cases={cases_passed}/{cases_run}")
         if iram_status != IRAM_RESTORED or not (0 < iram_size <= 0x16C8):
             errors.append(
@@ -141,23 +143,33 @@ def main() -> None:
         expected_pc = [
             0x4040, 0x4101, 0x4045, 0x4045,
             0x4043, 0x4043, 0x4043, 0x1234,
+            0x404d, 0x404d, 0x404d, 0x404d,
+            0x4050, 0x4048,
         ]
         expected_cycles = [
             0, 4, 6, 6, 4, 5, 5, 3,
+            20,20,20,20,
+            22,9,
         ]
         expected_instructions = [
             0, 1, 2, 2, 1, 1, 1, 1,
+            5,5,5,5,
+            6,4,
         ]
         expected_ac = [
             0x5A, 0x80, 0x7F, 0x00,
             0x91, 0x0F, 0xA5, 0x5A,
+            0,0x7f,0x80,0xff,
+            0xe8,0x5a,
         ]
         expected_status = [
             0x2D, 0xA5, 0x25, 0x27,
             0xE4, 0x25, 0x25, 0x25,
+            0x67,0xe4,0x65,0x65,
+            0xa4,0xff,
         ]
         observations = words[14:]
-        for index in range(8):
+        for index in range(14):
             case = observations[index * 7:(index + 1) * 7]
             if len(case) != 7:
                 errors.append(f"case{index}=truncated")

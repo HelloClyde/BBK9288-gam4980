@@ -44,6 +44,26 @@ FAR_CALL_BYTES = bytes.fromhex("a2 00 86 26 a2 00 86 27 20 f6 d2")
 FAR_CALL_MASK = bytes.fromhex("ff 00 ff ff ff 00 ff ff ff ff ff")
 
 
+def game_far_table_offset(
+    game_size: int, code_size: int, table_address: int,
+) -> int | None:
+    """Map a C6502 `.bf_call` descriptor to its GAM file offset.
+
+    Larger games may place the three-byte descriptor in the tail of bank E0
+    ($5000-$8fff), while compact games place it in the appended constant-data
+    image ($9000-$cfff).  Treating every table address as `$5000`-relative
+    accidentally decoded another code bank for the latter layout.
+    """
+
+    if GAME_VIRTUAL_BASE <= table_address < GAME_VIRTUAL_END:
+        offset = table_address - GAME_VIRTUAL_BASE
+    elif 0x9000 <= table_address < 0xD000:
+        offset = code_size + table_address - 0x9000
+    else:
+        return None
+    return offset if 0 <= offset <= game_size - 3 else None
+
+
 @dataclass
 class NativeModule:
     mapping_slot: int
@@ -75,6 +95,34 @@ def game_far_call_at(data: bytes, offset: int) -> bool:
             zip(FAR_CALL_BYTES, FAR_CALL_MASK)
         )
     )
+
+
+def game_switch_targets(game: bytes, jump_offset: int) -> tuple[int, ...] | None:
+    """Decode C6502's statically linked __switch_comparison descriptor.
+
+    Match instructions, not arbitrary pointer-looking words in game data.
+    Cases/default are intra-function CFG successors of JMP $DB5C.
+    """
+    if jump_offset < 20 or game[jump_offset:jump_offset+3] != b"\x4c\x5c\xdb":
+        return None
+    setup = game[jump_offset-20:jump_offset]
+    for index, value in ((0,0xa9),(2,0x85),(3,0x26),(4,0xa9),(6,0x85),
+                         (7,0x27),(8,0xa2),(10,0xa0),(12,0xa9),(14,0x85),
+                         (15,0x20),(16,0xa9),(18,0x85),(19,0x21)):
+        if setup[index] != value:
+            return None
+    table = setup[1] | setup[5] << 8
+    count = setup[9] | setup[11] << 8
+    default = setup[13] | setup[17] << 8
+    base = jump_offset & ~(GAME_BANK_SIZE-1)
+    data = base + table - GAME_VIRTUAL_BASE
+    if not count or data < base or data+4*count > min(base+GAME_BANK_SIZE,len(game)):
+        raise ValueError(f"invalid C6502 switch table at GAM+0x{jump_offset:x}")
+    targets = [default] + [int.from_bytes(game[data+count*2+i*2:data+count*2+i*2+2],"little")
+                           for i in range(count)]
+    if any(not GAME_VIRTUAL_BASE <= pc < GAME_VIRTUAL_END for pc in targets):
+        raise ValueError(f"out-of-bank C6502 switch target at GAM+0x{jump_offset:x}")
+    return tuple(dict.fromkeys(base+pc-GAME_VIRTUAL_BASE for pc in targets))
 
 
 def recover_game_blocks(game: bytes) -> tuple[list[tuple[int, ...]], dict[str, int]]:
@@ -130,11 +178,13 @@ def recover_game_blocks(game: bytes) -> tuple[list[tuple[int, ...]], dict[str, i
             GAME_VIRTUAL_BASE + (offset & (GAME_BANK_SIZE - 1)),
         )
         table_address = code[offset + 1] | code[offset + 5] << 8
-        table_offset = table_address - GAME_VIRTUAL_BASE
-        if not 0 <= table_offset <= code_size - 3:
+        table_offset = game_far_table_offset(
+            len(game), code_size, table_address,
+        )
+        if table_offset is None:
             continue
-        target = code[table_offset] | code[table_offset + 1] << 8
-        bank = code[table_offset + 2]
+        target = game[table_offset] | game[table_offset + 1] << 8
+        bank = game[table_offset + 2]
         if not (GAME_VIRTUAL_BASE <= target < GAME_VIRTUAL_END and bank >= 0xE0):
             continue
         target_offset = (
@@ -171,10 +221,12 @@ def recover_game_blocks(game: bytes) -> tuple[list[tuple[int, ...]], dict[str, i
             if game_far_call_at(code, offset):
                 far_calls += 1
                 table_address = code[offset + 1] | code[offset + 5] << 8
-                table_offset = table_address - GAME_VIRTUAL_BASE
-                if 0 <= table_offset <= code_size - 3:
-                    target = code[table_offset] | code[table_offset + 1] << 8
-                    bank = code[table_offset + 2]
+                table_offset = game_far_table_offset(
+                    len(game), code_size, table_address,
+                )
+                if table_offset is not None:
+                    target = game[table_offset] | game[table_offset + 1] << 8
+                    bank = game[table_offset + 2]
                     if (
                         GAME_VIRTUAL_BASE <= target < GAME_VIRTUAL_END and
                         bank >= 0xE0
@@ -205,6 +257,9 @@ def recover_game_blocks(game: bytes) -> tuple[list[tuple[int, ...]], dict[str, i
                 enqueue(next_offset, next_pc)
             elif opcode == 0x4C:
                 target = instruction[1] | instruction[2] << 8
+                if target == 0xdb5c:
+                    for case_offset in game_switch_targets(game, offset) or ():
+                        enqueue(case_offset, GAME_VIRTUAL_BASE + (case_offset & (GAME_BANK_SIZE-1)))
                 if GAME_VIRTUAL_BASE <= target < GAME_VIRTUAL_END:
                     enqueue(
                         (offset & ~(GAME_BANK_SIZE - 1)) +
@@ -340,6 +395,225 @@ def decode_record(
     return emitted, requires_binary
 
 
+def _semantic_direct_zp(address: int) -> bool:
+    return address < 0x100 and address not in (
+        aotgen.PAGE0_SPECIAL_READ | aotgen.PAGE0_SPECIAL_WRITE
+    )
+
+
+def _semantic_zp_pair(low: int, high: int) -> bool:
+    return (
+        _semantic_direct_zp(low) and
+        high == ((low + 1) & 0xFF) and
+        _semantic_direct_zp(high)
+    )
+
+
+def _semantic_pairs_safe(left: int, right: int) -> bool:
+    """Return whether snapshotting two compiler words preserves aliasing.
+
+    Equal pairs are safe and disjoint pairs are safe.  A one-byte overlap is
+    not: C6502 reloads the high byte after storing the low byte, while a
+    semantic word operation snapshots both bytes before either store.
+    """
+
+    left_bytes = {left & 0xFF, (left + 1) & 0xFF}
+    right_bytes = {right & 0xFF, (right + 1) & 0xFF}
+    return left == right or left_bytes.isdisjoint(right_bytes)
+
+
+def semantic_peephole(
+    instructions: list[aotgen.InstructionIR], index: int,
+) -> tuple[str, int, bool] | None:
+    """Recover exact C6502 integer/pointer phrases for emulator modules.
+
+    The standalone translator recognizes the same source-level idioms.  This
+    variant deliberately retains guest cycles, flags, registers and memory
+    side effects so it is safe inside the emulator's local-fallback model.
+    """
+
+    remaining = instructions[index:]
+    opcodes = tuple(item.data[0] for item in remaining[:10])
+    if len(remaining) >= 10 and opcodes[:10] in (
+        (0x08, 0x78, 0x18, 0xA5, 0x69, 0x85, 0xA5, 0x69, 0x85, 0x28),
+        (0x08, 0x78, 0x38, 0xA5, 0xE9, 0x85, 0xA5, 0xE9, 0x85, 0x28),
+    ):
+        src0, src1 = remaining[3].data[1], remaining[6].data[1]
+        dst0, dst1 = remaining[5].data[1], remaining[8].data[1]
+        if (_semantic_zp_pair(src0, src1) and
+                _semantic_zp_pair(dst0, dst1) and
+                _semantic_pairs_safe(src0, dst0)):
+            value = remaining[4].data[1] | remaining[7].data[1] << 8
+            name = "ADD16_PRESERVE" if remaining[2].data[0] == 0x18 else \
+                "SUB16_PRESERVE"
+            return (
+                f"S6502_SEM_{name}(0x{src0:02x}u, 0x{dst0:02x}u, "
+                f"0x{value:04x}u);",
+                10,
+                True,
+            )
+    if len(remaining) >= 7 and opcodes[:7] in (
+        (0x18, 0xA5, 0x69, 0x85, 0xA5, 0x69, 0x85),
+        (0x38, 0xA5, 0xE9, 0x85, 0xA5, 0xE9, 0x85),
+    ):
+        src0, src1 = remaining[1].data[1], remaining[4].data[1]
+        dst0, dst1 = remaining[3].data[1], remaining[6].data[1]
+        if (_semantic_zp_pair(src0, src1) and
+                _semantic_zp_pair(dst0, dst1) and
+                _semantic_pairs_safe(src0, dst0)):
+            value = remaining[2].data[1] | remaining[5].data[1] << 8
+            name = "ADD16_IMM" if remaining[0].data[0] == 0x18 else \
+                "SUB16_IMM"
+            return (
+                f"S6502_SEM_{name}(0x{src0:02x}u, 0x{dst0:02x}u, "
+                f"0x{value:04x}u);",
+                7,
+                True,
+            )
+    if len(remaining) >= 7 and opcodes[:7] in (
+        (0x18, 0xA5, 0x65, 0x85, 0xA5, 0x65, 0x85),
+        (0x38, 0xA5, 0xE5, 0x85, 0xA5, 0xE5, 0x85),
+    ):
+        left0, left1 = remaining[1].data[1], remaining[4].data[1]
+        right0, right1 = remaining[2].data[1], remaining[5].data[1]
+        dst0, dst1 = remaining[3].data[1], remaining[6].data[1]
+        if (_semantic_zp_pair(left0, left1) and
+                _semantic_zp_pair(right0, right1) and
+                _semantic_zp_pair(dst0, dst1) and
+                _semantic_pairs_safe(left0, right0) and
+                _semantic_pairs_safe(left0, dst0) and
+                _semantic_pairs_safe(right0, dst0)):
+            name = "ADD16_REGS" if remaining[0].data[0] == 0x18 else \
+                "SUB16_REGS"
+            return (
+                f"S6502_SEM_{name}(0x{left0:02x}u, 0x{right0:02x}u, "
+                f"0x{dst0:02x}u);",
+                7,
+                True,
+            )
+    if len(remaining) >= 4 and opcodes[:4] == (0xA9, 0x85, 0xA9, 0x85):
+        dst0, dst1 = remaining[1].data[1], remaining[3].data[1]
+        if _semantic_zp_pair(dst0, dst1):
+            value = remaining[0].data[1] | remaining[2].data[1] << 8
+            return (
+                f"S6502_SEM_STORE16_IMM(0x{dst0:02x}u, 0x{value:04x}u);",
+                4,
+                False,
+            )
+    if len(remaining) >= 4 and opcodes[:4] == (0xA5, 0x85, 0xA5, 0x85):
+        src0, src1 = remaining[0].data[1], remaining[2].data[1]
+        dst0, dst1 = remaining[1].data[1], remaining[3].data[1]
+        if _semantic_zp_pair(src0, src1) and _semantic_zp_pair(dst0, dst1):
+            return (
+                f"S6502_SEM_COPY16(0x{src0:02x}u, 0x{dst0:02x}u);",
+                4,
+                False,
+            )
+    if len(remaining) >= 6 and opcodes[:6] == (
+        0xA0, 0xB1, 0x85, 0xC8, 0xB1, 0x85,
+    ):
+        pointer0, pointer1 = remaining[1].data[1], remaining[4].data[1]
+        dst0, dst1 = remaining[2].data[1], remaining[5].data[1]
+        if (pointer0 == pointer1 and _semantic_direct_zp(pointer0) and
+                _semantic_direct_zp((pointer0 + 1) & 0xFF) and
+                _semantic_zp_pair(dst0, dst1) and
+                {pointer0, (pointer0 + 1) & 0xFF}.isdisjoint({dst0, dst1})):
+            return (
+                f"S6502_SEM_LOAD16_INDIRECT(0x{pointer0:02x}u, "
+                f"0x{dst0:02x}u, 0x{remaining[0].data[1]:02x}u);",
+                6,
+                False,
+            )
+    if len(remaining) >= 6 and opcodes[:6] == (
+        0xA0, 0xA5, 0x91, 0xC8, 0xA5, 0x91,
+    ):
+        src0, src1 = remaining[1].data[1], remaining[4].data[1]
+        pointer0, pointer1 = remaining[2].data[1], remaining[5].data[1]
+        if (pointer0 == pointer1 and _semantic_zp_pair(src0, src1) and
+                _semantic_direct_zp(pointer0) and
+                _semantic_direct_zp((pointer0 + 1) & 0xFF)):
+            return (
+                f"S6502_SEM_STORE16_INDIRECT(0x{pointer0:02x}u, "
+                f"0x{src0:02x}u, 0x{remaining[0].data[1]:02x}u);",
+                6,
+                False,
+            )
+    if len(remaining) >= 2 and opcodes[:2] == (0xA0, 0xB1):
+        if remaining[1].data[1] == 0x28:
+            return (
+                f"S6502_SEM_LOAD_STACK8(0x{remaining[0].data[1]:02x}u);",
+                2,
+                False,
+            )
+    if len(remaining) >= 2 and opcodes[:2] == (0xA0, 0x91):
+        if remaining[1].data[1] == 0x28:
+            return (
+                f"S6502_SEM_STORE_STACK8(0x{remaining[0].data[1]:02x}u);",
+                2,
+                False,
+            )
+    return None
+
+
+def semantic_decode_record(
+    signature: bytes, record: tuple[int, ...]
+) -> tuple[list[str], bool]:
+    _physical, virtual, offset, size, expected_count, _bank2 = record
+    data = signature[offset : offset + size]
+    cursor = 0
+    pc = virtual
+    instructions: list[aotgen.InstructionIR] = []
+    while cursor < len(data):
+        opcode = data[cursor]
+        length = aotgen.OPCODE_LENGTHS[opcode]
+        raw = data[cursor : cursor + length]
+        if not length or len(raw) != length:
+            raise SystemExit(f"truncated semantic block at 0x{pc:04x}")
+        reads, writes = aotgen.flag_effects(opcode)
+        instructions.append(aotgen.InstructionIR(pc, raw, reads, writes))
+        cursor += length
+        pc = (pc + length) & 0xFFFF
+    if len(instructions) != expected_count:
+        raise SystemExit("semantic decode instruction count mismatch")
+    aotgen.analyze_flag_liveness(instructions)
+    emitted: list[str] = []
+    requires_binary = False
+    index = 0
+    while index < len(instructions):
+        phrase = semantic_peephole(instructions, index)
+        if phrase is not None:
+            line, count, binary = phrase
+            emitted.append(line)
+            requires_binary |= binary
+            index += count
+            continue
+        lines, binary = aotgen.emit_instruction(instructions[index])
+        emitted.extend(lines)
+        requires_binary |= binary
+        index += 1
+    return emitted, requires_binary
+
+
+SEMANTIC_EMULATOR_MACROS = r"""
+#define S6502_SEM_ZP16(addr) ((native_u16)(ram[(native_u8)(addr)] | ((native_u16)ram[(native_u8)((addr) + 1u)] << 8)))
+#define S6502_SEM_SET16(dst, value) do { native_u16 sem_v_ = (native_u16)(value); ram[(native_u8)(dst)] = (native_u8)sem_v_; ram[(native_u8)((dst) + 1u)] = (native_u8)(sem_v_ >> 8); ac = (native_u8)(sem_v_ >> 8); } while (0)
+#define S6502_SEM_STORE16_IMM(dst, value) do { S6502_SEM_SET16((dst), (value)); SET_NZ(ac); CYCLES(10u); } while (0)
+#define S6502_SEM_COPY16(src, dst) do { ac = ram[(native_u8)(src)]; ram[(native_u8)(dst)] = ac; ac = ram[(native_u8)((src) + 1u)]; ram[(native_u8)((dst) + 1u)] = ac; SET_NZ(ac); CYCLES(12u); } while (0)
+#define S6502_SEM_ADD16_PRESERVE(src, dst, value) do { ram[0x100u | sp] = (native_u8)(status | FLAG_B | FLAG_U); S6502_SEM_SET16((dst), (native_u16)(S6502_SEM_ZP16(src) + (native_u16)(value))); status = (native_u8)(status | FLAG_B | FLAG_U); CYCLES(27u); } while (0)
+#define S6502_SEM_SUB16_PRESERVE(src, dst, value) do { ram[0x100u | sp] = (native_u8)(status | FLAG_B | FLAG_U); S6502_SEM_SET16((dst), (native_u16)(S6502_SEM_ZP16(src) - (native_u16)(value))); status = (native_u8)(status | FLAG_B | FLAG_U); CYCLES(27u); } while (0)
+#define S6502_SEM_ADD_BODY(left, right, dst, cost) do { native_u16 sem_l_ = (native_u16)(left); native_u16 sem_r_ = (native_u16)(right); native_u16 sem_lo_ = (native_u16)((sem_l_ & 0xffu) + (sem_r_ & 0xffu)); native_u16 sem_hi_ = (native_u16)((sem_l_ >> 8) + (sem_r_ >> 8) + (sem_lo_ >> 8)); native_u8 sem_lh_ = (native_u8)(sem_l_ >> 8); native_u8 sem_rh_ = (native_u8)(sem_r_ >> 8); native_u8 sem_ah_ = (native_u8)sem_hi_; S6502_SEM_SET16((dst), (native_u16)((sem_lo_ & 0xffu) | ((native_u16)sem_ah_ << 8))); SET_C(sem_hi_ > 0xffu); SET_V((~(sem_lh_ ^ sem_rh_) & (sem_lh_ ^ sem_ah_) & 0x80u) != 0u); SET_NZ(ac); CYCLES(cost); } while (0)
+#define S6502_SEM_SUB_BODY(left, right, dst, cost) do { native_u16 sem_l_ = (native_u16)(left); native_u16 sem_r_ = (native_u16)(right); native_u8 sem_ll_ = (native_u8)sem_l_; native_u8 sem_rl_ = (native_u8)sem_r_; native_u8 sem_lh_ = (native_u8)(sem_l_ >> 8); native_u8 sem_rh_ = (native_u8)(sem_r_ >> 8); native_u8 sem_al_ = (native_u8)(sem_ll_ - sem_rl_); native_u16 sem_hsub_ = (native_u16)sem_rh_ + (sem_ll_ < sem_rl_); native_u8 sem_ah_ = (native_u8)(sem_lh_ - sem_hsub_); S6502_SEM_SET16((dst), (native_u16)(sem_al_ | ((native_u16)sem_ah_ << 8))); SET_C((native_u16)sem_lh_ >= sem_hsub_); SET_V(((sem_lh_ ^ sem_rh_) & (sem_lh_ ^ sem_ah_) & 0x80u) != 0u); SET_NZ(ac); CYCLES(cost); } while (0)
+#define S6502_SEM_ADD16_IMM(src, dst, value) S6502_SEM_ADD_BODY(S6502_SEM_ZP16(src), (value), (dst), 18u)
+#define S6502_SEM_SUB16_IMM(src, dst, value) S6502_SEM_SUB_BODY(S6502_SEM_ZP16(src), (value), (dst), 18u)
+#define S6502_SEM_ADD16_REGS(left, right, dst) S6502_SEM_ADD_BODY(S6502_SEM_ZP16(left), S6502_SEM_ZP16(right), (dst), 20u)
+#define S6502_SEM_SUB16_REGS(left, right, dst) S6502_SEM_SUB_BODY(S6502_SEM_ZP16(left), S6502_SEM_ZP16(right), (dst), 20u)
+#define S6502_SEM_LOAD16_INDIRECT(pointer, dst, index) do { native_u16 sem_base_; native_u16 sem_ea_; native_u32 sem_cost_ = 20u; iy = (native_u8)(index); SET_NZ(iy); sem_base_ = S6502_SEM_ZP16(pointer); sem_ea_ = (native_u16)(sem_base_ + iy); sem_cost_ += !!(0xff00u & (sem_base_ ^ sem_ea_)); ac = READ8(sem_ea_); SET_NZ(ac); ram[(native_u8)(dst)] = ac; iy = (native_u8)(iy + 1u); SET_NZ(iy); sem_base_ = S6502_SEM_ZP16(pointer); sem_ea_ = (native_u16)(sem_base_ + iy); sem_cost_ += !!(0xff00u & (sem_base_ ^ sem_ea_)); ac = READ8(sem_ea_); SET_NZ(ac); ram[(native_u8)((dst) + 1u)] = ac; CYCLES(sem_cost_); } while (0)
+#define S6502_SEM_STORE16_INDIRECT(pointer, src, index) do { native_u16 sem_base_; iy = (native_u8)(index); SET_NZ(iy); ac = ram[(native_u8)(src)]; SET_NZ(ac); sem_base_ = S6502_SEM_ZP16(pointer); WRITE8((native_u16)(sem_base_ + iy), ac); iy = (native_u8)(iy + 1u); SET_NZ(iy); ac = ram[(native_u8)((src) + 1u)]; SET_NZ(ac); sem_base_ = S6502_SEM_ZP16(pointer); WRITE8((native_u16)(sem_base_ + iy), ac); CYCLES(22u); } while (0)
+#define S6502_SEM_LOAD_STACK8(index) do { native_u16 sem_base_ = S6502_SEM_ZP16(0x28u); iy = (native_u8)(index); ea = (native_u16)(sem_base_ + iy); ac = READ8(ea); SET_NZ(ac); CYCLES((native_u32)(7u + (!!(0xff00u & (sem_base_ ^ ea))))); } while (0)
+#define S6502_SEM_STORE_STACK8(index) do { iy = (native_u8)(index); SET_NZ(iy); WRITE8((native_u16)(S6502_SEM_ZP16(0x28u) + iy), ac); CYCLES(8u); } while (0)
+"""
+
+
 def native_macro_source() -> str:
     return aotgen.MACROS.replace(
         "s6502_page3[(uint8_t)(addr)]", "READ8((uint16_t)(addr))"
@@ -427,6 +701,82 @@ def emit_native_control_tail(
     return None
 
 
+def emit_compiler_runtime_lift_tail(
+    line: str, direct_targets: set[int]
+) -> list[str] | None:
+    """Inline C6502's two ubiquitous argument-transport leaf calls.
+
+    These routines are compiler ABI mechanics rather than guest application
+    logic.  Keeping them as separate native modules still pays a native/IRAM
+    boundary, another page lookup and a second module activation.  Recreate
+    their exact 6502-visible result at the caller, including cycle count and
+    stale hardware-stack bytes.  If the current scheduling slice ends at the
+    original JSR boundary (or decimal mode is unexpectedly active), execute
+    only that JSR and leave the original runtime path as the local fallback.
+    """
+
+    parsed = parse_macro_call(line)
+    if parsed is None:
+        return None
+    name, args = parsed
+    if name != "S6502_AOT_JSR" or len(args) != 2:
+        return None
+    return_pc = parse_c_integer(args[0])
+    target = parse_c_integer(args[1])
+    if target not in (0xDAAA, 0xDACA):
+        return None
+    next_pc = (return_pc + 1) & 0xFFFF
+    call_cycles = 51 if target == 0xDAAA else 61
+    runtime_instructions = 15 if target == 0xDAAA else 17
+    result = [
+        "/* compiler runtime lift: preserve the original JSR boundary */",
+        "if (DECIMAL_p || context->cycles + executed + "
+        f"{call_cycles}u > context->cycle_budget ||",
+        "    (ram[0x200u] & 0x08u) || *native_epoch != entry_epoch) {",
+        f"    PUSH(0x{return_pc >> 8:02x}u);",
+        f"    PUSH(0x{return_pc & 0xff:02x}u);",
+        f"    pc = 0x{target:04x}u;",
+        "    CYCLES(6u);",
+        "    NATIVE_EXTERNAL();",
+        "}",
+        f"ram[0x100u | sp] = 0x{return_pc >> 8:02x}u;",
+        f"ram[0x100u | (native_u8)(sp - 1u)] = 0x{return_pc & 0xff:02x}u;",
+        "ram[0x100u | (native_u8)(sp - 2u)] = "
+        "    (native_u8)(status | FLAG_B | FLAG_U);",
+        "ea = (native_u16)(ram[0x28u] | "
+        "    ((native_u16)ram[0x29u] << 8));",
+    ]
+    if target == 0xDAAA:
+        result.extend([
+            "ea = (native_u16)(ea - 1u);",
+            "ram[0x28u] = (native_u8)ea;",
+            "ram[0x29u] = (native_u8)(ea >> 8);",
+            "WRITE8(ea, ac);",
+            "ix = ac;",
+            "iy = 0u;",
+        ])
+    else:
+        result.extend([
+            "ea = (native_u16)(ea - 2u);",
+            "ram[0x28u] = (native_u8)ea;",
+            "ram[0x29u] = (native_u8)(ea >> 8);",
+            "iy = 0u;",
+            "ac = ram[0x20u];",
+            "WRITE8(ea, ac);",
+            "iy = 1u;",
+            "ac = ram[0x21u];",
+            "WRITE8((native_u16)(ea + 1u), ac);",
+        ])
+    result.extend([
+        "status = (native_u8)(status | FLAG_B | FLAG_U);",
+        f"CYCLES({call_cycles}u);",
+        f"native_instruction_count += {runtime_instructions}u;",
+        f"pc = 0x{next_pc:04x}u;",
+        native_direct_transfer(f"0x{next_pc:04x}u", direct_targets),
+    ])
+    return result
+
+
 def render_module_source(
     module_index: int,
     blocks: list[tuple[int, tuple[int, ...]]],
@@ -434,6 +784,7 @@ def render_module_source(
     skip_hle_entries: bool = True,
     defer_dispatch_entries: bool = False,
     module_key: int = 0,
+    decoder=None,
 ) -> tuple[str, str]:
     symbol = f"s6502_native_module_{module_index:02d}"
     section = f".text.{symbol}"
@@ -545,6 +896,7 @@ def render_module_source(
         "        pages, page_kind, (native_u16)(address + 1u)) << 8));",
         "}",
         native_macro_source(),
+        SEMANTIC_EMULATOR_MACROS,
         f'__attribute__((used, noinline, section("{section}")))',
         f"native_u32 {symbol}(s6502_iram_asm_context_t *context) {{",
         "    native_u32 executed = 0u;",
@@ -597,7 +949,10 @@ def render_module_source(
                 f"duplicate virtual PC 0x{virtual:04x} in native module"
             )
         seen.add(virtual)
-        emitted, requires_binary = decode_record(signature, record)
+        emitted, requires_binary = (
+            decoder(signature, record)
+            if decoder is not None else decode_record(signature, record)
+        )
         decoded_blocks.append((virtual, record, emitted, requires_binary))
 
     for virtual, _record, _emitted, _requires_binary in decoded_blocks:
@@ -620,11 +975,20 @@ def render_module_source(
         out.append(f"    native_instruction_count += {record[4]}u;")
         if virtual == 0x7C30:
             out.append("    ++native_7c30_entries;")
-        direct_tail = emit_native_control_tail(emitted[-1], seen)
-        body = emitted[:-1] if direct_tail is not None else emitted
+        runtime_lift_tail = emit_compiler_runtime_lift_tail(
+            emitted[-1], seen
+        )
+        direct_tail = None if runtime_lift_tail is not None else \
+            emit_native_control_tail(emitted[-1], seen)
+        body = emitted[:-1] if (
+            runtime_lift_tail is not None or direct_tail is not None
+        ) else emitted
         for line in body:
             out.append(f"    {line}")
-        if direct_tail is not None:
+        if runtime_lift_tail is not None:
+            for line in runtime_lift_tail:
+                out.append(f"    {line}")
+        elif direct_tail is not None:
             for line in direct_tail:
                 out.append(f"    {line}")
         out.append("    NATIVE_MISS();")
@@ -714,6 +1078,7 @@ def compile_modules(
             source_text, section = render_module_source(
                 module_index, blocks, signature, skip_hle_entries,
                 defer_dispatch_entries, module_key,
+                semantic_decode_record if module_flags & MODULE_GAME else None,
             )
             source = temporary / f"native_{module_index:02d}.c"
             object_path = temporary / f"native_{module_index:02d}.o"

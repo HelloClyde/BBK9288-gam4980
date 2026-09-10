@@ -187,7 +187,10 @@ def compile_app(
     external_exec: bool,
     bare_session: bool,
     dynamic_native_all: bool,
+    firmware_native_rom: Path | None,
     native_game: Path | None,
+    static_native_game: Path | None,
+    static_native_budget: int,
     rebuild: bool,
 ) -> bytes:
     clang = find_tool(toolchain, "clang")
@@ -195,10 +198,16 @@ def compile_app(
     objdump = find_tool(toolchain, "llvm-objdump")
     readelf = find_tool(toolchain, "llvm-readelf")
     generated_include = BUILD_ROOT / "sdk-include"
+    generated_native = BUILD_ROOT / "static-native"
     prepare_sdk_headers(sdk, generated_include)
 
     objects: list[Path] = []
+    analysis_id = hashlib.sha256()
+    for source in sorted(SOURCE_ROOT.glob('s6502*.h')):
+        analysis_id.update(source.read_bytes())
+    analysis_id.update((SOURCE_ROOT / 'gam4980_core.c').read_bytes())
     common_flags = [
+        f"-DGAM4980_ANALYSIS_BUILD_ID=0x{analysis_id.hexdigest()[:8]}u",
         "--target=s1c33-none-elf",
         f"-O{optimization}",
         "-ffreestanding",
@@ -224,6 +233,7 @@ def compile_app(
         "-I",
         str(SOURCE_ROOT),
     ]
+    static_native_objects: list[Path] = []
     if switch_dispatch:
         common_flags.append("-DS6502_NO_COMPUTED_GOTO")
     if enable_aot:
@@ -261,7 +271,7 @@ def compile_app(
         # generic interpreter.  The legacy shadow-superinstruction probe is
         # still built separately without this define, while pageable native
         # modules retain their own explicitly requested bridge.
-        if not dynamic_native_all:
+        if not dynamic_native_all or firmware_native_rom is not None:
             common_flags.append("-DGAM4980_IRAM_V2")
     if dynamic_native_all:
         if not iram_exec_asm:
@@ -269,6 +279,22 @@ def compile_app(
                 "--dynamic-native-all requires the S1C33 IRAM ASM engine"
             )
         common_flags.append("-DGAM4980_DYNAMIC_NATIVE_ALL")
+    if firmware_native_rom is not None:
+        common_flags.append("-DGAM4980_AUTHORED_FIRMWARE")
+        common_flags.append("-DGAM4980_NATIVE_GRAPHICS_ONLY")
+    if static_native_game is not None:
+        if not iram_exec_asm:
+            raise SystemExit(
+                "--static-native-game requires the S1C33 IRAM ASM engine"
+            )
+        common_flags.extend(
+            [
+                "-DGAM4980_STATIC_NATIVE_GAME",
+                "-DGAM4980_IRAM_STATIC_COMPACT",
+                "-I",
+                str(generated_native),
+            ]
+        )
     if external_exec:
         if not iram_exec_engine or not bare_session:
             raise SystemExit(
@@ -314,6 +340,34 @@ def compile_app(
         common_flags.append("-DGAM4980_LOAD_DIAGNOSTICS")
     if memory_diagnostics:
         common_flags.append("-DGAM4980_MEMORY_DIAGNOSTICS")
+    if static_native_game is not None:
+        run(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "tools" / "compile_static_native_game.py"),
+                "--clang",
+                clang,
+                "--objcopy",
+                objcopy,
+                "--include-dir",
+                str(SOURCE_ROOT),
+                "--game",
+                str(static_native_game),
+                "--output-dir",
+                str(generated_native),
+                "--optimization",
+                "z",
+                "--max-native-bytes",
+                hex(static_native_budget),
+            ],
+            "compile game-specific static native modules",
+        )
+        static_native_objects = sorted(
+            generated_native.glob("static_native_[0-9][0-9][0-9].o")
+        )
+        if not static_native_objects:
+            raise SystemExit("static native compiler generated no objects")
+
     # Header contents, rather than mtimes, are part of the object cache key.
     # This deliberately includes generated AOT headers: changing either BIN's
     # offline translation invalidates the core object, while changing only the
@@ -321,6 +375,8 @@ def compile_app(
     dependencies = sorted(SOURCE_ROOT.rglob("*.h"))
     dependencies.extend(sorted(SOURCE_ROOT.rglob("*.inc")))
     dependencies.extend(sorted(generated_include.rglob("*.h")))
+    if static_native_game is not None:
+        dependencies.extend(sorted(generated_native.glob("*.h")))
     compile_units = [
         (SOURCE_ROOT / "gam4980_9288_start.c", []),
         (SOURCE_ROOT / "gam4980_9288_runtime.c", []),
@@ -333,6 +389,10 @@ def compile_app(
     ]
     if iram_exec_asm:
         compile_units.append((SOURCE_ROOT / "s6502_iram_asm.S", []))
+    if static_native_game is not None:
+        compile_units.append(
+            (generated_native / "gam4980_static_native_registry.c", [])
+        )
     for source, unit_flags in compile_units:
         if not source.is_file():
             raise SystemExit(f"missing source: {source}")
@@ -347,8 +407,16 @@ def compile_app(
             rebuild,
         )
         objects.append(output)
+    objects.extend(static_native_objects)
 
-    if dynamic_native_all:
+    if firmware_native_rom is not None:
+        run([
+            sys.executable, str(PROJECT_ROOT / "tools" / "build_firmware_native.py"),
+            "--toolchain", str(toolchain), "--rom", str(firmware_native_rom),
+            "--output", str(BUILD_ROOT / "GAM4980.NAT"),
+            *(["--compiled-registers"] if iram_exec_engine else []),
+        ], "build authored firmware modules")
+    elif dynamic_native_all:
         run(
             [
                 sys.executable,
@@ -501,7 +569,7 @@ def compile_app(
                     "--allow-indirect-call-register",
                     "r13",
                     "--expected-indirect-calls",
-                    "1" if dynamic_native_all else "0",
+                    "2" if (dynamic_native_all or static_native_game is not None) else "0",
                 ]
             )
         run(audit_command, "audit 9288 IRAM execution engine")
@@ -584,17 +652,21 @@ def read_icon(path: Path, width: int, height: int) -> bytes:
     return data
 
 
-def pack_kf2(payload: bytes) -> bytes:
+def pack_kf2(payload: bytes, *, app_name: bytes = APP_NAME,
+             icon_root: Path | None = None) -> bytes:
     if len(payload) > APP_MAX_PAYLOAD_SIZE:
         raise SystemExit(
             "9288 KF2 payload is too large for the application RAM window: "
             f"{len(payload)} bytes, maximum {APP_MAX_PAYLOAD_SIZE}"
         )
-    icon1 = read_icon(ICON_ROOT / "ico1.bin", 40, 40)
-    icon2 = read_icon(ICON_ROOT / "ico2.bin", 16, 16)
+    if not app_name or len(app_name) > 15 or b"\0" in app_name:
+        raise ValueError("KF2 name must contain 1-15 bytes and no embedded NUL")
+    icon_root = ICON_ROOT if icon_root is None else icon_root
+    icon1 = read_icon(icon_root / "ico1.bin", 40, 40)
+    icon2 = read_icon(icon_root / "ico2.bin", 16, 16)
     code_offset = HEADER_SIZE + len(icon1) + len(icon2)
     total_size = code_offset + len(payload)
-    name = APP_NAME.ljust(16, b"\0")
+    name = app_name.ljust(16, b"\0")
     header = struct.pack(
         "<IIHH16sIIIII",
         MAGIC0,
@@ -647,6 +719,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the standalone BBK 9288 gam4980 port"
     )
+    parser.add_argument("--build-dir", type=Path,
+                        help="intermediate output directory (may be on another drive)")
     parser.add_argument(
         "--sdk",
         type=Path,
@@ -801,6 +875,10 @@ def parse_args() -> argparse.Namespace:
         help="ignore the content-addressed object cache and rebuild every unit",
     )
     parser.add_argument(
+        "--firmware-native-rom", type=Path,
+        help="development only: build authored firmware NAT from this E.BIN; incomplete coverage",
+    )
+    parser.add_argument(
         "--dynamic-native-all",
         action="store_true",
         help=(
@@ -817,17 +895,45 @@ def parse_args() -> argparse.Namespace:
             "to a same-name .GNA sidecar"
         ),
     )
+    parser.add_argument(
+        "--static-native-game",
+        type=Path,
+        help=(
+            "PC-recompile the initial working set of this GAM to S1C33 ELF "
+            "objects and link them directly into a game-specific KF2"
+        ),
+    )
+    parser.add_argument(
+        "--static-native-budget",
+        type=lambda value: int(value, 0),
+        default=0x50000,
+        help=(
+            "maximum generated S1C33 code bytes linked into a game-specific "
+            "KF2 (default: 0x50000)"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global BUILD_ROOT
     args = parse_args()
+    if args.build_dir is not None:
+        BUILD_ROOT = args.build_dir.resolve()
+    if args.firmware_native_rom is not None:
+        if args.native_game is not None or args.static_native_game is not None:
+            raise SystemExit("authored firmware package cannot be mixed with game AOT")
+        args.dynamic_native_all = True
     if args.iram_exec_asm is not None and not args.iram_exec_engine:
         raise SystemExit(
             "--iram-exec-asm/--iram-exec-c require --iram-exec-engine"
         )
     if args.native_game is not None and not args.dynamic_native_all:
         raise SystemExit("--native-game requires --dynamic-native-all")
+    if args.static_native_game is not None and args.reuse_payload_from is not None:
+        raise SystemExit("--static-native-game cannot reuse an existing payload")
+    if args.static_native_budget <= 0:
+        raise SystemExit("--static-native-budget must be positive")
     sdk = args.sdk.resolve()
     output = args.output.resolve()
     BUILD_ROOT.mkdir(parents=True, exist_ok=True)
@@ -860,10 +966,16 @@ def main() -> None:
             external_exec=args.external_exec,
             bare_session=args.bare_session,
             dynamic_native_all=args.dynamic_native_all,
+            firmware_native_rom=args.firmware_native_rom,
             native_game=(
                 args.native_game.resolve()
                 if args.native_game is not None else None
             ),
+            static_native_game=(
+                args.static_native_game.resolve()
+                if args.static_native_game is not None else None
+            ),
+            static_native_budget=args.static_native_budget,
             rebuild=args.rebuild,
         )
     app = pack_kf2(payload)

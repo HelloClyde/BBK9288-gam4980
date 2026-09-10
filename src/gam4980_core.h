@@ -3,6 +3,17 @@
 
 #include "gam4980_types.h"
 
+/* Optional startup-only persistent semantic index; never called in bare mode. */
+typedef int (*gam4980_analysis_io_fn)(int write, u32 offset, void *data, u32 size);
+void gam4980_set_analysis_io(gam4980_analysis_io_fn io);
+u32 gam4980_analysis_cache_status(void); /* 0 unused, 1 rebuilt, 2 hit, 3 saved */
+
+/* Legacy instruction-expanded firmware blocks and interpreted game traces.
+ * Keep semantic fusion/HLE independent; opt in only for regression builds. */
+#ifndef GAM4980_ENABLE_LEGACY_INSTRUCTION_AOT
+#define GAM4980_ENABLE_LEGACY_INSTRUCTION_AOT 0
+#endif
+
 #define GAM4980_LCD_WIDTH 159
 #define GAM4980_LCD_HEIGHT 96
 #define GAM4980_LCD_STRIDE (GAM4980_LCD_WIDTH + 1)
@@ -24,6 +35,22 @@
     (GAM4980_BARE_ROM_CACHE_LINES * 0x1000u)
 #define GAM4980_NATIVE_CODE_ARENA_SIZE 0x40000u
 #define GAM4980_ROM_MISS_TRACE_CAPACITY 19u
+
+/* Host display ownership supplied only for a live bare session. NAT graphics
+ * retains guest RAM semantics when framebuffer is zero (GUI/testing). */
+void gam4980_native_graphics_set_display(u32 framebuffer, u32 lut, u32 clock);
+int gam4980_native_graphics_row_synced(u32 y, const u8 *row);
+void gam4980_native_graphics_row_presented(u32 y, const u8 *row);
+void gam4980_native_graphics_reset_metrics(void);
+u32 gam4980_native_graphics_metric(u32 index);
+u32 gam4980_native_public_metric(u32 index);
+void gam4980_native_graphics_invalidate_sync(void);
+u32 gam4980_native_graphics_profile(u32 text, u32 metric);
+u32 gam4980_host_profile_metric(u32 phase, u32 calls);
+u32 gam4980_native_register_calls(void);
+u32 gam4980_native_bank_metric(u32 index);
+u32 gam4980_native_register_functions(void);
+u32 gam4980_native_function_profile(u32 index, u32 metric);
 
 enum gam4980_rom_miss_kind {
     GAM4980_ROM_MISS_MAPPED_BANK = 1,
@@ -149,6 +176,11 @@ typedef struct gam4980_buffers {
     u32 rom_cache_size;
     u8 *native_code;
     u32 native_code_size;
+    /* Optional demand allocator. FUNCTION NAT never reserves a code arena.
+     * free returns zero if the host could not safely release the allocation. */
+    u8 *(*native_alloc)(void *context, u32 size);
+    int (*native_free)(void *context, u8 *allocation);
+    void *native_alloc_context;
 } gam4980_buffers_t;
 
 int gam4980_init(const gam4980_buffers_t *buffers);
@@ -167,6 +199,8 @@ void gam4980_step_frame(void);
 int gam4980_render_frame(void);
 void gam4980_run_frame(void);
 int gam4980_cpu_halted(void);
+const u8 *gam4980_take_completed_picture(void);
+int gam4980_picture_active(void);
 const u8 *gam4980_packed_frame(void);
 u32 gam4980_changed_row_mask(u32 word);
 const u16 *gam4980_expand_frame(const u8 *packed_frame);
@@ -183,6 +217,10 @@ int gam4980_warm_bare_rom_cache(void);
 uint32_t gam4980_rom_cache_lines(void);
 uint32_t gam4980_rom_cache_warm_pages(void);
 uint32_t gam4980_rom_cache_runtime_misses(void);
+uint32_t gam4980_rom_cache_index_bytes(void);
+uint32_t gam4980_rom_cache_index_lookups(void);
+uint32_t gam4980_rom_cache_index_hits(void);
+uint32_t gam4980_rom_cache_index_misses(void);
 uint32_t gam4980_rom_miss_trace_count(void);
 uint32_t gam4980_rom_miss_trace_dropped(void);
 uint32_t gam4980_rom_miss_trace_kind(uint32_t index);
@@ -213,6 +251,15 @@ u32 gam4980_native_module_transition_to(u32 rank);
 u32 gam4980_native_module_transition_hits(u32 rank);
 u32 gam4980_native_module_transition_error(u32 rank);
 u32 gam4980_native_module_arena_size(void);
+u32 gam4980_native_module_function_mode(void);
+u32 gam4980_native_module_full_rebuilds(void);
+u32 gam4980_native_module_bank_refreshes(void);
+u32 gam4980_native_module_bank_nochanges(void);
+u32 gam4980_native_module_function_bank_fastpaths(void);
+u32 gam4980_native_module_rebuild_module_visits(void);
+u32 gam4980_native_module_resident_bytes(void);
+u32 gam4980_native_module_manifest_bytes(void);
+u32 gam4980_native_module_code_limit(void);
 u32 gam4980_native_module_slot_size(void);
 u32 gam4980_native_module_resident_count(void);
 u32 gam4980_native_module_alloc_units_used(void);
@@ -221,6 +268,13 @@ u32 gam4980_native_module_format(void);
 u32 gam4980_native_module_game_bound(void);
 u32 gam4980_native_module_game_blocks(void);
 u32 gam4980_native_module_game_bytes(void);
+u32 gam4980_static_native_compiled(void);
+u32 gam4980_static_native_bound(void);
+u32 gam4980_static_native_modules(void);
+u32 gam4980_static_native_blocks(void);
+u32 gam4980_static_native_guest_bytes(void);
+u32 gam4980_static_native_code_bytes(void);
+u32 gam4980_static_native_invalidations(void);
 #ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
 #define GAM4980_IRAM_BURST_BUCKET_COUNT 6u
 #define GAM4980_IRAM_EXIT_HOTSPOT_CAPACITY 16u
@@ -319,6 +373,7 @@ u32 gam4980_debug_cpu_pc(void);
 u32 gam4980_debug_cpu_regs(void);
 u32 gam4980_debug_cpu_status(void);
 u32 gam4980_debug_read8(u32 address);
+u32 gam4980_debug_bank(u32 slot);
 #endif
 #endif
 #ifdef GAM4980_ENABLE_FIRMWARE_HLE
@@ -328,8 +383,12 @@ u32 gam4980_firmware_hle_hits(void);
 u64 gam4980_firmware_hle_guest_cycles(void);
 u32 gam4980_resource_span_cache_hits(void);
 u32 gam4980_resource_span_cache_misses(void);
+u32 gam4980_hle_function_profile(u32 index, u32 metric);
+u32 gam4980_hle_fusion_metric(u32 id);
 u32 gam4980_firmware_hle_path_count(void);
 u16 gam4980_firmware_hle_path_pc(u32 path_id);
+u32 gam4980_bank_query_hits(void);
+u32 gam4980_bank_query_cycles(void);
 u32 gam4980_firmware_hle_path_attempts(u32 path_id);
 u32 gam4980_firmware_hle_path_hits(u32 path_id);
 u32 gam4980_firmware_hle_path_condition_rejects(u32 path_id);
@@ -359,6 +418,10 @@ u32 gam4980_game_aot_linked_call_count(void);
 u32 gam4980_game_aot_direct_link_hits(void);
 u32 gam4980_game_aot_linear_link_count(void);
 u32 gam4980_game_aot_linear_link_hits(void);
+u32 gam4980_game_aot_runtime_lift_hits(void);
+u32 gam4980_game_aot_trace_entry_count(void);
+u32 gam4980_game_aot_trace_hits(void);
+u32 gam4980_game_aot_trace_instruction_hits(void);
 u32 gam4980_game_aot_direct_link_stage_hits(u32 stage);
 u32 gam4980_game_aot_reachable_count(void);
 u32 gam4980_game_aot_code_size(void);

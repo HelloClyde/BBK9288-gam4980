@@ -1,5 +1,6 @@
 #include "Dsys.h"
 #include "gam4980_core.h"
+#include "gam4980_present_policy.h"
 #include "gam4980_9288_bare.h"
 #include "gam4980_9288_iram.h"
 
@@ -12,6 +13,8 @@
     __attribute__((aligned(4), section(".scratch")))
 
 #define APP_TITLE "GAM4980"
+static u8 g_presented_packed[1920];
+static u32 g_present_boundary_counts[5];
 #define GAM_SCREEN_WIDTH 320
 #define GAM_SCREEN_HEIGHT 240
 #define SCREEN_PITCH_BYTES 80
@@ -297,6 +300,9 @@ typedef struct T_GAM4980_PerformanceMetrics {
     u32 batch_guest_cycle_samples;
     u32 render_updates;
     u32 screen_submissions;
+    u32 framebuffer_direct_rows;
+    u32 framebuffer_direct_bytes;
+    u32 framebuffer_direct_full_refreshes;
     u32 timer_delta_min_ticks;
     u32 timer_delta_max_ticks;
     u32 timer_delta_under_10;
@@ -335,6 +341,9 @@ typedef struct T_GAM4980_PerformanceMetrics {
     u32 bare_render_max_ticks;
     u32 bare_present_ticks;
     u32 bare_present_max_ticks;
+    u32 bare_scanout_ticks;
+    u32 bare_present_metadata_ticks;
+    u32 bare_batch_host_yields;
     u32 bare_direct_fs_ticks;
     u32 bare_exit_reason;
     u32 bare_restore_ok;
@@ -692,6 +701,44 @@ static void release_buffers(void)
     memset(&g_buffers, 0, sizeof(g_buffers));
 }
 
+static u8 *allocate_native_memory(void *context, u32 size)
+{
+    int suspended = 0;
+    u8 *allocation;
+
+    (void)context;
+    if (gam4980_9288_bare_active()) {
+        if (!gam4980_9288_bare_suspend_for_sdk())
+            return 0;
+        suspended = 1;
+    }
+    allocation = (u8 *)malloc(size);
+    if (suspended && !gam4980_9288_bare_resume_after_sdk()) {
+        if (allocation)
+            free(allocation);
+        return 0;
+    }
+    return allocation;
+}
+
+static int free_native_memory(void *context, u8 *allocation)
+{
+    int suspended = 0;
+
+    (void)context;
+    if (!allocation)
+        return 1;
+    if (gam4980_9288_bare_active()) {
+        if (!gam4980_9288_bare_suspend_for_sdk())
+            return 0;
+        suspended = 1;
+    }
+    free(allocation);
+    if (suspended)
+        (void)gam4980_9288_bare_resume_after_sdk();
+    return 1;
+}
+
 static int allocate_buffers(u32 game_size)
 {
     u32 flash_size;
@@ -708,11 +755,6 @@ static int allocate_buffers(u32 game_size)
     if (GAM4980_BARE_ROM_CACHE_SIZE > 0xffffffffu - allocation_size)
         return 0;
     allocation_size += GAM4980_BARE_ROM_CACHE_SIZE;
-#ifdef GAM4980_DYNAMIC_NATIVE_ALL
-    if (GAM4980_NATIVE_CODE_ARENA_SIZE > 0xffffffffu - allocation_size)
-        return 0;
-    allocation_size += GAM4980_NATIVE_CODE_ARENA_SIZE;
-#endif
 #endif
     allocation = (u8 *)malloc(allocation_size);
     if (!allocation)
@@ -724,14 +766,6 @@ static int allocate_buffers(u32 game_size)
 #ifdef GAM4980_ENABLE_BARE_SESSION
     g_buffers.rom_cache = allocation + flash_size;
     g_buffers.rom_cache_size = GAM4980_BARE_ROM_CACHE_SIZE;
-#ifdef GAM4980_DYNAMIC_NATIVE_ALL
-    g_buffers.native_code = g_buffers.rom_cache +
-        GAM4980_BARE_ROM_CACHE_SIZE;
-    g_buffers.native_code_size = GAM4980_NATIVE_CODE_ARENA_SIZE;
-#else
-    g_buffers.native_code = 0;
-    g_buffers.native_code_size = 0u;
-#endif
 #else
     g_buffers.rom_cache = 0;
     g_buffers.rom_cache_size = 0u;
@@ -741,6 +775,9 @@ static int allocate_buffers(u32 game_size)
     g_buffers.framebuffer = 0;
     g_buffers.rom_read = read_rom_bank;
     g_buffers.rom_context = 0;
+    g_buffers.native_alloc = allocate_native_memory;
+    g_buffers.native_free = free_native_memory;
+    g_buffers.native_alloc_context = 0;
     return 1;
 }
 
@@ -1993,6 +2030,22 @@ static void performance_log_aot_blocks(FS_FILE *file)
         file, "game_aot_semantic_entries", gam4980_game_aot_semantic_count()
     );
     performance_log_u32(
+        file, "game_aot_semantic_add16_imm_generic_hits",
+        gam4980_game_aot_semantic_hits(14u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_sub16_imm_generic_hits",
+        gam4980_game_aot_semantic_hits(15u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_add16_preserve_generic_hits",
+        gam4980_game_aot_semantic_hits(16u)
+    );
+    performance_log_u32(
+        file, "game_aot_semantic_sub16_preserve_generic_hits",
+        gam4980_game_aot_semantic_hits(17u)
+    );
+    performance_log_u32(
         file, "game_aot_reachable_entries", gam4980_game_aot_reachable_count()
     );
     performance_log_u32(
@@ -2009,6 +2062,21 @@ static void performance_log_aot_blocks(FS_FILE *file)
     performance_log_u32(
         file, "game_aot_linear_link_hits",
         gam4980_game_aot_linear_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_runtime_lift_hits",
+        gam4980_game_aot_runtime_lift_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_entries",
+        gam4980_game_aot_trace_entry_count()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_hits", gam4980_game_aot_trace_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_instruction_hits",
+        gam4980_game_aot_trace_instruction_hits()
     );
     performance_log_u32(
         file, "game_aot_code_size", gam4980_game_aot_code_size()
@@ -2166,6 +2234,8 @@ static void write_performance_log(void)
         file, "expected_guest_hz", g_setting_double_speed ? 120u : 60u
     );
     performance_log_u32(file, "debug", 1u);
+    performance_log_u32(file, "legacy_instruction_aot_enabled",
+        GAM4980_ENABLE_LEGACY_INSTRUCTION_AOT ? 1u : 0u);
 #ifdef GAM4980_ENABLE_IRAM_HOT_CORE
     performance_log_u32(file, "iram_hot_core_enabled", 1u);
     performance_log_u32(
@@ -2317,6 +2387,30 @@ static void write_performance_log(void)
         gam4980_native_module_game_bytes()
     );
     performance_log_u32(
+        file, "static_native_compiled", gam4980_static_native_compiled()
+    );
+    performance_log_u32(
+        file, "static_native_bound", gam4980_static_native_bound()
+    );
+    performance_log_u32(
+        file, "static_native_modules", gam4980_static_native_modules()
+    );
+    performance_log_u32(
+        file, "static_native_blocks", gam4980_static_native_blocks()
+    );
+    performance_log_u32(
+        file, "static_native_guest_bytes",
+        gam4980_static_native_guest_bytes()
+    );
+    performance_log_u32(
+        file, "static_native_code_bytes",
+        gam4980_static_native_code_bytes()
+    );
+    performance_log_u32(
+        file, "static_native_invalidations",
+        gam4980_static_native_invalidations()
+    );
+    performance_log_u32(
         file, "native_module_match_count",
         gam4980_native_module_match_count()
     );
@@ -2364,6 +2458,25 @@ static void write_performance_log(void)
         file, "native_module_arena_size",
         gam4980_native_module_arena_size()
     );
+    performance_log_u32(file, "native_module_function_mode",
+        gam4980_native_module_function_mode());
+    performance_log_u32(file, "native_bank_dispatch_version", 2u);
+    performance_log_u32(file, "native_module_full_rebuilds",
+        gam4980_native_module_full_rebuilds());
+    performance_log_u32(file, "native_module_bank_refreshes",
+        gam4980_native_module_bank_refreshes());
+    performance_log_u32(file, "native_module_bank_nochanges",
+        gam4980_native_module_bank_nochanges());
+    performance_log_u32(file, "native_module_function_bank_fastpaths",
+        gam4980_native_module_function_bank_fastpaths());
+    performance_log_u32(file, "native_module_rebuild_module_visits",
+        gam4980_native_module_rebuild_module_visits());
+    performance_log_u32(file, "native_module_manifest_bytes",
+        gam4980_native_module_manifest_bytes());
+    performance_log_u32(file, "native_module_resident_code_bytes",
+        gam4980_native_module_resident_bytes());
+    performance_log_u32(file, "native_module_code_limit",
+        gam4980_native_module_code_limit());
     performance_log_u32(
         file, "native_module_slot_size", gam4980_native_module_slot_size()
     );
@@ -2497,6 +2610,15 @@ static void write_performance_log(void)
     performance_log_u32(file, "rom_cache_runtime_misses", 0u);
 #endif
     performance_log_rom_miss_trace(file);
+    performance_log_u32(file, "rom_cache_index_version", 1u);
+    performance_log_u32(file, "rom_cache_index_bytes",
+        gam4980_rom_cache_index_bytes());
+    performance_log_u32(file, "rom_cache_index_lookups",
+        gam4980_rom_cache_index_lookups());
+    performance_log_u32(file, "rom_cache_index_hits",
+        gam4980_rom_cache_index_hits());
+    performance_log_u32(file, "rom_cache_index_misses",
+        gam4980_rom_cache_index_misses());
     performance_log_u32(
         file, "bare_session_started", g_performance.bare_session_started
     );
@@ -2550,6 +2672,125 @@ static void write_performance_log(void)
     performance_log_u32(
         file, "bare_present_max_ticks",
         g_performance.bare_present_max_ticks
+    );
+    performance_log_u32(file, "framebuffer_direct_version", 2u);
+    performance_log_u32(file, "framebuffer_full_submit", 1u);
+    performance_log_u32(file, "framebuffer_submit_optimized_version", 1u);
+    performance_log_u32(file, "bare_scanout_ticks", g_performance.bare_scanout_ticks);
+    performance_log_u32(file, "bare_present_metadata_ticks", g_performance.bare_present_metadata_ticks);
+    performance_log_u32(file, "bare_batch_host_yields", g_performance.bare_batch_host_yields);
+    performance_log_u32(file, "native_graphics_direct_mirror", 0u);
+    performance_log_u32(file, "presentation_boundary_version", 1u);
+    performance_log_u32(file, "presentation_picture_commits", g_present_boundary_counts[1]);
+    performance_log_u32(file, "presentation_wait_commits", g_present_boundary_counts[2]);
+    performance_log_u32(file, "presentation_quiet_commits", g_present_boundary_counts[3]);
+    performance_log_u32(file, "presentation_timeout_commits", g_present_boundary_counts[4]);
+    performance_log_u32(file, "load_analysis_cache_status", gam4980_analysis_cache_status());
+    performance_log_u32(file, "host_profile_sample_stride", 16u);
+    performance_log_u32(file, "host_profile_samples", gam4980_host_profile_metric(11u, 0u));
+    performance_log_u32(file, "host_profile_clock_reads", gam4980_host_profile_metric(11u, 1u));
+    performance_log_u32(file, "host_exclusive_core_ticks", gam4980_host_profile_metric(1u, 0u));
+    performance_log_u32(file, "host_exclusive_iram_ticks", gam4980_host_profile_metric(2u, 0u));
+    performance_log_u32(file, "host_exclusive_native_ticks", gam4980_host_profile_metric(3u, 0u));
+    performance_log_u32(file, "host_exclusive_graphics_ticks", gam4980_host_profile_metric(4u, 0u));
+    performance_log_u32(file, "host_exclusive_text_ticks", gam4980_host_profile_metric(5u, 0u));
+    performance_log_u32(file, "host_exclusive_fastchain_ticks", gam4980_host_profile_metric(6u, 0u));
+    performance_log_u32(file, "host_exclusive_io_ticks", gam4980_host_profile_metric(7u, 0u));
+    performance_log_u32(file, "host_exclusive_hle_ticks", gam4980_host_profile_metric(9u, 0u));
+    performance_log_u32(file, "host_exclusive_semantic_ticks", gam4980_host_profile_metric(10u, 0u));
+    {
+        u32 id;
+        performance_log_u32(file, "hle_function_profile_version", 2u);
+        performance_log_u32(file, "hle_fusion_version", 3u);
+        performance_log_u32(file, "hle_fusion_counts_sampled", 1u);
+        performance_log_u32(file, "hle_counter_chain_hits", gam4980_hle_fusion_metric(0u));
+        performance_log_u32(file, "hle_bitmap_packed_groups", gam4980_hle_fusion_metric(1u));
+        performance_log_u32(file, "hle_counter_folded_rounds", gam4980_hle_fusion_metric(2u));
+        for (id = 0u; id < 32u; ++id) {
+            if (!gam4980_hle_function_profile(id, 0u) && !gam4980_hle_function_profile(id, 4u)) continue;
+            performance_log_u32(file, "hle_sample_id", id);
+            performance_log_u32(file, "hle_sample_pc", gam4980_firmware_hle_path_pc(id));
+            performance_log_u32(file, "hle_sample_attempts", gam4980_hle_function_profile(id, 0u));
+            performance_log_u32(file, "hle_sample_completed_segments", gam4980_hle_function_profile(id, 1u));
+            performance_log_u32(file, "hle_sample_condition_rejects", gam4980_hle_function_profile(id, 2u));
+            performance_log_u32(file, "hle_sample_budget_rejects", gam4980_hle_function_profile(id, 3u));
+            performance_log_u32(file, "hle_sample_exclusive_ticks", gam4980_hle_function_profile(id, 4u));
+        }
+    }
+    performance_log_u32(file, "native_register_calls", gam4980_native_register_calls());
+    performance_log_u32(file, "native_register_functions", gam4980_native_register_functions());
+    performance_log_u32(file, "execution_architecture_version", 6u);
+    performance_log_u32(file, "nat_function_profile_c_bridge_only", 0u);
+    /* Repeated groups identify functions by physical PC; sampled counts only.
+     * No sorting or clock reads are added to the running guest. */
+    {
+        u32 function_index;
+        performance_log_u32(file, "native_function_profile_version", 2u);
+        for (function_index = 0u; function_index < 192u; ++function_index) {
+            if (!gam4980_native_function_profile(function_index, 1u)) continue;
+            performance_log_u32(file, "nat_sample_pc", gam4980_native_function_profile(function_index, 0u));
+            performance_log_u32(file, "nat_sample_attempts", gam4980_native_function_profile(function_index, 1u));
+            performance_log_u32(file, "nat_sample_accepted", gam4980_native_function_profile(function_index, 2u));
+            performance_log_u32(file, "nat_sample_exclusive_ticks", gam4980_native_function_profile(function_index, 3u));
+            performance_log_u32(file, "nat_sample_private_attempts", gam4980_native_function_profile(function_index, 4u));
+            performance_log_u32(file, "nat_sample_private_accepted", gam4980_native_function_profile(function_index, 5u));
+        }
+    }
+    /* These are computational NAT entry attempts, not public API calls.
+     * Their time is included in bare_core_ticks, not bare_present_ticks. */
+    performance_log_u32(file, "native_graphics_version", 4u);
+    performance_log_u32(file, "native_graphics_timing_exclusive", 1u);
+    performance_log_u32(file, "native_graphics_host_tick_hz", 256u);
+    performance_log_u32(file, "native_graphics_timing_sample_stride", 16u);
+    performance_log_u32(file, "native_graphics_host_time_in_core", 1u);
+    performance_log_u32(file, "native_graphics_timing_enabled", g_setting_performance_debug && g_performance.bare_session_started);
+    performance_log_u32(file, "native_graphics_lcd_bytes", gam4980_native_graphics_metric(0));
+    performance_log_u32(file, "native_graphics_mirrored_writes", gam4980_native_graphics_metric(1));
+    performance_log_u32(file, "native_text_rows", gam4980_native_graphics_metric(2));
+    performance_log_u32(file, "native_packed_blit_version", 1u);
+    performance_log_u32(file, "native_packed_graphics_rows", gam4980_native_graphics_metric(3));
+    performance_log_u32(file, "native_public_atomic_version", 1u);
+    performance_log_u32(file, "native_atomic_contracts_version", 1u);
+    performance_log_u32(file, "native_bank_batch_version", 1u);
+    {
+        static const char *const names[12]={"native_bank_batch_attempts","native_bank_batch_accepted",
+            "native_bank_batch_windows","native_d2f6_attempts","native_d2f6_reject_decimal",
+            "native_d2f6_reject_descriptor","native_d2f6_reject_budget","native_d2f6_accepted",
+            "native_d2f6_first_reject_pointer","native_d2f6_last_reject_pointer","native_d2f6_extended_accepted",
+            "native_d2f6_first_extended_pointer"};
+        u32 i;for(i=0;i<12u;++i)performance_log_u32(file,names[i],gam4980_native_bank_metric(i));
+    }
+    performance_log_u32(file, "wall_guest_rate_cycle_equivalent",
+        0u); /* Public drawing and eligible complete NAT contracts use synthetic cycles. */
+    performance_log_u32(file, "native_public_calls", gam4980_native_public_metric(0));
+    performance_log_u32(file, "native_public_picture", gam4980_native_public_metric(1));
+    performance_log_u32(file, "native_public_part_picture", gam4980_native_public_metric(2));
+    performance_log_u32(file, "native_public_ascii", gam4980_native_public_metric(3));
+    performance_log_u32(file, "native_public_chinese", gam4980_native_public_metric(4));
+    performance_log_u32(file, "native_public_host_ticks", gam4980_native_public_metric(5));
+    performance_log_u32(file, "native_public_max_host_ticks", gam4980_native_public_metric(6));
+    performance_log_u32(file, "native_public_fallbacks", gam4980_native_public_metric(7));
+    performance_log_u32(file, "native_graphics_attempts", gam4980_native_graphics_profile(0, 0));
+    performance_log_u32(file, "native_graphics_accepted", gam4980_native_graphics_profile(0, 1));
+    performance_log_u32(file, "native_graphics_host_ticks", gam4980_native_graphics_profile(0, 2));
+    performance_log_u32(file, "native_graphics_max_host_ticks", gam4980_native_graphics_profile(0, 3));
+    performance_log_u32(file, "native_graphics_zero_returns", gam4980_native_graphics_profile(0, 4));
+    performance_log_u32(file, "native_text_attempts", gam4980_native_graphics_profile(1, 0));
+    performance_log_u32(file, "native_text_accepted", gam4980_native_graphics_profile(1, 1));
+    performance_log_u32(file, "native_text_host_ticks", gam4980_native_graphics_profile(1, 2));
+    performance_log_u32(file, "native_text_max_host_ticks", gam4980_native_graphics_profile(1, 3));
+    performance_log_u32(file, "native_text_zero_returns", gam4980_native_graphics_profile(1, 4));
+    performance_log_u32(
+        file, "framebuffer_direct_rows",
+        g_performance.framebuffer_direct_rows
+    );
+    performance_log_u32(
+        file, "framebuffer_direct_bytes",
+        g_performance.framebuffer_direct_bytes
+    );
+    performance_log_u32(
+        file, "framebuffer_direct_full_refreshes",
+        g_performance.framebuffer_direct_full_refreshes
     );
     performance_log_u32(
         file, "bare_direct_fs_calls",
@@ -2696,6 +2937,12 @@ static void write_performance_log(void)
         gam4980_aot_token_link_hits()
     );
     performance_log_u32(
+        file, "firmware_bank_query_hle_hits", gam4980_bank_query_hits()
+    );
+    performance_log_u32(
+        file, "firmware_bank_query_hle_guest_cycles", gam4980_bank_query_cycles()
+    );
+    performance_log_u32(
         file, "native_trace_aot_enabled",
         (u32)gam4980_native_trace_aot_enabled()
     );
@@ -2799,6 +3046,30 @@ static void write_performance_log(void)
         file, "game_aot_semantic_store_oper1_indy16_hits",
         gam4980_game_aot_semantic_hits(13u)
     );
+    performance_log_u32(file, "game_aot_semantic_add16_imm_generic_hits",
+        gam4980_game_aot_semantic_hits(14u));
+    performance_log_u32(file, "game_aot_semantic_sub16_imm_generic_hits",
+        gam4980_game_aot_semantic_hits(15u));
+    performance_log_u32(file, "game_aot_semantic_add16_preserve_generic_hits",
+        gam4980_game_aot_semantic_hits(16u));
+    performance_log_u32(file, "game_aot_semantic_sub16_preserve_generic_hits",
+        gam4980_game_aot_semantic_hits(17u));
+    performance_log_u32(file, "game_aot_semantic_add16_regs_generic_hits",
+        gam4980_game_aot_semantic_hits(18u));
+    performance_log_u32(file, "game_aot_semantic_sub16_regs_generic_hits",
+        gam4980_game_aot_semantic_hits(19u));
+    performance_log_u32(file, "game_aot_semantic_store16_imm_generic_hits",
+        gam4980_game_aot_semantic_hits(20u));
+    performance_log_u32(file, "game_aot_semantic_copy16_generic_hits",
+        gam4980_game_aot_semantic_hits(21u));
+    performance_log_u32(file, "game_aot_semantic_load16_indirect_generic_hits",
+        gam4980_game_aot_semantic_hits(22u));
+    performance_log_u32(file, "game_aot_semantic_store16_indirect_generic_hits",
+        gam4980_game_aot_semantic_hits(23u));
+    performance_log_u32(file, "game_aot_semantic_load_stack8_generic_hits",
+        gam4980_game_aot_semantic_hits(24u));
+    performance_log_u32(file, "game_aot_semantic_store_stack8_generic_hits",
+        gam4980_game_aot_semantic_hits(25u));
     performance_log_u32(
         file, "game_aot_reachable_entries", gam4980_game_aot_reachable_count()
     );
@@ -2816,6 +3087,21 @@ static void write_performance_log(void)
     performance_log_u32(
         file, "game_aot_linear_link_hits",
         gam4980_game_aot_linear_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_runtime_lift_hits",
+        gam4980_game_aot_runtime_lift_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_entries",
+        gam4980_game_aot_trace_entry_count()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_hits", gam4980_game_aot_trace_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_instruction_hits",
+        gam4980_game_aot_trace_instruction_hits()
     );
     performance_log_u32(
         file, "game_aot_code_size", gam4980_game_aot_code_size()
@@ -3061,6 +3347,21 @@ static void write_performance_log(void)
     performance_log_u32(
         file, "game_aot_linear_link_hits",
         gam4980_game_aot_linear_link_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_runtime_lift_hits",
+        gam4980_game_aot_runtime_lift_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_entries",
+        gam4980_game_aot_trace_entry_count()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_hits", gam4980_game_aot_trace_hits()
+    );
+    performance_log_u32(
+        file, "game_aot_trace_instruction_hits",
+        gam4980_game_aot_trace_instruction_hits()
     );
     performance_log_u32(
         file, "game_aot_code_size", gam4980_game_aot_code_size()
@@ -3652,6 +3953,25 @@ static void load_progress_callback(
         draw_loading_stage(status, step, current, total);
 }
 
+static FS_FILE *g_analysis_file;
+static int g_analysis_write;
+static char g_analysis_path[PATH_CAPACITY];
+static int analysis_cache_io(int write, u32 offset, void *data, u32 size)
+{
+    if (g_analysis_file && write != g_analysis_write) {
+        fs_fclose(g_analysis_file);
+        g_analysis_file = 0;
+    }
+    if (!g_analysis_file) {
+        g_analysis_write = write;
+        g_analysis_file = fs_fopen(g_analysis_path, write ? FS_O_WRONLY : FS_O_RDONLY);
+    }
+    if (!g_analysis_file || fs_fseek(g_analysis_file, (long)offset, SEEK_SET) < 0)
+        return 0;
+    return write ? write_exact(g_analysis_file, (const u8 *)data, size) :
+                   read_exact(g_analysis_file, (u8 *)data, size);
+}
+
 static int load_game(const char *path)
 {
     u8 header[GAM4980_GAME_HEADER_SIZE];
@@ -3689,7 +4009,16 @@ static int load_game(const char *path)
     );
     write_load_diagnostic(0x09u, (u32)size, 0u);
     operation_tick = (u32)fnGUI_GetTickCount();
+    g_analysis_file = 0;
+    if (byte_length(path) >= 4u && byte_length(path) + 1u <= sizeof(g_analysis_path) &&
+        path[byte_length(path)-4u] == '.') {
+        copy_path(g_analysis_path, path, sizeof(g_analysis_path));
+        copy_path(g_analysis_path + byte_length(path)-4u, ".GAC", 5u);
+        gam4980_set_analysis_io(analysis_cache_io);
+    }
     header_result = gam4980_load_game_header(header, (u32)size);
+    gam4980_set_analysis_io(0);
+    if (g_analysis_file) { fs_fclose(g_analysis_file); g_analysis_file = 0; }
     g_performance.game_header_ticks = tick_elapsed(
         operation_tick, (u32)fnGUI_GetTickCount()
     );
@@ -3773,23 +4102,73 @@ static void init_screen_expansion(void)
     }
 }
 
-static void expand_2x(const u8 *packed)
+/* Presentation-time dirty-row expansion, not a per-guest-store mirror.  The
+ * caller supplies either the GUI staging surface or the physical LCD.  A
+ * forced reconciliation also restores the white margins after SDK activity.
+ * The result counts physical LCD rows written, including those margins. */
+static u32 expand_2x_to(
+    const u8 *packed, volatile u32 *target, int force_all
+)
 {
     int source_y;
+    u32 written_rows = 0u;
 
-    if (!packed)
-        return;
+    if (!packed || !target)
+        return 0u;
+    if (force_all) {
+        u32 word;
+
+        if(target==(volatile u32 *)(unsigned long)0x003c0000u)
+            gam4980_native_graphics_invalidate_sync();
+
+        /* Do not clear the game rectangle first: expansion overwrites every
+         * word there.  Each full refresh therefore writes exactly 19,200
+         * bytes, with no extra whole-frame staging copy or redundant clear. */
+        for (word = 0u;
+             word < (u32)VIEW_Y * SCREEN_PITCH_BYTES / sizeof(u32);
+             ++word)
+            target[word] = 0xffffffffu;
+        for (word = (u32)(VIEW_Y + GAM4980_LCD_HEIGHT * 2) *
+                    SCREEN_PITCH_BYTES / sizeof(u32);
+             word < SCREEN_FRAME_BYTES / sizeof(u32); ++word)
+            target[word] = 0xffffffffu;
+        written_rows = GAM_SCREEN_HEIGHT - GAM4980_LCD_HEIGHT * 2u;
+        /* Full submissions need no dirty/synchronization cache bookkeeping.
+         * Hoist the last-byte mask and unroll four words per iteration. */
+        for (source_y=0;source_y<GAM4980_LCD_HEIGHT;++source_y) {
+            const u8 *s=packed+source_y*GAM4980_LCD_PACKED_STRIDE;
+            volatile u32 *d=target+(VIEW_Y+source_y*2)*20;
+            u32 carry=1u,value,bits;
+            int i;
+#define FULL_EXPAND_AT(index, mask) do { \
+            value=s[index] & (mask); \
+            bits=g_expand_2x_shifted[carry][value]; \
+            d[index]=bits;d[(index)+20]=bits;carry=(value&1u)^1u; \
+        } while(0)
+            for(i=0;i<16;i+=4) {
+                FULL_EXPAND_AT(i,255u);FULL_EXPAND_AT(i+1,255u);
+                FULL_EXPAND_AT(i+2,255u);FULL_EXPAND_AT(i+3,255u);
+            }
+            FULL_EXPAND_AT(16,255u);FULL_EXPAND_AT(17,255u);
+            FULL_EXPAND_AT(18,255u);FULL_EXPAND_AT(19,254u);
+#undef FULL_EXPAND_AT
+        }
+        return GAM_SCREEN_HEIGHT;
+    }
     for (source_y = 0; source_y < GAM4980_LCD_HEIGHT; ++source_y) {
-        if (!(gam4980_changed_row_mask((u32)source_y >> 5) &
+        if (!force_all &&
+            !(gam4980_changed_row_mask((u32)source_y >> 5) &
               (1u << ((u32)source_y & 31u))))
             continue;
         const u8 *source =
             packed + source_y * GAM4980_LCD_PACKED_STRIDE;
-        u32 *destination_0 = (u32 *)(void *)(
-            g_screen_frame +
-            (u32)(VIEW_Y + source_y * 2) * SCREEN_PITCH_BYTES
-        );
-        u32 *destination_1 = destination_0 + SCREEN_PITCH_BYTES / 4;
+        if (!force_all && target == (volatile u32 *)(unsigned long)0x003c0000u &&
+            gam4980_native_graphics_row_synced((u32)source_y, source))
+            continue;
+        volatile u32 *destination_0 = target +
+            (u32)(VIEW_Y + source_y * 2) * SCREEN_PITCH_BYTES / sizeof(u32);
+        volatile u32 *destination_1 =
+            destination_0 + SCREEN_PITCH_BYTES / sizeof(u32);
         int incoming_white = 1;
         int index;
 
@@ -3809,7 +4188,18 @@ static void expand_2x(const u8 *packed)
             destination_1[index] = expanded;
             incoming_white = (value & 1u) == 0u;
         }
+        if (target == (volatile u32 *)(unsigned long)0x003c0000u)
+            gam4980_native_graphics_row_presented((u32)source_y, source);
+        written_rows += 2u;
     }
+    return written_rows;
+}
+
+static void expand_2x(const u8 *packed)
+{
+    (void)expand_2x_to(
+        packed, (volatile u32 *)(void *)g_screen_frame, 1
+    );
 }
 
 static void present_2x(const u8 *packed)
@@ -3818,12 +4208,28 @@ static void present_2x(const u8 *packed)
     submit_screen_frame();
 }
 
-static void present_2x_bare(const u8 *packed)
+static void present_2x_bare(const u8 *packed, int force_all)
 {
-    expand_2x(packed);
-    gam4980_9288_bare_submit(g_screen_frame, sizeof(g_screen_frame));
-    if (g_setting_performance_debug)
+    /* Match the standalone native player's submission policy: guest RAM is
+     * authoritative; rewrite all rows and margins on every actual submit.
+     * Neither dirty rows nor NAT shadow state proves physical LCD validity. */
+    force_all = 1;
+    u32 written_rows = expand_2x_to(
+        packed, (volatile u32 *)(unsigned long)0x003c0000u, force_all
+    );
+
+    /* The bare session owns the LCD until it yields to the SDK.  Updating
+     * just these dirty rows therefore needs neither g_screen_frame nor the
+     * former complete 0x4b00-byte bare_submit copy.  GUI, Loading and desktop
+     * restoration continue to use their existing independent paths. */
+    if (written_rows && g_setting_performance_debug) {
         ++g_performance.screen_submissions;
+        g_performance.framebuffer_direct_rows += written_rows;
+        g_performance.framebuffer_direct_bytes +=
+            written_rows * SCREEN_PITCH_BYTES;
+        if (force_all)
+            ++g_performance.framebuffer_direct_full_refreshes;
+    }
 }
 
 static u8 map_scancode(T_UHWORD scancode)
@@ -4036,8 +4442,14 @@ static void wait_for_bare_keys_released(void)
     }
 }
 
+static int bare_batch_should_yield(u32 start,u32 now,u32 completed,u32 planned)
+{
+    return completed<planned && (u32)(now-start)>=8u;
+}
+
 static int run_bare_emulator_window(void)
 {
+    gam_present_policy presentation = {0};
     T_GUI_HWND window;
     T_BareInputPollState input;
     u32 start_clock;
@@ -4048,18 +4460,22 @@ static int run_bare_emulator_window(void)
     u32 enter_attempt;
     int entered = 0;
     int completed = 0;
+    int force_full_present = 1;
 
     if (!g_main_window)
         return 0;
     window = g_main_window;
     init_screen_expansion();
+    memset(g_presented_packed, 0, sizeof(g_presented_packed));
+    memset(g_present_boundary_counts, 0, sizeof(g_present_boundary_counts));
     g_close_requested = 0;
 
     /* App_Main has already replaced STARTING GAME with a coherent white frame
      * in both the SDK surface and physical LCD.  Do not submit an
-     * uninitialised guest LCD here; the first actual guest update replaces the
-     * white transition frame.  A few complete prepare/enter retries safely
-     * close the small quiescence race without changing the display. */
+     * uninitialised guest LCD here; the first normal render below fully
+     * reconciles the LCD, including both white margins.  A few complete
+     * prepare/enter retries safely close the small quiescence race without
+     * changing the display. */
     for (enter_attempt = 0u; enter_attempt < 3u; ++enter_attempt) {
         if (!gam4980_9288_bare_prepare())
             break;
@@ -4073,6 +4489,11 @@ static int run_bare_emulator_window(void)
     }
     if (!entered)
         return 0;
+    gam4980_native_graphics_reset_metrics();
+    gam4980_native_graphics_set_display(
+        0u, 0u, /* Guest-memory-only NAT; presenter exclusively owns the LCD. */
+        g_setting_performance_debug ? (u32)(unsigned long)gam4980_9288_bare_clock : 0u
+    );
     performance_begin_session();
 #if defined(GAM4980_ENABLE_IRAM_EXEC_ENGINE) && \
     !defined(GAM4980_FORCE_EXTERNAL_EXEC)
@@ -4121,17 +4542,25 @@ static int run_bare_emulator_window(void)
             continue;
         if (g_setting_performance_debug) {
             ++g_performance.timer_batches;
-            g_performance.guest_frames += frames_this_batch;
         }
         path_start = gam4980_9288_bare_clock();
         for (frame = 0u; frame < frames_this_batch; ++frame) {
             gam4980_step_frame();
+            if (g_setting_performance_debug) ++g_performance.guest_frames;
+            /* Poll only between complete guest frames, never inside an atomic
+             * drawing service. Stop catch-up batching after 8 host ticks. */
+            poll_bare_input(&input);
 #ifdef GAM4980_MEMORY_DIAGNOSTICS
             ++g_gam4980_memory_diagnostic.frames;
 #endif
             if (g_close_requested || gam4980_shutdown_requested() ||
                 !gam4980_9288_bare_active())
                 break;
+            if (frame+1u<frames_this_batch && bare_batch_should_yield(
+                path_start,gam4980_9288_bare_clock(),frame+1u,frames_this_batch)) {
+                ++g_performance.bare_batch_host_yields;
+                break;
+            }
         }
         path_end = gam4980_9288_bare_clock();
         path_ticks = path_end - path_start;
@@ -4158,6 +4587,10 @@ static int run_bare_emulator_window(void)
             last_clock = gam4980_9288_bare_clock();
             last_scan_clock = last_clock;
             input.last_scan_clock = last_clock;
+            /* While the SDK was live it could redraw the physical screen.
+             * Dirty guest rows alone cannot repair that, even when the guest
+             * frame has not changed at all.  Reconcile once after resuming. */
+            force_full_present = 1;
         }
         path_start = path_end;
         frame_changed = gam4980_render_frame();
@@ -4166,25 +4599,67 @@ static int run_bare_emulator_window(void)
         g_performance.bare_render_ticks += path_ticks;
         if (path_ticks > g_performance.bare_render_max_ticks)
             g_performance.bare_render_max_ticks = path_ticks;
-        if (frame_changed) {
-            /* The white transition frame remains visible until guest
-             * execution really changes its LCD.  Clearing this flag before
-             * the first physical submit switches subsequent paints and
-             * metrics to the normal gameplay path. */
+        {
+        const u8 *picture = gam4980_take_completed_picture();
+        u32 reason = gam_present_decide(&presentation, path_end, frame_changed,
+            picture != 0, gam4980_picture_active(), gam4980_cpu_halted());
+        if (frame_changed && g_setting_performance_debug)
+            ++g_performance.render_updates;
+        if (reason || force_full_present) {
+            u32 submit_start;
+            const u8 *display = picture ? picture :
+                reason ? gam4980_packed_frame() : g_presented_packed;
+            /* A recovery submission is host-display work, not a new guest
+             * render update.  Count it as a submission without inflating
+             * render_updates or changing guest/scheduler timing. */
             g_loading_active = 0;
-            if (g_setting_performance_debug)
-                ++g_performance.render_updates;
-            path_start = path_end;
-            present_2x_bare(gam4980_packed_frame());
+            submit_start = gam4980_9288_bare_clock();
+            path_start = submit_start;
+            present_2x_bare(display, force_full_present);
+            {
+                u32 scanout_end=gam4980_9288_bare_clock();
+                g_performance.bare_scanout_ticks+=scanout_end-path_start;
+                /* Keep the same endpoint for adjacent, non-overlapping spans. */
+                path_start=scanout_end;
+            }
+            if (reason) {
+                ++g_present_boundary_counts[reason];
+                memcpy(g_presented_packed, display, sizeof(g_presented_packed));
+                /* A completed full-copy snapshot may precede newer guest
+                 * writes in the same execution batch. Keep those pending. */
+                presentation.pending = 0u;
+                if (picture) {
+                    u32 i;
+                    const u8 *current = gam4980_packed_frame();
+                    for (i=0u; i<sizeof(g_presented_packed); ++i)
+                        if (display[i] != current[i]) {
+                            presentation.pending=1u;
+                            break;
+                        }
+                }
+                if (presentation.pending) {
+                    presentation.first = path_end;
+                    presentation.last_change = path_end;
+                    presentation.quiet = 0u;
+                }
+            }
+            force_full_present = 0;
             path_end = gam4980_9288_bare_clock();
             path_ticks = path_end - path_start;
-            g_performance.bare_present_ticks += path_ticks;
+            g_performance.bare_present_metadata_ticks += path_ticks;
+            /* Total includes scanout and metadata; maximum uses this call's
+             * start, captured separately below. */
+            g_performance.bare_present_ticks = g_performance.bare_scanout_ticks+
+                g_performance.bare_present_metadata_ticks;
+            path_ticks = path_end - submit_start;
             if (path_ticks > g_performance.bare_present_max_ticks)
                 g_performance.bare_present_max_ticks = path_ticks;
+        }
         }
     }
     if (gam4980_shutdown_requested())
         g_performance.bare_exit_reason = BARE_EXIT_GUEST_SHUTDOWN;
+    gam4980_native_graphics_set_display(0u, 0u, 0u);
     gam4980_set_runtime_poll_callback(0, 0, 0u);
     if (gam4980_9288_bare_active()) {
         /* The guest normally shuts down while the Enter key that selected
@@ -4617,16 +5092,6 @@ T_WORD App_Main(void)
     remember_launcher_windows();
     capture_desktop_frame_direct();
 
-#ifdef GAM4980_ENABLE_IRAM_HOT_CORE
-    if (!gam4980_9288_iram_enter()) {
-        show_error(
-            gam4980_9288_iram_status() == GAM4980_IRAM_STATUS_AMR_BUSY
-                ? "IRAM is occupied by audio. Stop audio and retry."
-                : "Could not install the IRAM hot core."
-        );
-        return -6;
-    }
-#endif
     (void)fs_mkdir(k_game_root);
     load_settings();
     memory_diagnostic(0x00u, 0u, 0u);
@@ -4772,6 +5237,21 @@ T_WORD App_Main(void)
         g_performance.load_begin_tick, (u32)fnGUI_GetTickCount()
     );
     memory_diagnostic(0x06u, (u32)game_size, 0u);
+#ifdef GAM4980_ENABLE_IRAM_HOT_CORE
+    /* Selector, loading UI and file preparation still call into the system.
+     * Preserve the firmware's IRAM until all of that work has completed, and
+     * install the resident guest engine only for the actual game session. */
+    if (!gam4980_9288_iram_enter()) {
+        show_error(
+            gam4980_9288_iram_status() == GAM4980_IRAM_STATUS_AMR_BUSY
+                ? "IRAM is occupied by audio. Stop audio and retry."
+                : "Could not install the IRAM hot core."
+        );
+        release_buffers();
+        destroy_emulator_window();
+        return -6;
+    }
+#endif
     if (!run_emulator_window()) {
         show_error("Could not create the GAM4980 window.");
         release_buffers();
