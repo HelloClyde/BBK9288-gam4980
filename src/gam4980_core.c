@@ -39,20 +39,25 @@ static void *core_load_progress_context;
 static gam4980_runtime_poll_fn core_runtime_poll_callback;
 static void *core_runtime_poll_context;
 static u32 core_runtime_poll_max_guest_cycles;
+/* Fast stack access is also used by the interpreter-only configuration. */
+static uint8_t *s6502_stack_ram;
 static firmware_native_graphics_services_t native_graphics_services;
 static uint32_t native_graphics_io_metrics[4];
 static uint32_t native_public_metrics[8];
 static uint32_t native_bank_metrics[12];
 static uint32_t hle_counter_chain_hits, hle_bitmap_packed_groups, hle_counter_folded_rounds;
 u32 gam4980_hle_fusion_metric(u32 id) { return id == 0u ? hle_counter_chain_hits : id == 1u ? hle_bitmap_packed_groups : id == 2u ? hle_counter_folded_rounds : 0u; }
+#ifdef GAM4980_ENABLE_GAME_LOAD_AOT
 static const uint8_t *s6502_game_hle_table_pointer(uint16_t address);
 static int s6502_game_hle_row_direct_destination(uint32_t first, uint32_t last);
+#endif
 #ifdef GAM4980_HLE_FUSION_TEST
 static int s6502_counter_chain_enabled = 1;
 #else
 #define s6502_counter_chain_enabled 1
 #endif
 static uint32_t native_bank_map4(uint32_t bank);
+#ifdef GAM4980_ENABLE_GAME_LOAD_AOT
 static inline __attribute__((always_inline)) void
 s6502_game_hle_record_compare_state_fields(
     uint8_t index_offset, uint8_t data_pointer_offset,
@@ -62,6 +67,7 @@ s6502_game_hle_record_compare_state_fields(
     uint8_t candidate_value, uint8_t reference_value,
     uint8_t *ac_value, uint8_t *iy_value, uint8_t *status_value
 );
+#endif
 static uint32_t native_bank_descriptor_safe(uint32_t address);
 u32 gam4980_native_bank_metric(u32 index) { return index < 12u ? native_bank_metrics[index] : 0u; }
 static uint8_t native_resource_read(uint32_t address);
@@ -202,7 +208,7 @@ u32 gam4980_native_graphics_profile(u32 text, u32 metric)
     return text < 2u && metric < 5u ? native_graphics_host_profile[text][metric] : 0u;
 }
 
-static void native_graphics_poll(void)
+static __attribute__((unused)) void native_graphics_poll(void)
 {
     if (core_runtime_poll_callback)
         core_runtime_poll_callback(core_runtime_poll_context);
@@ -227,7 +233,7 @@ static void *gam4980_memcpy(void *destination, const void *source, u32 size)
     return destination;
 }
 
-static void gam4980_report_load_progress(
+static __attribute__((unused)) void gam4980_report_load_progress(
     u32 stage, u32 current, u32 total
 )
 {
@@ -1182,7 +1188,6 @@ static __attribute__((noinline)) void s6502_firmware_hle_compare16(
     uint32_t sp, uint32_t status, s6502_hle_compare_result_t *result
 );
 /* Shared by the ordinary glyph HLE and the optional whole-region helpers. */
-static uint8_t *s6502_stack_ram;
 #ifdef GAM4980_ENABLE_AGGRESSIVE_REGION_HLE
 typedef uint32_t (*s6502_hle_shift_row_cycles_fn)(const uint8_t *ram);
 typedef int (*s6502_hle_shift_prefix_fn)(
@@ -3238,7 +3243,7 @@ s6502_firmware_hle_glyph_row_cycles(uint32_t source_index, int wide)
 #else
 #define S6502_GAME_HLE_DISPATCH() ((void)0)
 #endif
-static __attribute__((noinline)) int s6502_hle_try_direct_bitmap_copy(
+static __attribute__((noinline, unused)) int s6502_hle_try_direct_bitmap_copy(
     uint8_t *ram, uint8_t initial_count, uint32_t cycle_budget,
     uint16_t first_cycles, uint8_t initial_status
 )
@@ -3351,7 +3356,7 @@ static __attribute__((noinline)) int s6502_hle_try_direct_bitmap_copy(
     return 1;
 }
 
-static __attribute__((noinline)) int s6502_hle_try_direct_shift_blit(
+static __attribute__((noinline, unused)) int s6502_hle_try_direct_shift_blit(
     uint8_t *ram, uint8_t initial_count, uint32_t cycle_budget,
     uint16_t first_cycles, uint8_t initial_status
 )
@@ -9097,7 +9102,7 @@ static __attribute__((noinline)) int s6502_firmware_hle_bitmap_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_bitmap_region_match(void)
 {
     uint32_t fnv = 2166136261u;
@@ -9124,7 +9129,7 @@ s6502_firmware_hle_bitmap_region_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_shift_region_match(void)
 {
     uint32_t main_fnv = 2166136261u;
@@ -9162,7 +9167,7 @@ s6502_firmware_hle_shift_region_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_picture_head_match(void)
 {
     uint32_t fnv = 2166136261u;
@@ -9189,7 +9194,7 @@ s6502_firmware_hle_picture_head_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_graphics_address_match(void)
 {
     uint32_t fnv = 2166136261u;
@@ -9216,7 +9221,7 @@ s6502_firmware_hle_graphics_address_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_hline_match(void)
 {
     uint32_t fnv = 2166136261u;
@@ -9243,7 +9248,7 @@ s6502_firmware_hle_hline_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_part_picture_match(void)
 {
     uint32_t right_fnv = 2166136261u;
@@ -9281,7 +9286,7 @@ s6502_firmware_hle_part_picture_match(void)
     return 1;
 }
 
-static __attribute__((noinline)) int
+static __attribute__((noinline, unused)) int
 s6502_firmware_hle_pixel_tail_match(void)
 {
     uint32_t fnv = 2166136261u;
@@ -13808,7 +13813,7 @@ static __attribute__((noinline)) int s6502_aot_validate(uint32_t block_id)
     return 1;
 }
 
-static __attribute__((noinline)) int s6502_aot_match(uint32_t block_id)
+static __attribute__((noinline, unused)) int s6502_aot_match(uint32_t block_id)
 {
     const s6502_aot_block_t *block;
     uint8_t validation;
@@ -16456,6 +16461,7 @@ static void mem_bs(uint8_t sel)
     mapped_bank_physical[sel] = paddr;
     mapped_bank_valid |= (uint16_t)(1u << sel);
 mapping_unchanged:
+    ; /* The optional IRAM block below may be absent in host builds. */
     /* Feature/dispatch state may change independently of memory ownership. */
 #ifdef GAM4980_ENABLE_IRAM_EXEC_ENGINE
     if (s6502_iram_exec_enabled)

@@ -79,13 +79,8 @@ def validate() -> None:
     magic, format_version, abi_version, header_size, file_size = (
         struct.unpack_from("<5I", native)
     )
-    if (magic, format_version, abi_version, header_size, file_size) != (
-        0x54414E47,
-        1,
-        4,
-        64,
-        len(native),
-    ):
+    if ((magic, header_size, file_size) != (0x54414E47, 64, len(native))
+            or (format_version, abi_version) not in ((1, 4), (5, 6))):
         raise SystemExit("pageable native module header is invalid")
 
 
@@ -98,6 +93,8 @@ def add_file(archive: zipfile.ZipFile, source: Path, target: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Package the BBK 9288 release")
+    parser.add_argument('--app', type=Path, default=APP_PATH)
+    parser.add_argument('--native', type=Path, default=NATIVE_PATH)
     parser.add_argument(
         "--output",
         type=Path,
@@ -107,7 +104,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global APP_PATH, NATIVE_PATH
     args = parse_args()
+    APP_PATH, NATIVE_PATH = args.app.resolve(), args.native.resolve()
     validate()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(

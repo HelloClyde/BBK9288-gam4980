@@ -62,7 +62,7 @@ static __attribute__((noinline)) void host_hle_select_sampled(u32 id)
     host_hle_owner = id;
 }
 #define host_hle_select(id) do { if (host_profile.current == HP_HLE) host_hle_select_sampled(id); } while (0)
-static __attribute__((noinline)) void host_hle_event_sampled(u32 id, u32 event)
+static __attribute__((noinline, unused)) void host_hle_event_sampled(u32 id, u32 event)
 {
     if (host_profile.current != HP_HLE || id >= HP_HLE_LOOKUP || event > 3u) return;
     if (!event) host_hle_select(id);
@@ -71,7 +71,7 @@ static __attribute__((noinline)) void host_hle_event_sampled(u32 id, u32 event)
     if (event >= 2u) host_hle_select(HP_HLE_LOOKUP);
 }
 #define host_hle_event(id, event) do { if (host_profile.current == HP_HLE) host_hle_event_sampled((id), (event)); } while (0)
-static void host_private_profile_begin(u32 index, u32 physical, u32 phase, u32 *frame)
+static __attribute__((unused)) void host_private_profile_begin(u32 index, u32 physical, u32 phase, u32 *frame)
 {
     frame[2] = host_function_owner;
     frame[1] = host_profile_enter(phase);
@@ -83,7 +83,7 @@ static void host_private_profile_begin(u32 index, u32 physical, u32 phase, u32 *
         ++host_private_function_attempts[index];
     }
 }
-static void host_private_profile_end(u32 *frame, u32 accepted)
+static __attribute__((unused)) void host_private_profile_end(u32 *frame, u32 accepted)
 {
     u32 owner = host_function_owner;
     host_profile_leave(frame[1]);
