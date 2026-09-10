@@ -6083,9 +6083,19 @@ static void *const s6502_aot_token_table[S6502_AOT_BLOCK_COUNT] = {
     ac = READ8(ea); S6502_AOT_SET_NZ_MASK(ac, flags);                       \
     CYCLES(4);                                              \
 } while (0)
+#define S6502_AOT_LDA_ABSY(base, flags) do {                                 \
+    et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
+    CYCLES((!!(0xff00 & (et ^ ea))));                                       \
+    ac = READ8(ea); S6502_AOT_SET_NZ_MASK(ac, flags);                       \
+    CYCLES(4);                                              \
+} while (0)
 #define S6502_AOT_STA_INDY(base) do {                                        \
     et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
     WRITE8(ea, ac); CYCLES(6);                              \
+} while (0)
+#define S6502_AOT_STA_ZPX(base) do {                                         \
+    WRITE8((uint8_t)((uint8_t)(base) + ix), ac);                            \
+    CYCLES(4);                                              \
 } while (0)
 #define S6502_AOT_STA_ABSX(base) do {                                        \
     ea = (uint16_t)((uint16_t)(base) + ix); WRITE8(ea, ac);                 \
@@ -6109,6 +6119,12 @@ static void *const s6502_aot_token_table[S6502_AOT_BLOCK_COUNT] = {
     ac = (uint8_t)(ac | (uint8_t)(value));                                  \
     S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(cost);         \
 } while (0)
+#define S6502_AOT_ORA_INDY(base, flags) do {                                 \
+    et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
+    CYCLES((!!(0xff00 & (et ^ ea))));                                       \
+    ac = (uint8_t)(ac | READ8(ea));                                         \
+    S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(5);            \
+} while (0)
 #define S6502_AOT_ORA_ABSX(base, flags) do {                                 \
     et = (uint16_t)(base); ea = (uint16_t)(et + ix);                         \
     CYCLES((!!(0xff00 & (et ^ ea))));                                       \
@@ -6118,6 +6134,12 @@ static void *const s6502_aot_token_table[S6502_AOT_BLOCK_COUNT] = {
 #define S6502_AOT_EOR(value, cost, flags) do {                               \
     ac = (uint8_t)(ac ^ (uint8_t)(value));                                  \
     S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(cost);         \
+} while (0)
+#define S6502_AOT_EOR_INDY(base, flags) do {                                 \
+    et = (uint16_t)(base); ea = (uint16_t)(et + iy);                         \
+    CYCLES((!!(0xff00 & (et ^ ea))));                                       \
+    ac = (uint8_t)(ac ^ READ8(ea));                                         \
+    S6502_AOT_SET_NZ_MASK(ac, flags); CYCLES(5);            \
 } while (0)
 #define S6502_AOT_COMPARE(reg, value, cost, flags) do {                      \
     dt = (uint8_t)~(uint8_t)(value); et = (uint16_t)((reg) + dt + 1u);       \
@@ -16445,8 +16467,10 @@ static void *const s6502_aot_token_table[S6502_AOT_BLOCK_COUNT] = {
 #undef S6502_AOT_AND
 #undef S6502_AOT_AND_INDY
 #undef S6502_AOT_ORA
+#undef S6502_AOT_ORA_INDY
 #undef S6502_AOT_ORA_ABSX
 #undef S6502_AOT_EOR
+#undef S6502_AOT_EOR_INDY
 #undef S6502_AOT_COMPARE
 #undef S6502_AOT_CLC
 #undef S6502_AOT_SEC
